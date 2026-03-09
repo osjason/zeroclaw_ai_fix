@@ -1,3 +1,4 @@
+use super::ack_reaction::{select_ack_reaction, AckReactionContext, AckReactionContextChatType};
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use base64::Engine;
@@ -6,7 +7,7 @@ use prost::Message as ProstMessage;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
 
@@ -232,6 +233,12 @@ struct CachedTenantToken {
     refresh_after: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct DraftEditState {
+    last_edit_at: Instant,
+    edits_used: u32,
+}
+
 fn extract_lark_response_code(body: &serde_json::Value) -> Option<i64> {
     body.get("code").and_then(|c| c.as_i64())
 }
@@ -317,6 +324,10 @@ pub struct LarkChannel {
     tenant_token: Arc<RwLock<Option<CachedTenantToken>>>,
     /// Dedup set: WS message_ids seen in last ~30 min to prevent double-dispatch
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
+    ack_reaction: Option<crate::config::AckReactionConfig>,
+    draft_update_interval_ms: u64,
+    max_draft_edits: u32,
+    draft_state: Arc<Mutex<HashMap<String, DraftEditState>>>,
 }
 
 impl LarkChannel {
@@ -360,6 +371,11 @@ impl LarkChannel {
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
+            ack_reaction: None,
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            draft_state: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -377,10 +393,12 @@ impl LarkChannel {
             config.verification_token.clone().unwrap_or_default(),
             config.port,
             config.allowed_users.clone(),
-            config.mention_only,
+            config.effective_group_reply_mode().requires_mention(),
             platform,
         );
         ch.receive_mode = config.receive_mode.clone();
+        ch.draft_update_interval_ms = config.draft_update_interval_ms;
+        ch.max_draft_edits = config.max_draft_edits;
         ch
     }
 
@@ -391,10 +409,12 @@ impl LarkChannel {
             config.verification_token.clone().unwrap_or_default(),
             config.port,
             config.allowed_users.clone(),
-            config.mention_only,
+            config.effective_group_reply_mode().requires_mention(),
             LarkPlatform::Lark,
         );
         ch.receive_mode = config.receive_mode.clone();
+        ch.draft_update_interval_ms = config.draft_update_interval_ms;
+        ch.max_draft_edits = config.max_draft_edits;
         ch
     }
 
@@ -405,11 +425,21 @@ impl LarkChannel {
             config.verification_token.clone().unwrap_or_default(),
             config.port,
             config.allowed_users.clone(),
-            false,
+            config.effective_group_reply_mode().requires_mention(),
             LarkPlatform::Feishu,
         );
         ch.receive_mode = config.receive_mode.clone();
+        ch.draft_update_interval_ms = config.draft_update_interval_ms;
+        ch.max_draft_edits = config.max_draft_edits;
         ch
+    }
+
+    pub fn with_ack_reaction(
+        mut self,
+        ack_reaction: Option<crate::config::AckReactionConfig>,
+    ) -> Self {
+        self.ack_reaction = ack_reaction;
+        self
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -440,6 +470,10 @@ impl LarkChannel {
         format!("{}/im/v1/messages?receive_id_type=chat_id", self.api_base())
     }
 
+    fn message_url(&self, message_id: &str) -> String {
+        format!("{}/im/v1/messages/{message_id}", self.api_base())
+    }
+
     fn message_reaction_url(&self, message_id: &str) -> String {
         format!("{}/im/v1/messages/{message_id}/reactions", self.api_base())
     }
@@ -459,6 +493,25 @@ impl LarkChannel {
         if let Ok(mut guard) = self.resolved_bot_open_id.write() {
             *guard = open_id;
         }
+    }
+
+    fn draft_state_key(recipient: &str, message_id: &str) -> String {
+        format!("{recipient}:{message_id}")
+    }
+
+    fn build_text_payload(recipient: &str, text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "receive_id": recipient,
+            "msg_type": "text",
+            "content": serde_json::json!({ "text": text }).to_string(),
+        })
+    }
+
+    fn build_text_edit_payload(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "msg_type": "text",
+            "content": serde_json::json!({ "text": text }).to_string(),
+        })
     }
 
     async fn fetch_image_marker(&self, image_key: &str) -> anyhow::Result<String> {
@@ -889,15 +942,22 @@ impl LarkChannel {
                         continue;
                     }
 
-                    let ack_emoji =
-                        random_lark_ack_reaction(Some(&event_payload), &text).to_string();
-                    let reaction_channel = self.clone();
-                    let reaction_message_id = lark_msg.message_id.clone();
-                    tokio::spawn(async move {
-                        reaction_channel
-                            .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
-                            .await;
-                    });
+                    if let Some(ack_emoji) = select_lark_ack_reaction(
+                        self.ack_reaction.as_ref(),
+                        Some(&event_payload),
+                        &text,
+                        Some(sender_open_id),
+                        Some(&lark_msg.chat_id),
+                        lark_msg.chat_type == "group",
+                    ) {
+                        let reaction_channel = self.clone();
+                        let reaction_message_id = lark_msg.message_id.clone();
+                        tokio::spawn(async move {
+                            reaction_channel
+                                .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
+                                .await;
+                        });
+                    }
 
                     let channel_msg = ChannelMessage {
                         id: Uuid::new_v4().to_string(),
@@ -1084,6 +1144,101 @@ impl LarkChannel {
         let parsed = serde_json::from_str::<serde_json::Value>(&raw)
             .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
         Ok((status, parsed))
+    }
+
+    async fn send_json_once(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        token: &str,
+        body: Option<&serde_json::Value>,
+    ) -> anyhow::Result<(reqwest::StatusCode, serde_json::Value)> {
+        let mut request = self
+            .http_client()
+            .request(method, url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json; charset=utf-8");
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let resp = request.send().await?;
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let parsed = if raw.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str::<serde_json::Value>(&raw)
+                .unwrap_or_else(|_| serde_json::json!({ "raw": raw }))
+        };
+        Ok((status, parsed))
+    }
+
+    async fn create_text_message(
+        &self,
+        recipient: &str,
+        text: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let mut token = self.get_tenant_access_token().await?;
+        let body = Self::build_text_payload(recipient, text);
+        let mut retried = false;
+
+        loop {
+            let (status, response) = self
+                .send_text_once(&self.send_message_url(), &token, &body)
+                .await?;
+            if !retried && should_refresh_lark_tenant_token(status, &response) {
+                self.invalidate_token().await;
+                token = self.get_tenant_access_token().await?;
+                retried = true;
+                continue;
+            }
+            ensure_lark_send_success(status, &response, "while creating text message")?;
+            return Ok(response
+                .pointer("/data/message_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string));
+        }
+    }
+
+    async fn update_text_message(&self, message_id: &str, text: &str) -> anyhow::Result<()> {
+        let mut token = self.get_tenant_access_token().await?;
+        let body = Self::build_text_edit_payload(text);
+        let url = self.message_url(message_id);
+        let mut retried = false;
+
+        loop {
+            let (status, response) = self
+                .send_json_once(reqwest::Method::PATCH, &url, &token, Some(&body))
+                .await?;
+            if !retried && should_refresh_lark_tenant_token(status, &response) {
+                self.invalidate_token().await;
+                token = self.get_tenant_access_token().await?;
+                retried = true;
+                continue;
+            }
+            ensure_lark_send_success(status, &response, "while updating text message")?;
+            return Ok(());
+        }
+    }
+
+    async fn delete_message(&self, message_id: &str) -> anyhow::Result<()> {
+        let mut token = self.get_tenant_access_token().await?;
+        let url = self.message_url(message_id);
+        let mut retried = false;
+
+        loop {
+            let (status, response) = self
+                .send_json_once(reqwest::Method::DELETE, &url, &token, None)
+                .await?;
+            if !retried && should_refresh_lark_tenant_token(status, &response) {
+                self.invalidate_token().await;
+                token = self.get_tenant_access_token().await?;
+                retried = true;
+                continue;
+            }
+            ensure_lark_send_success(status, &response, "while deleting message")?;
+            return Ok(());
+        }
     }
 
     /// Parse an event callback payload and extract incoming messages.
@@ -1358,37 +1513,120 @@ impl Channel for LarkChannel {
         self.channel_name()
     }
 
-    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let token = self.get_tenant_access_token().await?;
-        let url = self.send_message_url();
+    fn supports_draft_updates(&self) -> bool {
+        self.max_draft_edits > 0
+    }
 
-        let content = serde_json::json!({ "text": message.content }).to_string();
-        let body = serde_json::json!({
-            "receive_id": message.recipient,
-            "msg_type": "text",
-            "content": content,
-        });
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        if !self.supports_draft_updates() {
+            return Ok(None);
+        }
 
-        let (status, response) = self.send_text_once(&url, &token, &body).await?;
+        let initial_text = if message.content.trim().is_empty() {
+            "..."
+        } else {
+            message.content.as_str()
+        };
+        let message_id = self
+            .create_text_message(&message.recipient, initial_text)
+            .await?;
 
-        if should_refresh_lark_tenant_token(status, &response) {
-            // Token expired/invalid, invalidate and retry once.
-            self.invalidate_token().await;
-            let new_token = self.get_tenant_access_token().await?;
-            let (retry_status, retry_response) =
-                self.send_text_once(&url, &new_token, &body).await?;
+        if let Some(message_id) = message_id.as_deref() {
+            self.draft_state.lock().await.insert(
+                Self::draft_state_key(&message.recipient, message_id),
+                DraftEditState {
+                    last_edit_at: Instant::now(),
+                    edits_used: 0,
+                },
+            );
+        }
 
-            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
-                anyhow::bail!(
-                    "Lark send failed after token refresh: status={retry_status}, body={retry_response}"
-                );
+        Ok(message_id)
+    }
+
+    async fn update_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<Option<String>> {
+        if !self.supports_draft_updates() || message_id.trim().is_empty() {
+            return Ok(None);
+        }
+
+        let draft_key = Self::draft_state_key(recipient, message_id);
+        {
+            let draft_state = self.draft_state.lock().await;
+            if let Some(state) = draft_state.get(&draft_key) {
+                let elapsed_ms =
+                    u64::try_from(state.last_edit_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if elapsed_ms < self.draft_update_interval_ms
+                    || state.edits_used >= self.max_draft_edits
+                {
+                    return Ok(None);
+                }
             }
+        }
 
-            ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
+        self.update_text_message(message_id, text).await?;
+        let mut draft_state = self.draft_state.lock().await;
+        let state = draft_state.entry(draft_key).or_insert(DraftEditState {
+            last_edit_at: Instant::now(),
+            edits_used: 0,
+        });
+        state.last_edit_at = Instant::now();
+        state.edits_used = state.edits_used.saturating_add(1);
+        Ok(None)
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let cleaned_text = super::strip_tool_call_tags(text);
+        self.draft_state
+            .lock()
+            .await
+            .remove(&Self::draft_state_key(recipient, message_id));
+
+        if message_id.trim().is_empty() {
+            let _ = self.create_text_message(recipient, &cleaned_text).await?;
             return Ok(());
         }
 
-        ensure_lark_send_success(status, &response, "without token refresh")?;
+        match self.update_text_message(message_id, &cleaned_text).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                tracing::warn!(
+                    "Lark finalize_draft edit failed for {message_id}: {error}; sending fallback message"
+                );
+                let _ = self.create_text_message(recipient, &cleaned_text).await?;
+                Ok(())
+            }
+        }
+    }
+
+    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        self.draft_state
+            .lock()
+            .await
+            .remove(&Self::draft_state_key(recipient, message_id));
+        if message_id.trim().is_empty() {
+            return Ok(());
+        }
+
+        if let Err(error) = self.delete_message(message_id).await {
+            tracing::debug!("Lark cancel_draft delete failed for {message_id}: {error}");
+        }
+        Ok(())
+    }
+
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        let _ = self
+            .create_text_message(&message.recipient, &message.content)
+            .await?;
         Ok(())
     }
 
@@ -1453,15 +1691,32 @@ impl LarkChannel {
                     .and_then(|m| m.as_str())
                 {
                     let ack_text = messages.first().map_or("", |msg| msg.content.as_str());
-                    let ack_emoji =
-                        random_lark_ack_reaction(payload.get("event"), ack_text).to_string();
-                    let reaction_channel = Arc::clone(&state.channel);
-                    let reaction_message_id = message_id.to_string();
-                    tokio::spawn(async move {
-                        reaction_channel
-                            .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
-                            .await;
-                    });
+                    let sender_open_id = payload
+                        .pointer("/event/sender/sender_id/open_id")
+                        .and_then(|value| value.as_str());
+                    let chat_id = payload
+                        .pointer("/event/message/chat_id")
+                        .and_then(|value| value.as_str());
+                    let is_group_message = payload
+                        .pointer("/event/message/chat_type")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|value| value == "group");
+                    if let Some(ack_emoji) = select_lark_ack_reaction(
+                        state.channel.ack_reaction.as_ref(),
+                        payload.get("event"),
+                        ack_text,
+                        sender_open_id,
+                        chat_id,
+                        is_group_message,
+                    ) {
+                        let reaction_channel = Arc::clone(&state.channel);
+                        let reaction_message_id = message_id.to_string();
+                        tokio::spawn(async move {
+                            reaction_channel
+                                .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
+                                .await;
+                        });
+                    }
                 }
             }
 
@@ -1703,6 +1958,35 @@ fn random_lark_ack_reaction(
 ) -> &'static str {
     let locale = detect_lark_ack_locale(payload, fallback_text);
     random_from_pool(lark_ack_pool(locale))
+}
+
+fn select_lark_ack_reaction(
+    policy: Option<&crate::config::AckReactionConfig>,
+    payload: Option<&serde_json::Value>,
+    fallback_text: &str,
+    sender_id: Option<&str>,
+    chat_id: Option<&str>,
+    is_group_message: bool,
+) -> Option<String> {
+    let locale = detect_lark_ack_locale(payload, fallback_text);
+    let locale_hint = match locale {
+        LarkAckLocale::ZhCn => Some("zh-CN"),
+        LarkAckLocale::ZhTw => Some("zh-TW"),
+        LarkAckLocale::En => Some("en"),
+        LarkAckLocale::Ja => Some("ja"),
+    };
+    let ctx = AckReactionContext {
+        text: fallback_text,
+        sender_id,
+        chat_id,
+        chat_type: if is_group_message {
+            AckReactionContextChatType::Group
+        } else {
+            AckReactionContextChatType::Direct
+        },
+        locale_hint,
+    };
+    select_ack_reaction(policy, lark_ack_pool(locale), &ctx)
 }
 
 /// Flatten a Feishu `post` rich-text message to plain text.
@@ -2288,9 +2572,13 @@ mod tests {
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["ou_user1".into(), "ou_user2".into()],
             mention_only: false,
+            group_reply: None,
             use_feishu: false,
             receive_mode: LarkReceiveMode::default(),
             port: None,
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -2310,9 +2598,13 @@ mod tests {
             verification_token: Some("tok".into()),
             allowed_users: vec!["*".into()],
             mention_only: false,
+            group_reply: None,
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -2344,9 +2636,13 @@ mod tests {
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
             mention_only: false,
+            group_reply: None,
             use_feishu: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
         };
 
         let ch = LarkChannel::from_config(&cfg);
@@ -2355,6 +2651,14 @@ mod tests {
         assert_eq!(ch.ws_base(), LARK_WS_BASE_URL);
         assert_eq!(ch.receive_mode, LarkReceiveMode::Webhook);
         assert_eq!(ch.port, Some(9898));
+        assert_eq!(
+            ch.draft_update_interval_ms,
+            crate::config::schema::default_lark_draft_update_interval_ms()
+        );
+        assert_eq!(
+            ch.max_draft_edits,
+            crate::config::schema::default_lark_max_draft_edits()
+        );
     }
 
     #[test]
@@ -2368,9 +2672,13 @@ mod tests {
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
             mention_only: false,
+            group_reply: None,
             use_feishu: true,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
         };
 
         let ch = LarkChannel::from_lark_config(&cfg);
@@ -2390,8 +2698,12 @@ mod tests {
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
+            group_reply: None,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
         };
 
         let ch = LarkChannel::from_feishu_config(&cfg);
@@ -2399,6 +2711,37 @@ mod tests {
         assert_eq!(ch.api_base(), FEISHU_BASE_URL);
         assert_eq!(ch.ws_base(), FEISHU_WS_BASE_URL);
         assert_eq!(ch.name(), "feishu");
+        assert!(ch.supports_draft_updates());
+    }
+
+    #[test]
+    fn lark_group_reply_and_draft_limits_follow_runtime_config() {
+        use crate::config::schema::{
+            GroupReplyConfig, GroupReplyMode, LarkConfig, LarkReceiveMode,
+        };
+
+        let cfg = LarkConfig {
+            app_id: "cli_app123".into(),
+            app_secret: "secret456".into(),
+            encrypt_key: None,
+            verification_token: Some("vtoken789".into()),
+            allowed_users: vec!["*".into()],
+            mention_only: false,
+            group_reply: Some(GroupReplyConfig {
+                mode: Some(GroupReplyMode::MentionOnly),
+                allowed_sender_ids: vec![],
+            }),
+            use_feishu: false,
+            receive_mode: LarkReceiveMode::Webhook,
+            port: Some(9898),
+            draft_update_interval_ms: 1500,
+            max_draft_edits: 7,
+        };
+
+        let ch = LarkChannel::from_lark_config(&cfg);
+        assert!(ch.mention_only);
+        assert_eq!(ch.draft_update_interval_ms, 1500);
+        assert_eq!(ch.max_draft_edits, 7);
     }
 
     #[test]
@@ -2562,8 +2905,12 @@ mod tests {
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
+            group_reply: None,
             receive_mode: crate::config::schema::LarkReceiveMode::Webhook,
             port: Some(9898),
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
         };
         let ch_feishu = LarkChannel::from_feishu_config(&feishu_cfg);
         assert_eq!(
@@ -2667,5 +3014,28 @@ mod tests {
         });
         let selected = random_lark_ack_reaction(Some(&payload), "hello");
         assert!(LARK_ACK_REACTIONS_JA.contains(&selected));
+    }
+
+    #[test]
+    fn lark_ack_reaction_policy_can_disable_channel_pool() {
+        let payload = serde_json::json!({
+            "sender": {
+                "locale": "en-US"
+            }
+        });
+        let cfg = crate::config::AckReactionConfig {
+            sample_rate: 0.0,
+            ..crate::config::AckReactionConfig::default()
+        };
+
+        let selected = select_lark_ack_reaction(
+            Some(&cfg),
+            Some(&payload),
+            "hello",
+            Some("ou_user"),
+            Some("oc_chat"),
+            false,
+        );
+        assert!(selected.is_none());
     }
 }

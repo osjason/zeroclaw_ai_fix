@@ -5,8 +5,10 @@
 //! 2. **Ping-pong** — two calls alternating (A→B→A→B) with no progress.
 //! 3. **Consecutive failure streak** — same tool failing repeatedly.
 //!
-//! On first detection an `InjectWarning` verdict gives the LLM a chance to
-//! self-correct.  If the pattern persists the next check returns `HardStop`.
+//! On detection an `InjectWarning` verdict gives the LLM a chance to
+//! self-correct. If the pattern persists, the detector keeps escalating the
+//! recovery prompt and lets the caller's max-iteration budget decide when to
+//! stop.
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -69,7 +71,7 @@ pub(crate) struct LoopDetector {
     config: LoopDetectionConfig,
     history: Vec<CallRecord>,
     consecutive_failures: HashMap<String, usize>,
-    warning_injected: bool,
+    recovery_attempts: usize,
 }
 
 impl LoopDetector {
@@ -78,7 +80,7 @@ impl LoopDetector {
             config,
             history: Vec::new(),
             consecutive_failures: HashMap::new(),
-            warning_injected: false,
+            recovery_attempts: 0,
         }
     }
 
@@ -115,14 +117,13 @@ impl LoopDetector {
             .or_else(|| self.check_failure_streak());
 
         match reason {
-            None => DetectionVerdict::Continue,
+            None => {
+                self.recovery_attempts = 0;
+                DetectionVerdict::Continue
+            }
             Some(msg) => {
-                if self.warning_injected {
-                    DetectionVerdict::HardStop(msg)
-                } else {
-                    self.warning_injected = true;
-                    DetectionVerdict::InjectWarning(format_warning(&msg))
-                }
+                self.recovery_attempts += 1;
+                DetectionVerdict::InjectWarning(format_warning(&msg, self.recovery_attempts))
             }
         }
     }
@@ -231,15 +232,26 @@ fn hash_output(output: &str) -> u64 {
     hasher.finish()
 }
 
-fn format_warning(reason: &str) -> String {
-    format!(
-        "IMPORTANT: A loop pattern has been detected in your tool usage. {reason}. \
-         You must change your approach: \
-         (1) Try a different tool or different arguments, \
-         (2) If polling a process, increase wait time or check if it's stuck, \
-         (3) If the task cannot be completed, explain why and stop. \
-         Do NOT repeat the same tool call with the same arguments."
-    )
+fn format_warning(reason: &str, recovery_attempt: usize) -> String {
+    if recovery_attempt <= 1 {
+        format!(
+            "IMPORTANT: A loop pattern has been detected in your tool usage. {reason}. \
+             You must change your approach: \
+             (1) Try a different tool or different arguments, \
+             (2) If polling a process, increase wait time or check if it's stuck, \
+             (3) If the task cannot be completed, explain why and stop. \
+             Do NOT repeat the same tool call with the same arguments."
+        )
+    } else {
+        format!(
+            "CRITICAL RECOVERY ATTEMPT #{recovery_attempt}: tool usage is still looping. {reason}. \
+             You must recover immediately: \
+             (1) Switch to a different tool OR materially different arguments, \
+             (2) If no safe tool path remains, stop calling tools and provide the best direct answer, \
+             (3) Explicitly explain the blocker instead of retrying the same failing pattern. \
+             DO NOT repeat the previous tool call pattern."
+        )
+    }
 }
 
 // ─── Unit tests ──────────────────────────────────────────────────────────────
@@ -294,9 +306,9 @@ mod tests {
         assert_eq!(det.check(), DetectionVerdict::Continue);
     }
 
-    // 4. Warning then continued loop → HardStop
+    // 4. Warning then continued loop → stronger recovery warning
     #[test]
-    fn warning_then_continued_loop_triggers_hard_stop() {
+    fn warning_then_continued_loop_escalates_recovery_warning() {
         let mut det = LoopDetector::new(default_config());
         for _ in 0..3 {
             det.record_call("echo", r#"{"msg":"hi"}"#, "same", true);
@@ -305,10 +317,11 @@ mod tests {
         // One more identical call
         det.record_call("echo", r#"{"msg":"hi"}"#, "same", true);
         match det.check() {
-            DetectionVerdict::HardStop(msg) => {
+            DetectionVerdict::InjectWarning(msg) => {
+                assert!(msg.contains("CRITICAL RECOVERY ATTEMPT #2"), "msg: {msg}");
                 assert!(msg.contains("no progress"), "msg: {msg}");
             }
-            other => panic!("expected HardStop, got {other:?}"),
+            other => panic!("expected InjectWarning, got {other:?}"),
         }
     }
 

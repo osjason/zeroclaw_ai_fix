@@ -41,6 +41,10 @@ pub mod hardware_memory_map;
 pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
+pub mod mcp_client;
+pub mod mcp_protocol;
+pub mod mcp_tool;
+pub mod mcp_transport;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
@@ -56,6 +60,7 @@ pub mod shell;
 pub mod task_plan;
 pub mod traits;
 pub mod url_validation;
+pub mod wasm_tool;
 pub mod web_fetch;
 pub mod web_search_tool;
 
@@ -83,6 +88,8 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
+pub use mcp_client::McpRegistry;
+pub use mcp_tool::McpToolWrapper;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
@@ -254,6 +261,8 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(BrowserOpenTool::new(
             security.clone(),
             browser_config.allowed_domains.clone(),
+            root_config.security.url_access.clone(),
+            browser_open::BrowserChoice::from_str(&browser_config.browser_open),
         )));
         // Add full browser automation tool (pluggable backend)
         tool_arcs.push(Arc::new(BrowserTool::new_with_backend(
@@ -261,6 +270,10 @@ pub fn all_tools_with_runtime(
             browser_config.allowed_domains.clone(),
             browser_config.session_name.clone(),
             browser_config.backend.clone(),
+            browser_config.auto_backend_priority.clone(),
+            browser_config.agent_browser_command.clone(),
+            browser_config.agent_browser_extra_args.clone(),
+            browser_config.agent_browser_timeout_ms,
             browser_config.native_headless,
             browser_config.native_webdriver_url.clone(),
             browser_config.native_chrome_path.clone(),
@@ -280,8 +293,11 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(HttpRequestTool::new(
             security.clone(),
             http_config.allowed_domains.clone(),
+            root_config.security.url_access.clone(),
             http_config.max_response_size,
             http_config.timeout_secs,
+            http_config.user_agent.clone(),
+            http_config.credential_profiles.clone(),
         )));
     }
 
@@ -293,6 +309,7 @@ pub fn all_tools_with_runtime(
             web_fetch_config.api_url.clone(),
             web_fetch_config.allowed_domains.clone(),
             web_fetch_config.blocked_domains.clone(),
+            root_config.security.url_access.clone(),
             web_fetch_config.max_response_size,
             web_fetch_config.timeout_secs,
         )));
@@ -311,11 +328,13 @@ pub fn all_tools_with_runtime(
             root_config.web_search.api_key.clone()
         };
         tool_arcs.push(Arc::new(WebSearchTool::new(
+            security.clone(),
             root_config.web_search.provider.clone(),
             api_key,
             root_config.web_search.api_url.clone(),
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,
+            root_config.web_search.user_agent.clone(),
         )));
     }
 
@@ -354,12 +373,14 @@ pub fn all_tools_with_runtime(
             crate::providers::ProviderRuntimeOptions {
                 auth_profile_override: None,
                 provider_api_url: root_config.api_url.clone(),
+                provider_transport: root_config.effective_provider_transport(),
                 zeroclaw_dir: root_config
                     .config_path
                     .parent()
                     .map(std::path::PathBuf::from),
                 secrets_encrypt: root_config.secrets.encrypt,
                 reasoning_enabled: root_config.runtime.reasoning_enabled,
+                reasoning_level: root_config.effective_provider_reasoning_level(),
                 custom_provider_api_mode: root_config
                     .provider_api
                     .map(|mode| mode.as_compatible_mode()),
@@ -623,6 +644,9 @@ mod tests {
                 model: "llama3".to_string(),
                 system_prompt: None,
                 api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,

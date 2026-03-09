@@ -1,6 +1,12 @@
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
+use crate::agent::loop_::detection::{DetectionVerdict, LoopDetectionConfig, LoopDetector};
+use crate::agent::loop_::parsing::tool_call_signature;
+use crate::agent::loop_::{
+    build_missing_tool_call_retry_prompt, build_runtime_constraint_retry_prompt,
+    looks_like_deferred_action_without_tool_call, summarize_runtime_constraint_reasons,
+};
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::agent::research;
@@ -39,6 +45,43 @@ pub struct Agent {
     available_hints: Vec<String>,
     route_model_by_hint: HashMap<String, String>,
     research_config: ResearchPhaseConfig,
+}
+
+fn response_resembles_malformed_tool_call(response: &str, parsed_calls: &[ParsedToolCall]) -> bool {
+    if !parsed_calls.is_empty() {
+        return false;
+    }
+
+    let trimmed = response.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    trimmed.contains("<tool_call")
+        || trimmed.contains("</tool_call>")
+        || trimmed.contains("<toolcall")
+        || trimmed.contains("</toolcall>")
+        || trimmed.contains("<tool-call")
+        || trimmed.contains("</tool-call>")
+        || trimmed.contains("</function_call>")
+        || trimmed.contains("</function_calls>")
+        || trimmed.contains("<shell>")
+        || trimmed.contains("<file_write>")
+        || trimmed.contains("<file_read>")
+        || trimmed.contains("<memory_recall>")
+        || trimmed.contains("</invoke>")
+        || trimmed.contains("</tool>")
+        || trimmed.contains("```tool_call")
+        || trimmed.contains("```toolcall")
+        || trimmed.contains("```tool-call")
+        || trimmed.contains("```tool file_")
+        || trimmed.contains("```tool shell")
+        || trimmed.contains("```tool web_")
+        || trimmed.contains("```tool memory_")
+        || trimmed.contains("```tool ")
+        || trimmed.contains("\"tool_calls\"")
+        || trimmed.contains("TOOL_CALL")
+        || trimmed.contains("<FunctionCall>")
 }
 
 pub struct AgentBuilder {
@@ -399,37 +442,38 @@ impl Agent {
     async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
         let start = Instant::now();
 
-        let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
-            match tool.execute(call.arguments.clone()).await {
-                Ok(r) => {
-                    self.observer.record_event(&ObserverEvent::ToolCall {
-                        tool: call.name.clone(),
-                        duration: start.elapsed(),
-                        success: r.success,
-                    });
-                    if r.success {
-                        r.output
-                    } else {
-                        format!("Error: {}", r.error.unwrap_or(r.output))
+        let (result, success) =
+            if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
+                match tool.execute(call.arguments.clone()).await {
+                    Ok(r) => {
+                        self.observer.record_event(&ObserverEvent::ToolCall {
+                            tool: call.name.clone(),
+                            duration: start.elapsed(),
+                            success: r.success,
+                        });
+                        if r.success {
+                            (r.output, true)
+                        } else {
+                            (format!("Error: {}", r.error.unwrap_or(r.output)), false)
+                        }
+                    }
+                    Err(e) => {
+                        self.observer.record_event(&ObserverEvent::ToolCall {
+                            tool: call.name.clone(),
+                            duration: start.elapsed(),
+                            success: false,
+                        });
+                        (format!("Error executing {}: {e}", call.name), false)
                     }
                 }
-                Err(e) => {
-                    self.observer.record_event(&ObserverEvent::ToolCall {
-                        tool: call.name.clone(),
-                        duration: start.elapsed(),
-                        success: false,
-                    });
-                    format!("Error executing {}: {e}", call.name)
-                }
-            }
-        } else {
-            format!("Unknown tool: {}", call.name)
-        };
+            } else {
+                (format!("Unknown tool: {}", call.name), false)
+            };
 
         ToolExecutionResult {
             name: call.name.clone(),
             output: result,
-            success: true,
+            success,
             tool_call_id: call.tool_call_id.clone(),
         }
     }
@@ -556,9 +600,28 @@ impl Agent {
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
         let effective_model = self.classify_model(user_message);
+        let max_tool_iterations = self.config.max_tool_iterations.max(1);
+        let mut missing_tool_call_retry_attempts = 0usize;
+        let mut missing_tool_call_retry_prompt: Option<String> = None;
+        let mut runtime_constraint_prompt: Option<String> = None;
+        let mut loop_detection_prompt: Option<String> = None;
+        let mut loop_detector = LoopDetector::new(LoopDetectionConfig {
+            no_progress_threshold: self.config.loop_detection_no_progress_threshold,
+            ping_pong_cycles: self.config.loop_detection_ping_pong_cycles,
+            failure_streak_threshold: self.config.loop_detection_failure_streak,
+        });
 
-        for _ in 0..self.config.max_tool_iterations {
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+        for _ in 0..max_tool_iterations {
+            let mut messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            if let Some(prompt) = missing_tool_call_retry_prompt.take() {
+                messages.push(ChatMessage::user(prompt));
+            }
+            if let Some(prompt) = runtime_constraint_prompt.take() {
+                messages.push(ChatMessage::user(prompt));
+            }
+            if let Some(prompt) = loop_detection_prompt.take() {
+                messages.push(ChatMessage::user(prompt));
+            }
             let response = match self
                 .provider
                 .chat(
@@ -579,14 +642,36 @@ impl Agent {
                 Err(err) => return Err(err),
             };
 
+            let response_text = response.text.clone().unwrap_or_default();
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
+            let display_text = if text.is_empty() {
+                response_text.clone()
+            } else {
+                text.clone()
+            };
+            let parse_issue_detected =
+                response_resembles_malformed_tool_call(&response_text, &calls);
             if calls.is_empty() {
-                let final_text = if text.is_empty() {
-                    response.text.unwrap_or_default()
+                let retry_reason = if parse_issue_detected {
+                    Some("parse_issue_detected")
+                } else if !self.tool_specs.is_empty()
+                    && looks_like_deferred_action_without_tool_call(&display_text)
+                {
+                    Some("deferred_action_text_detected")
                 } else {
-                    text
+                    None
                 };
 
+                if !self.tool_specs.is_empty() && retry_reason.is_some() {
+                    missing_tool_call_retry_attempts += 1;
+                    missing_tool_call_retry_prompt = Some(build_missing_tool_call_retry_prompt(
+                        retry_reason.unwrap_or("unknown"),
+                        missing_tool_call_retry_attempts,
+                    ));
+                    continue;
+                }
+
+                let final_text = display_text;
                 self.history
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         final_text.clone(),
@@ -595,6 +680,8 @@ impl Agent {
 
                 return Ok(final_text);
             }
+
+            missing_tool_call_retry_attempts = 0;
 
             if !text.is_empty() {
                 self.history
@@ -612,14 +699,33 @@ impl Agent {
             });
 
             let results = self.execute_tools(&calls).await;
+            for (call, result) in calls.iter().zip(results.iter()) {
+                let (tool_name, args_sig) = tool_call_signature(&call.name, &call.arguments);
+                loop_detector.record_call(&tool_name, &args_sig, &result.output, result.success);
+            }
+            let runtime_constraint_reasons = summarize_runtime_constraint_reasons(
+                results
+                    .iter()
+                    .filter(|result| !result.success)
+                    .map(|result| result.output.as_str()),
+                3,
+            );
+            runtime_constraint_prompt =
+                build_runtime_constraint_retry_prompt(&runtime_constraint_reasons);
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
+            match loop_detector.check() {
+                DetectionVerdict::Continue => {}
+                DetectionVerdict::InjectWarning(warning) | DetectionVerdict::HardStop(warning) => {
+                    loop_detection_prompt = Some(warning);
+                }
+            }
             self.trim_history();
         }
 
         anyhow::bail!(
             "Agent exceeded maximum tool iterations ({})",
-            self.config.max_tool_iterations
+            max_tool_iterations
         )
     }
 
@@ -744,6 +850,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    quota_metadata: None,
                 });
             }
             Ok(guard.remove(0))
@@ -781,6 +888,7 @@ mod tests {
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    quota_metadata: None,
                 });
             }
             Ok(guard.remove(0))
@@ -820,6 +928,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                quota_metadata: None,
             }]),
         });
 
@@ -860,12 +969,14 @@ mod tests {
                     }],
                     usage: None,
                     reasoning_content: None,
+                    quota_metadata: None,
                 },
                 crate::providers::ChatResponse {
                     text: Some("done".into()),
                     tool_calls: vec![],
                     usage: None,
                     reasoning_content: None,
+                    quota_metadata: None,
                 },
             ]),
         });
@@ -907,6 +1018,7 @@ mod tests {
                 tool_calls: vec![],
                 usage: None,
                 reasoning_content: None,
+                quota_metadata: None,
             }]),
             seen_models: seen_models.clone(),
         });

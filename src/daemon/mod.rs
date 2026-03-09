@@ -87,7 +87,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     }
 
-    if config.cron.enabled {
+    if config.cron.enabled && config.scheduler.enabled {
         let scheduler_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "scheduler",
@@ -100,7 +100,11 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     } else {
         crate::health::mark_component_ok("scheduler");
-        tracing::info!("Cron disabled; scheduler supervisor not started");
+        if !config.cron.enabled {
+            tracing::info!("Cron disabled; scheduler supervisor not started");
+        } else {
+            tracing::info!("Scheduler disabled by config; scheduler supervisor not started");
+        }
     }
 
     println!("🧠 ZeroClaw daemon started");
@@ -530,6 +534,21 @@ mod tests {
             group_reply: None,
         });
         assert!(has_supervised_channels(&config));
+    }
+
+    #[test]
+    fn scheduler_supervisor_start_requires_both_cron_and_scheduler_enabled() {
+        let mut config = Config::default();
+        config.cron.enabled = true;
+        config.scheduler.enabled = true;
+        assert!(config.cron.enabled && config.scheduler.enabled);
+
+        config.scheduler.enabled = false;
+        assert!(!(config.cron.enabled && config.scheduler.enabled));
+
+        config.scheduler.enabled = true;
+        config.cron.enabled = false;
+        assert!(!(config.cron.enabled && config.scheduler.enabled));
     }
 
     #[test]

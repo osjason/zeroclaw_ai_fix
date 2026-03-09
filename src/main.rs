@@ -879,34 +879,40 @@ async fn main() -> Result<()> {
         if channels_only && force {
             bail!("--channels-only does not accept --force");
         }
+        if no_totp {
+            warn!("--no-totp is currently ignored by onboarding; current security defaults will be used");
+        }
+
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
         } else if interactive {
-            Box::pin(onboard::run_wizard_with_migration(
-                force,
-                onboard::OpenClawOnboardMigrationOptions {
-                    enabled: openclaw_migration_enabled,
-                    source_workspace: openclaw_source,
-                    source_config: openclaw_config,
-                },
-            ))
-            .await
+            Box::pin(onboard::run_wizard(force)).await
         } else {
-            onboard::run_quick_setup_with_migration(
+            onboard::run_quick_setup(
                 api_key.as_deref(),
                 provider.as_deref(),
                 model.as_deref(),
                 memory.as_deref(),
                 force,
-                no_totp,
-                onboard::OpenClawOnboardMigrationOptions {
-                    enabled: openclaw_migration_enabled,
-                    source_workspace: openclaw_source,
-                    source_config: openclaw_config,
-                },
             )
             .await
         }?;
+        let config = if openclaw_migration_enabled {
+            let _report = migration::migrate_openclaw(
+                &config,
+                migration::OpenClawMigrationOptions {
+                    source_workspace: openclaw_source,
+                    source_config: openclaw_config,
+                    include_memory: true,
+                    include_config: true,
+                    dry_run: false,
+                },
+            )
+            .await?;
+            Config::load_or_init().await?
+        } else {
+            config
+        };
         // Auto-start channels if user said yes during wizard
         if std::env::var("ZEROCLAW_AUTOSTART_CHANNELS").as_deref() == Ok("1") {
             Box::pin(channels::start_channels(config)).await?;

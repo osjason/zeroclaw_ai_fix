@@ -187,7 +187,15 @@ impl ToolDispatcher for NativeToolDispatcher {
                 }),
                 tool_call_id: Some(tc.id.clone()),
             })
-            .collect();
+            .collect::<Vec<_>>();
+
+        if calls.is_empty() {
+            let (fallback_text, fallback_calls) = XmlToolDispatcher::parse_xml_tool_calls(&text);
+            if !fallback_calls.is_empty() {
+                return (fallback_text, fallback_calls);
+            }
+        }
+
         (text, calls)
     }
 

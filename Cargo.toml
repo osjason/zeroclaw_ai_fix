@@ -62,12 +62,20 @@ urlencoding = "2.1"
 fast_html2md = { version = "0.0.58", optional = true }
 nanohtml2text = { version = "0.2", optional = true }
 
+# Zip archive extraction and XML parsing (DOCX/PPTX/audit tooling)
+zip = { version = "8.1", default-features = false, features = ["deflate"] }
+quick-xml = "0.37"
+
 # Optional Rust-native browser automation backend
 fantoccini = { version = "0.22.0", optional = true, default-features = false, features = ["rustls-tls"] }
+
+# Optional in-process WASM runtime for sandboxed tool execution
+wasmi = { version = "1.0.9", optional = true, default-features = true }
 
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
+aho-corasick = "1.1"
 
 # UUID generation
 uuid = { version = "1.11", default-features = false, features = ["v4", "std"] }
@@ -108,6 +116,7 @@ cron = "0.15"
 
 # Interactive CLI prompts
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
+rustyline = "17.0"
 console = "0.16"
 
 # Hardware discovery (device path globbing)
@@ -115,6 +124,9 @@ glob = "0.3"
 
 # Binary discovery (init system detection)
 which = "8.0"
+
+# Temporary directory creation (self-update and runtime tests/helpers)
+tempfile = "3.26"
 
 # WebSocket client channels (Discord/Lark/DingTalk/Nostr)
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
@@ -150,6 +162,10 @@ opentelemetry = { version = "0.31", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "metrics"], optional = true }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "metrics", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"], optional = true }
 
+# WASM plugin runtime (optional)
+wasmtime = { version = "36.0.6", optional = true, default-features = false, features = ["runtime", "cranelift"] }
+wasmtime-wasi = { version = "36.0.6", optional = true, default-features = false, features = ["preview1"] }
+
 # Serial port for peripheral communication (STM32, etc.)
 tokio-serial = { version = "5", default-features = false, optional = true }
 
@@ -181,6 +197,10 @@ wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = f
 rppal = { version = "0.22", optional = true }
 landlock = { version = "0.4", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+
 [features]
 default = ["channel-lark", "web-fetch-html2md"]
 hardware = ["nusb", "tokio-serial"]
@@ -196,6 +216,8 @@ peripheral-rpi = ["rppal"]
 browser-native = ["dep:fantoccini"]
 # Backward-compatible alias for older invocations
 fantoccini = ["browser-native"]
+# In-process WASM runtime (capability-based sandbox)
+runtime-wasm = ["dep:wasmi"]
 # Sandbox feature aliases used by cfg(feature = "sandbox-*")
 sandbox-landlock = ["dep:landlock"]
 sandbox-bubblewrap = []
@@ -205,6 +227,8 @@ landlock = ["sandbox-landlock"]
 probe = ["dep:probe-rs"]
 # rag-pdf = PDF ingestion for datasheet RAG
 rag-pdf = ["dep:pdf-extract"]
+# wasm-tools = WASM plugin engine for dynamically-loaded tool packages (WASI stdio protocol)
+wasm-tools = ["dep:wasmtime", "dep:wasmtime-wasi"]
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost", "dep:qrcode"]
 

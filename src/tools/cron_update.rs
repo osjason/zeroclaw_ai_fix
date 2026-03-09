@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
-use crate::cron::{self, CronJobPatch};
+use crate::cron::{self, CronJobPatch, DeliveryConfig, JobType, Schedule};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -44,6 +44,51 @@ impl CronUpdateTool {
         }
 
         None
+    }
+
+    fn parse_default_delivery(args: &serde_json::Value) -> Result<Option<DeliveryConfig>, String> {
+        match args.get("default_delivery") {
+            Some(value) => serde_json::from_value::<DeliveryConfig>(value.clone())
+                .map(Some)
+                .map_err(|e| format!("Invalid default_delivery payload: {e}")),
+            None => Ok(None),
+        }
+    }
+
+    fn should_apply_default_delivery(
+        existing_job: &crate::cron::CronJob,
+        patch: &CronJobPatch,
+        default_delivery: Option<&DeliveryConfig>,
+    ) -> bool {
+        if patch.delivery.is_some()
+            || default_delivery.is_none()
+            || !matches!(existing_job.job_type, JobType::Agent)
+            || !matches!(existing_job.schedule, Schedule::At { .. })
+            || existing_job
+                .name
+                .as_deref()
+                .is_some_and(|name| name.starts_with("__"))
+        {
+            return false;
+        }
+
+        let mode = existing_job.delivery.mode.trim();
+        let channel = existing_job
+            .delivery
+            .channel
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let target = existing_job
+            .delivery
+            .to
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+
+        (mode.is_empty() || mode.eq_ignore_ascii_case("none"))
+            && channel.is_none()
+            && target.is_none()
     }
 }
 
@@ -118,6 +163,16 @@ impl Tool for CronUpdateTool {
             .get("approved")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        let default_delivery = match Self::parse_default_delivery(&args) {
+            Ok(default_delivery) => default_delivery,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error),
+                });
+            }
+        };
 
         if let Some(command) = &patch.command {
             if let Err(reason) = self.security.validate_command_execution(command, approved) {
@@ -127,6 +182,21 @@ impl Tool for CronUpdateTool {
                     error: Some(reason),
                 });
             }
+        }
+
+        let mut patch = patch;
+        let existing_job = match cron::get_job(&self.config, job_id) {
+            Ok(job) => job,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                });
+            }
+        };
+        if Self::should_apply_default_delivery(&existing_job, &patch, default_delivery.as_ref()) {
+            patch.delivery = default_delivery;
         }
 
         if let Some(blocked) = self.enforce_mutation_allowed("cron_update") {
@@ -312,5 +382,128 @@ mod tests {
             .unwrap_or_default()
             .contains("Rate limit exceeded"));
         assert!(cron::get_job(&cfg, &job.id).unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn applies_default_delivery_to_agent_jobs_when_patch_omits_it() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_agent_job(
+            &cfg,
+            Some("daily-summary".into()),
+            cron::Schedule::At {
+                at: chrono::Utc::now() + chrono::Duration::minutes(10),
+            },
+            "summarize the latest alerts",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "enabled": true },
+                "default_delivery": {
+                    "mode": "announce",
+                    "channel": "feishu",
+                    "to": "oc_chat_123"
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let updated = cron::get_job(&cfg, &job.id).unwrap();
+        assert_eq!(updated.delivery.mode, "announce");
+        assert_eq!(updated.delivery.channel.as_deref(), Some("feishu"));
+        assert_eq!(updated.delivery.to.as_deref(), Some("oc_chat_123"));
+    }
+
+    #[tokio::test]
+    async fn does_not_override_existing_delivery_on_agent_job_update() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_agent_job(
+            &cfg,
+            Some("daily-summary".into()),
+            cron::Schedule::At {
+                at: chrono::Utc::now() + chrono::Duration::minutes(10),
+            },
+            "summarize the latest alerts",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            Some(DeliveryConfig {
+                mode: "announce".into(),
+                channel: Some("discord".into()),
+                to: Some("C123".into()),
+                best_effort: true,
+            }),
+            true,
+        )
+        .unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "enabled": true },
+                "default_delivery": {
+                    "mode": "announce",
+                    "channel": "feishu",
+                    "to": "oc_chat_123"
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let updated = cron::get_job(&cfg, &job.id).unwrap();
+        assert_eq!(updated.delivery.mode, "announce");
+        assert_eq!(updated.delivery.channel.as_deref(), Some("discord"));
+        assert_eq!(updated.delivery.to.as_deref(), Some("C123"));
+    }
+
+    #[tokio::test]
+    async fn does_not_apply_default_delivery_to_recurring_or_internal_jobs() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let recurring_job = cron::add_agent_job(
+            &cfg,
+            Some("__consolidate_nightly".into()),
+            cron::Schedule::Cron {
+                expr: "0 3 * * *".into(),
+                tz: None,
+            },
+            "internal maintenance task",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "job_id": recurring_job.id,
+                "patch": { "enabled": true },
+                "default_delivery": {
+                    "mode": "announce",
+                    "channel": "feishu",
+                    "to": "oc_chat_123"
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let updated = cron::get_job(&cfg, &recurring_job.id).unwrap();
+        assert_eq!(updated.delivery.mode, "none");
+        assert!(updated.delivery.channel.is_none());
+        assert!(updated.delivery.to.is_none());
     }
 }

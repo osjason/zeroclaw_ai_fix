@@ -78,8 +78,9 @@ pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{
     build_shell_policy_instructions, build_tool_instructions_from_specs,
-    run_tool_call_loop_with_non_cli_approval_context, scrub_credentials, NonCliApprovalContext,
-    NonCliApprovalPrompt, SafetyHeartbeatConfig,
+    run_tool_call_loop_with_non_cli_approval_context, scrub_credentials,
+    summarize_runtime_constraint_reasons, NonCliApprovalContext, NonCliApprovalPrompt,
+    SafetyHeartbeatConfig,
 };
 use crate::agent::session::{resolve_session_id, shared_session_manager, Session, SessionManager};
 use crate::approval::{ApprovalManager, ApprovalResponse, PendingApprovalError};
@@ -408,6 +409,15 @@ fn strip_tool_call_tags(message: &str) -> String {
         "<tool>",
         "<invoke>",
     ];
+    const TOOL_CALL_CLOSE_TAGS: [&str; 7] = [
+        "</function_calls>",
+        "</function_call>",
+        "</tool_call>",
+        "</toolcall>",
+        "</tool-call>",
+        "</tool>",
+        "</invoke>",
+    ];
 
     fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
         tags.iter()
@@ -426,6 +436,10 @@ fn strip_tool_call_tags(message: &str) -> String {
             "<invoke>" => Some("</invoke>"),
             _ => None,
         }
+    }
+
+    fn should_strip_unclosed_open_tag(open_tag: &str) -> bool {
+        !matches!(open_tag, "<tool>")
     }
 
     fn extract_first_json_end(input: &str) -> Option<usize> {
@@ -489,6 +503,11 @@ fn strip_tool_call_tags(message: &str) -> String {
             continue;
         }
 
+        if should_strip_unclosed_open_tag(open_tag) {
+            remaining = "";
+            break;
+        }
+
         kept_segments.push(remaining[start..].to_string());
         remaining = "";
         break;
@@ -498,7 +517,22 @@ fn strip_tool_call_tags(message: &str) -> String {
         kept_segments.push(remaining.to_string());
     }
 
-    let mut result = kept_segments.concat();
+    let mut cleaned_lines = Vec::new();
+    for line in kept_segments.concat().lines() {
+        let mut cleaned_line = line.to_string();
+        let mut removed_close_tag = false;
+        for close_tag in TOOL_CALL_CLOSE_TAGS {
+            if cleaned_line.contains(close_tag) {
+                cleaned_line = cleaned_line.replace(close_tag, "");
+                removed_close_tag = true;
+            }
+        }
+        if removed_close_tag && cleaned_line.trim().is_empty() {
+            continue;
+        }
+        cleaned_lines.push(cleaned_line);
+    }
+    let mut result = cleaned_lines.join("\n");
 
     // Clean up any resulting blank lines (but preserve paragraphs)
     while result.contains("\n\n\n") {
@@ -2950,6 +2984,67 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
     format!("[Used tools: {}]", tool_names.join(", "))
 }
 
+fn collect_runtime_constraint_fragments_from_tool_results(
+    content: &str,
+    reasons: &mut Vec<String>,
+) {
+    let mut remaining = content;
+
+    while let Some(start) = remaining.find("<tool_result") {
+        let after_start = &remaining[start..];
+        let Some(open_end) = after_start.find('>') else {
+            break;
+        };
+        let body = &after_start[open_end + 1..];
+        let Some(close_idx) = body.find("</tool_result>") else {
+            break;
+        };
+        let inner = body[..close_idx].trim();
+        if !inner.is_empty() {
+            reasons.push(inner.to_string());
+        }
+        remaining = &body[close_idx + "</tool_result>".len()..];
+    }
+}
+
+fn extract_runtime_constraint_summary(history: &[ChatMessage], start_index: usize) -> Vec<String> {
+    let mut reasons = Vec::new();
+
+    for msg in history.iter().skip(start_index) {
+        match msg.role.as_str() {
+            "tool" => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content) {
+                    if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
+                        reasons.push(content.to_string());
+                    }
+                }
+            }
+            "user" => {
+                if msg.content.contains("[Tool results]") || msg.content.contains("<tool_result") {
+                    collect_runtime_constraint_fragments_from_tool_results(
+                        &msg.content,
+                        &mut reasons,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    summarize_runtime_constraint_reasons(reasons.iter().map(String::as_str), 3)
+}
+
+fn append_runtime_constraint_summary(base: &str, reasons: &[String]) -> String {
+    if reasons.is_empty() {
+        return base.to_string();
+    }
+
+    format!(
+        "{base}\n\nRecent runtime blockers:\n- {}",
+        reasons.join("\n- ")
+    )
+}
+
 pub(crate) enum ChannelSanitizationResult {
     Sanitized(String),
     Blocked {
@@ -3758,6 +3853,9 @@ or tune thresholds in config.",
         log_worker_join_result(handle.await);
     }
 
+    let runtime_constraint_summary =
+        extract_runtime_constraint_summary(&history, history_len_before_tools);
+
     let reaction_done_emoji = match &llm_result {
         LlmExecutionResult::Completed(Ok(Ok(_))) => "\u{2705}", // ✅
         _ => "\u{26A0}\u{FE0F}",                                // ⚠️
@@ -4025,8 +4123,11 @@ or tune thresholds in config.",
                 }
             } else if is_tool_iteration_limit_error(&e) {
                 let limit = ctx.max_tool_iterations.max(1);
-                let pause_text = format!(
+                let pause_text = append_runtime_constraint_summary(
+                    &format!(
                     "⚠️ Reached tool-iteration limit ({limit}) for this turn. Context and progress were preserved. Reply \"continue\" to resume, or increase `agent.max_tool_iterations`."
+                    ),
+                    &runtime_constraint_summary,
                 );
                 runtime_trace::record_event(
                     "channel_message_error",
@@ -4045,9 +4146,7 @@ or tune thresholds in config.",
                 append_sender_turn(
                     ctx.as_ref(),
                     &history_key,
-                    ChatMessage::assistant(
-                        "[Task paused at tool-iteration limit — context preserved. Ask to continue.]",
-                    ),
+                    ChatMessage::assistant(&pause_text),
                 );
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
@@ -11370,6 +11469,58 @@ Mon Feb 20
     }
 
     #[test]
+    fn extract_runtime_constraint_summary_collects_tool_policy_failures() {
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(
+                r#"[Tool results]
+<tool_result name="file_read" status="error">
+Error: Reading sensitive file '.env' is blocked by policy. Set [autonomy].allow_sensitive_file_reads = true only when strictly necessary.
+</tool_result>
+<tool_result name="shell" status="error">
+Error: Command requires explicit approval (approved=true): medium-risk operation
+</tool_result>"#,
+            ),
+            ChatMessage::tool(
+                serde_json::json!({
+                    "tool_call_id": "call_1",
+                    "content": "Error: Tool 'browser_open' is not available in this channel."
+                })
+                .to_string(),
+            ),
+        ];
+
+        let summary = extract_runtime_constraint_summary(&history, 1);
+        assert_eq!(summary.len(), 3);
+        assert!(summary
+            .iter()
+            .any(|item| item.contains("allow_sensitive_file_reads")));
+        assert!(summary
+            .iter()
+            .any(|item| item.contains("requires approval")));
+        assert!(summary
+            .iter()
+            .any(|item| item.contains("not available in this channel")));
+    }
+
+    #[test]
+    fn append_runtime_constraint_summary_adds_user_visible_blockers() {
+        let base = "⚠️ Reached tool-iteration limit (3) for this turn.";
+        let summary = append_runtime_constraint_summary(
+            base,
+            &[
+                "Reading sensitive file '.env' is blocked by policy. Set [autonomy].allow_sensitive_file_reads = true only when strictly necessary.".to_string(),
+                "Command requires explicit approval (approved=true): medium-risk operation".to_string(),
+            ],
+        );
+
+        assert!(summary.contains(base));
+        assert!(summary.contains("Recent runtime blockers:"));
+        assert!(summary.contains("allow_sensitive_file_reads"));
+        assert!(summary.contains("medium-risk operation"));
+    }
+
+    #[test]
     fn strip_isolated_tool_json_artifacts_removes_tool_calls_and_results() {
         let mut known_tools = HashSet::new();
         known_tools.insert("schedule".to_string());
@@ -11522,6 +11673,41 @@ BTC is currently around $65,000 based on latest tool output."#;
         assert!(!result.contains("<tool_call>"));
         assert!(!result.contains("\"name\":\"mock_price\""));
         assert!(!result.contains("\"result\""));
+    }
+
+    #[test]
+    fn sanitize_channel_response_removes_orphan_tool_close_tags() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let input = "[Used tools: shell]\n</tool_call>\nWorking on it...";
+
+        let result = sanitize_channel_response(
+            input,
+            &tools,
+            &crate::config::OutboundLeakGuardConfig::default(),
+        );
+        let ChannelSanitizationResult::Sanitized(result) = result else {
+            panic!("expected sanitized output");
+        };
+
+        assert!(!result.contains("</tool_call>"));
+        assert_eq!(result, "[Used tools: shell]\nWorking on it...");
+    }
+
+    #[test]
+    fn sanitize_channel_response_drops_unclosed_tool_call_block() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
+        let input = "Let me check.\n<tool_call>\n{\"name\":\"debug_trace\",\"arguments\":{\"foo\":\"bar\"}}";
+
+        let result = sanitize_channel_response(
+            input,
+            &tools,
+            &crate::config::OutboundLeakGuardConfig::default(),
+        );
+        let ChannelSanitizationResult::Sanitized(result) = result else {
+            panic!("expected sanitized output");
+        };
+
+        assert_eq!(result, "Let me check.");
     }
 
     #[test]

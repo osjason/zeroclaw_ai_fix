@@ -851,6 +851,23 @@ fn parse_source_agent(raw_agent: &Value) -> Option<DelegateAgentConfig> {
         model,
         system_prompt: find_string(obj, &["system_prompt", "systemPrompt"]),
         api_key: find_string(obj, &["api_key", "apiKey"]),
+        enabled: obj.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+        capabilities: obj
+            .get("capabilities")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        priority: obj
+            .get("priority")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or(0),
         temperature: find_f64(obj, &["temperature"]),
         max_depth: find_u32(obj, &["max_depth", "maxDepth"]).unwrap_or(3),
         agentic: obj.get("agentic").and_then(Value::as_bool).unwrap_or(false),
@@ -1468,6 +1485,9 @@ mod tests {
                 model: "existing-model".to_string(),
                 system_prompt: Some("existing prompt".to_string()),
                 api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,

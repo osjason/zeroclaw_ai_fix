@@ -35,7 +35,7 @@ mod context;
 pub(crate) mod detection;
 mod execution;
 mod history;
-mod parsing;
+pub(crate) mod parsing;
 
 use context::{build_context, build_hardware_context};
 use detection::{DetectionVerdict, LoopDetectionConfig, LoopDetector};
@@ -544,7 +544,7 @@ fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len
     }
 }
 
-fn looks_like_deferred_action_without_tool_call(text: &str) -> bool {
+pub(crate) fn looks_like_deferred_action_without_tool_call(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return false;
@@ -559,21 +559,164 @@ fn looks_like_deferred_action_without_tool_call(text: &str) -> bool {
         && CJK_DEFERRED_ACTION_VERB_REGEX.is_match(trimmed)
 }
 
-fn maybe_inject_cron_add_delivery(
+fn strip_tool_error_prefix(reason: &str) -> &str {
+    let trimmed = reason.trim();
+    trimmed
+        .strip_prefix("Error:")
+        .map(str::trim)
+        .unwrap_or(trimmed)
+}
+
+pub(crate) fn looks_like_runtime_constraint_reason(reason: &str) -> bool {
+    let lower = strip_tool_error_prefix(reason).to_ascii_lowercase();
+    lower.contains("security policy")
+        || lower.contains("blocked by policy")
+        || lower.contains("requires explicit approval")
+        || lower.contains("denied by user")
+        || lower.contains("not available in this channel")
+        || lower.contains("outside the allowed workspace")
+        || lower.contains("escapes workspace")
+        || lower.contains("allowed_roots")
+        || lower.contains("workspace_only")
+        || lower.contains("allow_sensitive_file_reads")
+        || lower.contains("allow_sensitive_file_writes")
+        || lower.contains("security.url_access.")
+        || lower.contains("first-time domain approval required")
+}
+
+pub(crate) fn normalize_runtime_constraint_reason(reason: &str) -> String {
+    let trimmed = strip_tool_error_prefix(reason);
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+
+    if lower.contains("path not allowed by security policy")
+        || lower.contains("path blocked by security policy")
+        || lower.contains("outside the allowed workspace")
+        || lower.contains("escapes workspace")
+    {
+        if lower.contains("allowed_roots") || lower.contains("workspace_only") {
+            return trimmed.to_string();
+        }
+        return format!(
+            "{trimmed} Guidance: review `[autonomy].workspace_only` and `[autonomy].allowed_roots`."
+        );
+    }
+
+    if lower.contains("requires explicit approval") || lower.contains("denied by user") {
+        return format!(
+            "{trimmed} Guidance: supervised execution requires approval for this tool or action."
+        );
+    }
+
+    if lower.contains("not available in this channel") {
+        return format!(
+            "{trimmed} Guidance: review the channel/runtime tool exclusion list or use another allowed tool."
+        );
+    }
+
+    if lower.contains("command not allowed by security policy")
+        || lower.contains("high-risk command is disallowed by policy")
+    {
+        return format!(
+            "{trimmed} Guidance: use a safer dedicated tool, or adjust `[autonomy]` command/approval policy."
+        );
+    }
+
+    trimmed.to_string()
+}
+
+pub(crate) fn summarize_runtime_constraint_reasons<I, S>(
+    reasons: I,
+    max_items: usize,
+) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut summaries = Vec::new();
+    let mut seen = HashSet::new();
+
+    for reason in reasons {
+        let raw = reason.as_ref();
+        if !looks_like_runtime_constraint_reason(raw) {
+            continue;
+        }
+
+        let normalized = truncate_with_ellipsis(&normalize_runtime_constraint_reason(raw), 280);
+        if normalized.is_empty() {
+            continue;
+        }
+
+        if seen.insert(normalized.clone()) {
+            summaries.push(normalized);
+            if summaries.len() >= max_items {
+                break;
+            }
+        }
+    }
+
+    summaries
+}
+
+pub(crate) fn build_runtime_constraint_retry_prompt(reasons: &[String]) -> Option<String> {
+    if reasons.is_empty() {
+        return None;
+    }
+
+    Some(format!(
+        "Runtime policy blocked one or more tool calls this turn:\n- {}\n\
+         These are runtime safety or approval constraints, not transient tool failures. \
+         Do not retry the same blocked tool, path, command, or domain unchanged. \
+         Explain the exact blocker to the user, mention the relevant config key or approval gate when known, \
+         and either choose an allowed alternative or clearly state what must change before continuing.",
+        reasons.join("\n- ")
+    ))
+}
+
+pub(crate) fn build_missing_tool_call_retry_prompt(reason: &str, attempt: usize) -> String {
+    if attempt <= 1 {
+        return format!("{MISSING_TOOL_CALL_RETRY_PROMPT} Recovery reason: {reason}.");
+    }
+
+    format!(
+        "Internal correction attempt #{attempt}: your last reply still failed to emit a valid tool call. Recovery reason: {reason}. \
+         Either (1) emit one valid <tool_call>...</tool_call> block immediately, or (2) stop using tools and provide the complete final answer now. \
+         Do not emit partial tags, protocol fragments, or placeholders."
+    )
+}
+
+fn build_cron_default_delivery(
+    channel_name: &str,
+    reply_target: Option<&str>,
+) -> Option<serde_json::Value> {
+    if !AUTO_CRON_DELIVERY_CHANNELS
+        .iter()
+        .any(|supported| supported == &channel_name)
+    {
+        return None;
+    }
+
+    let reply_target = reply_target
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+
+    Some(serde_json::json!({
+        "mode": "announce",
+        "channel": channel_name,
+        "to": reply_target,
+    }))
+}
+
+fn maybe_inject_cron_delivery_defaults(
     tool_name: &str,
     tool_args: &mut serde_json::Value,
     channel_name: &str,
     reply_target: Option<&str>,
 ) {
-    if tool_name != "cron_add"
-        || !AUTO_CRON_DELIVERY_CHANNELS
-            .iter()
-            .any(|supported| supported == &channel_name)
-    {
-        return;
-    }
-
-    let Some(reply_target) = reply_target.map(str::trim).filter(|v| !v.is_empty()) else {
+    let Some(default_delivery) = build_cron_default_delivery(channel_name, reply_target) else {
         return;
     };
 
@@ -581,56 +724,60 @@ fn maybe_inject_cron_add_delivery(
         return;
     };
 
-    let is_agent_job = match args_obj.get("job_type").and_then(serde_json::Value::as_str) {
-        Some("agent") => true,
-        Some(_) => false,
-        None => args_obj.contains_key("prompt"),
-    };
-    if !is_agent_job {
-        return;
-    }
+    match tool_name {
+        "cron_add" => {
+            let is_agent_job = match args_obj.get("job_type").and_then(serde_json::Value::as_str) {
+                Some("agent") => true,
+                Some(_) => false,
+                None => args_obj.contains_key("prompt"),
+            };
+            if !is_agent_job {
+                return;
+            }
 
-    let delivery = args_obj
-        .entry("delivery".to_string())
-        .or_insert_with(|| serde_json::json!({}));
-    let Some(delivery_obj) = delivery.as_object_mut() else {
-        return;
-    };
+            let delivery = args_obj
+                .entry("delivery".to_string())
+                .or_insert_with(|| serde_json::json!({}));
+            let Some(delivery_obj) = delivery.as_object_mut() else {
+                return;
+            };
 
-    let mode = delivery_obj
-        .get("mode")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("none");
-    if mode.eq_ignore_ascii_case("none") || mode.trim().is_empty() {
-        delivery_obj.insert(
-            "mode".to_string(),
-            serde_json::Value::String("announce".to_string()),
-        );
-    } else if !mode.eq_ignore_ascii_case("announce") {
-        // Respect explicitly chosen non-announce modes.
-        return;
-    }
+            let mode = delivery_obj
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("none");
+            if mode.eq_ignore_ascii_case("none") || mode.trim().is_empty() {
+                delivery_obj.insert(
+                    "mode".to_string(),
+                    serde_json::Value::String("announce".to_string()),
+                );
+            } else if !mode.eq_ignore_ascii_case("announce") {
+                // Respect explicitly chosen non-announce modes.
+                return;
+            }
 
-    let needs_channel = delivery_obj
-        .get("channel")
-        .and_then(serde_json::Value::as_str)
-        .is_none_or(|value| value.trim().is_empty());
-    if needs_channel {
-        delivery_obj.insert(
-            "channel".to_string(),
-            serde_json::Value::String(channel_name.to_string()),
-        );
-    }
-
-    let needs_target = delivery_obj
-        .get("to")
-        .and_then(serde_json::Value::as_str)
-        .is_none_or(|value| value.trim().is_empty());
-    if needs_target {
-        delivery_obj.insert(
-            "to".to_string(),
-            serde_json::Value::String(reply_target.to_string()),
-        );
+            for key in ["channel", "to"] {
+                let needs_value = delivery_obj
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .is_none_or(|value| value.trim().is_empty());
+                if needs_value {
+                    delivery_obj.insert(
+                        key.to_string(),
+                        default_delivery
+                            .get(key)
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null),
+                    );
+                }
+            }
+        }
+        "cron_update" => {
+            args_obj
+                .entry("default_delivery".to_string())
+                .or_insert(default_delivery);
+        }
+        _ => {}
     }
 }
 
@@ -1029,8 +1176,9 @@ pub(crate) async fn run_tool_call_loop(
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
-    let mut missing_tool_call_retry_used = false;
+    let mut missing_tool_call_retry_attempts = 0usize;
     let mut missing_tool_call_retry_prompt: Option<String> = None;
+    let mut runtime_constraint_prompt: Option<String> = None;
     let ld_config = LOOP_DETECTION_CONFIG
         .try_with(Clone::clone)
         .unwrap_or_default();
@@ -1090,6 +1238,9 @@ pub(crate) async fn run_tool_call_loop(
             multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
         let mut request_messages = prepared_messages.messages.clone();
         if let Some(prompt) = missing_tool_call_retry_prompt.take() {
+            request_messages.push(ChatMessage::user(prompt));
+        }
+        if let Some(prompt) = runtime_constraint_prompt.take() {
             request_messages.push(ChatMessage::user(prompt));
         }
         if let Some(prompt) = loop_detection_prompt.take() {
@@ -1493,19 +1644,22 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
-            let missing_tool_call_followthrough = !missing_tool_call_retry_used
-                && iteration + 1 < max_iterations
-                && !tool_specs.is_empty()
-                && (parse_issue_detected
-                    || looks_like_deferred_action_without_tool_call(&display_text));
+            let parse_retry_reason = if parse_issue_detected {
+                Some("parse_issue_detected")
+            } else if looks_like_deferred_action_without_tool_call(&display_text) {
+                Some("deferred_action_text_detected")
+            } else {
+                None
+            };
+            let missing_tool_call_followthrough =
+                !tool_specs.is_empty() && parse_retry_reason.is_some();
             if missing_tool_call_followthrough {
-                missing_tool_call_retry_used = true;
-                missing_tool_call_retry_prompt = Some(MISSING_TOOL_CALL_RETRY_PROMPT.to_string());
-                let retry_reason = if parse_issue_detected {
-                    "parse_issue_detected"
-                } else {
-                    "deferred_action_text_detected"
-                };
+                missing_tool_call_retry_attempts += 1;
+                let retry_reason = parse_retry_reason.unwrap_or("unknown");
+                missing_tool_call_retry_prompt = Some(build_missing_tool_call_retry_prompt(
+                    retry_reason,
+                    missing_tool_call_retry_attempts,
+                ));
 
                 runtime_trace::record_event(
                     "tool_call_followthrough_retry",
@@ -1518,6 +1672,7 @@ pub(crate) async fn run_tool_call_loop(
                     serde_json::json!({
                         "iteration": iteration + 1,
                         "reason": retry_reason,
+                        "attempt": missing_tool_call_retry_attempts,
                         "response_excerpt": truncate_with_ellipsis(&scrub_credentials(&display_text), 600),
                     }),
                 );
@@ -1526,7 +1681,8 @@ pub(crate) async fn run_tool_call_loop(
                     if let Some(ref tx) = on_delta {
                         let _ = tx
                             .send(format!(
-                                "{DRAFT_PROGRESS_SENTINEL}\u{21bb} Retrying: response deferred action without a tool call\n"
+                                "{DRAFT_PROGRESS_SENTINEL}\u{21bb} Retrying after malformed or incomplete tool call (attempt {})\n",
+                                missing_tool_call_retry_attempts
                             ))
                             .await;
                     }
@@ -1578,6 +1734,8 @@ pub(crate) async fn run_tool_call_loop(
             history.push(ChatMessage::assistant(response_text.clone()));
             return Ok(display_text);
         }
+
+        missing_tool_call_retry_attempts = 0;
 
         // Print any text the LLM produced alongside tool calls (unless silent)
         if !silent && !display_text.is_empty() {
@@ -1644,7 +1802,7 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
 
-            maybe_inject_cron_add_delivery(
+            maybe_inject_cron_delivery_defaults(
                 &tool_name,
                 &mut tool_args,
                 channel_name,
@@ -1936,6 +2094,16 @@ pub(crate) async fn run_tool_call_loop(
 
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
+
+        let runtime_constraint_reasons = summarize_runtime_constraint_reasons(
+            ordered_results
+                .iter()
+                .flatten()
+                .filter_map(|(_, _, outcome)| outcome.error_reason.as_deref()),
+            3,
+        );
+        runtime_constraint_prompt =
+            build_runtime_constraint_retry_prompt(&runtime_constraint_reasons);
 
         for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
             individual_results.push((tool_call_id, outcome.output.clone()));
@@ -3061,13 +3229,13 @@ mod tests {
     }
 
     #[test]
-    fn maybe_inject_cron_add_delivery_populates_agent_delivery_from_channel_context() {
+    fn maybe_inject_cron_delivery_defaults_populates_agent_delivery_from_channel_context() {
         let mut args = serde_json::json!({
             "job_type": "agent",
             "prompt": "remind me later"
         });
 
-        maybe_inject_cron_add_delivery("cron_add", &mut args, "telegram", Some("-10012345"));
+        maybe_inject_cron_delivery_defaults("cron_add", &mut args, "telegram", Some("-10012345"));
 
         assert_eq!(args["delivery"]["mode"], "announce");
         assert_eq!(args["delivery"]["channel"], "telegram");
@@ -3075,7 +3243,7 @@ mod tests {
     }
 
     #[test]
-    fn maybe_inject_cron_add_delivery_does_not_override_explicit_target() {
+    fn maybe_inject_cron_delivery_defaults_does_not_override_explicit_target() {
         let mut args = serde_json::json!({
             "job_type": "agent",
             "prompt": "remind me later",
@@ -3086,31 +3254,31 @@ mod tests {
             }
         });
 
-        maybe_inject_cron_add_delivery("cron_add", &mut args, "telegram", Some("-10012345"));
+        maybe_inject_cron_delivery_defaults("cron_add", &mut args, "telegram", Some("-10012345"));
 
         assert_eq!(args["delivery"]["channel"], "discord");
         assert_eq!(args["delivery"]["to"], "C123");
     }
 
     #[test]
-    fn maybe_inject_cron_add_delivery_skips_shell_jobs() {
+    fn maybe_inject_cron_delivery_defaults_skips_shell_jobs() {
         let mut args = serde_json::json!({
             "job_type": "shell",
             "command": "echo hello"
         });
 
-        maybe_inject_cron_add_delivery("cron_add", &mut args, "telegram", Some("-10012345"));
+        maybe_inject_cron_delivery_defaults("cron_add", &mut args, "telegram", Some("-10012345"));
 
         assert!(args.get("delivery").is_none());
     }
 
     #[test]
-    fn maybe_inject_cron_add_delivery_supports_lark_and_feishu_channels() {
+    fn maybe_inject_cron_delivery_defaults_supports_lark_and_feishu_channels() {
         let mut lark_args = serde_json::json!({
             "job_type": "agent",
             "prompt": "daily summary"
         });
-        maybe_inject_cron_add_delivery("cron_add", &mut lark_args, "lark", Some("oc_xxx"));
+        maybe_inject_cron_delivery_defaults("cron_add", &mut lark_args, "lark", Some("oc_xxx"));
         assert_eq!(lark_args["delivery"]["channel"], "lark");
         assert_eq!(lark_args["delivery"]["to"], "oc_xxx");
 
@@ -3118,9 +3286,24 @@ mod tests {
             "job_type": "agent",
             "prompt": "daily summary"
         });
-        maybe_inject_cron_add_delivery("cron_add", &mut feishu_args, "feishu", Some("oc_yyy"));
+        maybe_inject_cron_delivery_defaults("cron_add", &mut feishu_args, "feishu", Some("oc_yyy"));
         assert_eq!(feishu_args["delivery"]["channel"], "feishu");
         assert_eq!(feishu_args["delivery"]["to"], "oc_yyy");
+    }
+
+    #[test]
+    fn maybe_inject_cron_delivery_defaults_adds_hidden_defaults_for_cron_update() {
+        let mut args = serde_json::json!({
+            "job_id": "cron-123",
+            "patch": { "enabled": true }
+        });
+
+        maybe_inject_cron_delivery_defaults("cron_update", &mut args, "feishu", Some("oc_yyy"));
+
+        assert_eq!(args["default_delivery"]["mode"], "announce");
+        assert_eq!(args["default_delivery"]["channel"], "feishu");
+        assert_eq!(args["default_delivery"]["to"], "oc_yyy");
+        assert!(args["patch"].get("delivery").is_none());
     }
 
     #[test]
@@ -5189,6 +5372,15 @@ Done."#;
         assert!(
             issue.is_some(),
             "malformed tool payload should be flagged for diagnostics"
+        );
+    }
+
+    #[test]
+    fn detect_tool_call_parse_issue_flags_orphan_close_tag() {
+        let issue = detect_tool_call_parse_issue("</tool_call>", &[]);
+        assert!(
+            issue.is_some(),
+            "orphan close tag should be flagged for diagnostics"
         );
     }
 

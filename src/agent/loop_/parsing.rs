@@ -4,10 +4,10 @@ use std::collections::HashSet;
 use std::sync::LazyLock;
 
 #[derive(Debug, Clone)]
-pub(super) struct ParsedToolCall {
-    pub(super) name: String,
-    pub(super) arguments: serde_json::Value,
-    pub(super) tool_call_id: Option<String>,
+pub(crate) struct ParsedToolCall {
+    pub(crate) name: String,
+    pub(crate) arguments: serde_json::Value,
+    pub(crate) tool_call_id: Option<String>,
 }
 
 pub(super) fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
@@ -169,7 +169,7 @@ pub(super) fn canonicalize_json_for_tool_signature(value: &serde_json::Value) ->
     }
 }
 
-pub(super) fn tool_call_signature(name: &str, arguments: &serde_json::Value) -> (String, String) {
+pub(crate) fn tool_call_signature(name: &str, arguments: &serde_json::Value) -> (String, String) {
     let canonical_args = canonicalize_json_for_tool_signature(arguments);
     let args_json = serde_json::to_string(&canonical_args).unwrap_or_else(|_| "{}".to_string());
     (name.trim().to_ascii_lowercase(), args_json)
@@ -1651,12 +1651,19 @@ pub(super) fn detect_tool_call_parse_issue(
     }
 
     let looks_like_tool_payload = trimmed.contains("<tool_call")
+        || trimmed.contains("</tool_call>")
         || trimmed.contains("<toolcall")
+        || trimmed.contains("</toolcall>")
         || trimmed.contains("<tool-call")
+        || trimmed.contains("</tool-call>")
+        || trimmed.contains("</function_call>")
+        || trimmed.contains("</function_calls>")
         || trimmed.contains("<shell>")
         || trimmed.contains("<file_write>")
         || trimmed.contains("<file_read>")
         || trimmed.contains("<memory_recall>")
+        || trimmed.contains("</invoke>")
+        || trimmed.contains("</tool>")
         || trimmed.contains("```tool_call")
         || trimmed.contains("```toolcall")
         || trimmed.contains("```tool-call")

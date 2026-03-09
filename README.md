@@ -45,6 +45,54 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
   <a href="docs/contributing/README.md">Contribute</a>
 </p>
 
+## Fork Status (`release/v0.1.8`)
+
+This repository is a ZeroClaw fork with branch-local changes on top of `release/v0.1.8`.
+It keeps the upstream documentation entry points, but the current working tree is tailored for this fork's build and runtime workflow.
+
+- Cross-platform builds in this fork use [`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild).
+- The branch-specific detailed changelog for the current working tree is tracked in [docs/project/2026-03-09-release-v0.1.8-working-tree-changelog.md](docs/project/2026-03-09-release-v0.1.8-working-tree-changelog.md).
+- The summary below only covers the current `release/v0.1.8` branch working tree. It is not a generic upstream `v0.1.8` release note.
+
+### Cross-Compile With `cargo-zigbuild`
+
+Install `cargo-zigbuild` first, then use `cargo zigbuild` with the target and feature set you need.
+
+Primary example used in this fork:
+
+```bash
+cargo zigbuild --release --target aarch64-unknown-linux-gnu --features web-fetch-html2md,wasm-tools,runtime-wasm,channel-lark
+```
+
+Additional examples:
+
+```bash
+cargo zigbuild --release --target x86_64-unknown-linux-gnu --features web-fetch-html2md,channel-lark
+
+cargo zigbuild --release --target aarch64-unknown-linux-musl --features web-fetch-html2md,runtime-wasm
+
+cargo zigbuild --release --target x86_64-unknown-linux-gnu --no-default-features --features channel-lark,wasm-tools,runtime-wasm
+```
+
+Feature hints used by this branch:
+
+- `web-fetch-html2md`: keep HTML fetching and HTML-to-Markdown conversion available.
+- `wasm-tools`: enable the WASM plugin engine for dynamically loaded tool packages.
+- `runtime-wasm`: enable the in-process WASM runtime path.
+- `channel-lark`: keep the Lark/Feishu channel implementation in the build.
+
+### Current Branch Changelog Summary
+
+Current working-tree changes on `release/v0.1.8` mainly do the following:
+
+- Harden tool-loop recovery so malformed `tool_call` payloads, repeated failures, and runtime policy blockers push the model toward a new strategy instead of failing silently.
+- Extend Lark/Feishu behavior with draft message updates, ACK reaction policy handling, group-reply gating, and cleaner outbound message sanitization.
+- Expand the config/runtime surface for provider defaults, transport/reasoning controls, URL-access policy, MCP/WASM integration, and cron delivery defaults.
+- Follow through on the above with onboarding, gateway, daemon/doctor, migration, and docs/test updates on this branch.
+
+See the branch-local detailed changelog for the full breakdown:
+[docs/project/2026-03-09-release-v0.1.8-working-tree-changelog.md](docs/project/2026-03-09-release-v0.1.8-working-tree-changelog.md)
+
 <p align="center">
   <strong>Fast, small, and fully autonomous Framework</strong><br />
   Deploy anywhere. Swap anything.

@@ -360,9 +360,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &providers::ProviderRuntimeOptions {
             auth_profile_override: None,
             provider_api_url: config.api_url.clone(),
+            provider_transport: config.effective_provider_transport(),
             zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
             secrets_encrypt: config.secrets.encrypt,
             reasoning_enabled: config.runtime.reasoning_enabled,
+            reasoning_level: config.effective_provider_reasoning_level(),
             custom_provider_api_mode: config.provider_api.map(|mode| mode.as_compatible_mode()),
             max_tokens_override: None,
             model_support_vision: config.model_support_vision,
@@ -923,9 +925,13 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
 }
 
 /// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
-async fn run_gateway_chat_with_tools(state: &AppState, message: &str) -> anyhow::Result<String> {
+async fn run_gateway_chat_with_tools(
+    state: &AppState,
+    message: &str,
+    session_id: Option<&str>,
+) -> anyhow::Result<String> {
     let config = state.config.lock().clone();
-    crate::agent::process_message(config, message).await
+    crate::agent::process_message_with_session(config, message, session_id).await
 }
 
 /// Webhook request body
@@ -1436,7 +1442,7 @@ async fn handle_whatsapp_message(
                 .await;
         }
 
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        match run_gateway_chat_with_tools(&state, &msg.content, None).await {
             Ok(response) => {
                 // Send reply via WhatsApp
                 if let Err(e) = wa
@@ -1544,7 +1550,7 @@ async fn handle_linq_webhook(
         }
 
         // Call the LLM
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        match run_gateway_chat_with_tools(&state, &msg.content, None).await {
             Ok(response) => {
                 // Send reply via Linq
                 if let Err(e) = linq
@@ -1636,7 +1642,7 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
         }
 
         // Call the LLM
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        match run_gateway_chat_with_tools(&state, &msg.content, None).await {
             Ok(response) => {
                 // Send reply via WATI
                 if let Err(e) = wati
@@ -1740,7 +1746,7 @@ async fn handle_nextcloud_talk_webhook(
                 .await;
         }
 
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        match run_gateway_chat_with_tools(&state, &msg.content, None).await {
             Ok(response) => {
                 if let Err(e) = nextcloud_talk
                     .send(&SendMessage::new(response, &msg.reply_target))
@@ -1829,7 +1835,7 @@ async fn handle_qq_webhook(
                 .await;
         }
 
-        match run_gateway_chat_with_tools(&state, &msg.content).await {
+        match run_gateway_chat_with_tools(&state, &msg.content, None).await {
             Ok(response) => {
                 if let Err(e) = qq
                     .send(
@@ -1977,7 +1983,10 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_endpoint_renders_prometheus_output() {
-        let prom = Arc::new(crate::observability::PrometheusObserver::new());
+        let prom = Arc::new(
+            crate::observability::PrometheusObserver::new()
+                .expect("prometheus observer should initialize"),
+        );
         crate::observability::Observer::record_event(
             prom.as_ref(),
             &crate::observability::ObserverEvent::HeartbeatTick,

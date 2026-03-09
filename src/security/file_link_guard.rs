@@ -1,27 +1,45 @@
 use std::fs::Metadata;
+use std::path::Path;
 
 /// Returns true when a file has multiple hard links.
 ///
 /// Multiple links can allow path-based workspace guards to be bypassed by
 /// linking a workspace path to external sensitive content.
-pub fn has_multiple_hard_links(metadata: &Metadata) -> bool {
-    link_count(metadata) > 1
+pub fn has_multiple_hard_links(metadata: &Metadata, path: &Path) -> bool {
+    link_count(metadata, path) > 1
 }
 
 #[cfg(unix)]
-fn link_count(metadata: &Metadata) -> u64 {
+fn link_count(metadata: &Metadata, _path: &Path) -> u64 {
     use std::os::unix::fs::MetadataExt;
     metadata.nlink()
 }
 
 #[cfg(windows)]
-fn link_count(metadata: &Metadata) -> u64 {
-    use std::os::windows::fs::MetadataExt;
-    u64::from(metadata.number_of_links())
+fn link_count(_metadata: &Metadata, path: &Path) -> u64 {
+    let output = std::process::Command::new("fsutil")
+        .args(["hardlink", "list"])
+        .arg(path)
+        .output();
+
+    let Ok(output) = output else {
+        return 2;
+    };
+
+    if !output.status.success() {
+        return 2;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let count = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    count.max(1) as u64
 }
 
 #[cfg(not(any(unix, windows)))]
-fn link_count(_metadata: &Metadata) -> u64 {
+fn link_count(_metadata: &Metadata, _path: &Path) -> u64 {
     1
 }
 
@@ -35,7 +53,7 @@ mod tests {
         let file = dir.path().join("single.txt");
         std::fs::write(&file, "hello").unwrap();
         let meta = std::fs::metadata(&file).unwrap();
-        assert!(!has_multiple_hard_links(&meta));
+        assert!(!has_multiple_hard_links(&meta, &file));
     }
 
     #[test]
@@ -51,6 +69,6 @@ mod tests {
         }
 
         let meta = std::fs::metadata(&original).unwrap();
-        assert!(has_multiple_hard_links(&meta));
+        assert!(has_multiple_hard_links(&meta, &original));
     }
 }

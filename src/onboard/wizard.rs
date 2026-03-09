@@ -4,9 +4,8 @@ use crate::config::schema::{
     WhatsAppConfig,
 };
 use crate::config::{
-    AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
-    HeartbeatConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
-    RuntimeConfig, SecretsConfig, SlackConfig, StorageConfig, TelegramConfig, WebhookConfig,
+    ChannelsConfig, ComposioConfig, Config, DiscordConfig, IMessageConfig, LarkConfig,
+    MatrixConfig, MemoryConfig, SecretsConfig, SlackConfig, TelegramConfig, WebhookConfig,
 };
 use crate::hardware::{self, HardwareConfig};
 use crate::memory::{
@@ -61,6 +60,49 @@ const MODEL_PREVIEW_LIMIT: usize = 20;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
+
+#[derive(Debug, Clone, Default)]
+pub struct OpenClawOnboardMigrationOptions {
+    pub enabled: bool,
+    pub source_workspace: Option<PathBuf>,
+    pub source_config: Option<PathBuf>,
+}
+
+pub async fn run_wizard_with_migration(
+    force: bool,
+    migration: OpenClawOnboardMigrationOptions,
+) -> Result<Config> {
+    if migration.enabled {
+        bail!("OpenClaw migration is not available in this build");
+    }
+    run_wizard(force).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_quick_setup_with_migration(
+    credential_override: Option<&str>,
+    provider: Option<&str>,
+    model_override: Option<&str>,
+    memory_backend: Option<&str>,
+    force: bool,
+    no_totp: bool,
+    migration: OpenClawOnboardMigrationOptions,
+) -> Result<Config> {
+    if no_totp {
+        bail!("--no-totp is not available in this build");
+    }
+    if migration.enabled {
+        bail!("OpenClaw migration is not available in this build");
+    }
+    run_quick_setup(
+        credential_override,
+        provider,
+        model_override,
+        memory_backend,
+        force,
+    )
+    .await
+}
 
 fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
     channels.channels_except_webhook().iter().any(|(_, ok)| *ok)
@@ -124,57 +166,25 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
 
     // ── Build config ──
     // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
-    let config = Config {
+    let mut config = Config {
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
-        api_key: if api_key.is_empty() {
-            None
-        } else {
-            Some(api_key)
-        },
-        api_url: provider_api_url,
-        default_provider: Some(provider),
-        provider_api: None,
-        default_model: Some(model),
-        model_providers: std::collections::HashMap::new(),
-        default_temperature: 0.7,
-        observability: ObservabilityConfig::default(),
-        autonomy: AutonomyConfig::default(),
-        security: crate::config::SecurityConfig::default(),
-        runtime: RuntimeConfig::default(),
-        research: crate::config::ResearchPhaseConfig::default(),
-        reliability: crate::config::ReliabilityConfig::default(),
-        scheduler: crate::config::schema::SchedulerConfig::default(),
-        agent: crate::config::schema::AgentConfig::default(),
-        skills: crate::config::SkillsConfig::default(),
-        model_routes: Vec::new(),
-        embedding_routes: Vec::new(),
-        heartbeat: HeartbeatConfig::default(),
-        cron: crate::config::CronConfig::default(),
-        channels_config,
-        memory: memory_config, // User-selected memory backend
-        storage: StorageConfig::default(),
-        tunnel: tunnel_config,
-        gateway: crate::config::GatewayConfig::default(),
-        composio: composio_config,
-        secrets: secrets_config,
-        browser: BrowserConfig::default(),
-        http_request: crate::config::HttpRequestConfig::default(),
-        multimodal: crate::config::MultimodalConfig::default(),
-        web_fetch: crate::config::WebFetchConfig::default(),
-        web_search: crate::config::WebSearchConfig::default(),
-        proxy: crate::config::ProxyConfig::default(),
-        identity: crate::config::IdentityConfig::default(),
-        cost: crate::config::CostConfig::default(),
-        peripherals: crate::config::PeripheralsConfig::default(),
-        agents: std::collections::HashMap::new(),
-        hooks: crate::config::HooksConfig::default(),
-        hardware: hardware_config,
-        query_classification: crate::config::QueryClassificationConfig::default(),
-        transcription: crate::config::TranscriptionConfig::default(),
-        agents_ipc: crate::config::AgentsIpcConfig::default(),
-        model_support_vision: None,
+        ..Config::default()
     };
+    config.api_key = if api_key.is_empty() {
+        None
+    } else {
+        Some(api_key)
+    };
+    config.api_url = provider_api_url;
+    config.default_provider = Some(provider);
+    config.default_model = Some(model);
+    config.channels_config = channels_config;
+    config.memory = memory_config;
+    config.tunnel = tunnel_config;
+    config.composio = composio_config;
+    config.secrets = secrets_config;
+    config.hardware = hardware_config;
 
     println!(
         "  {} Security: {} | workspace-scoped",
@@ -393,6 +403,7 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         snapshot_on_hygiene: false,
         auto_hydrate: true,
         sqlite_open_timeout_secs: None,
+        sqlite_journal_mode: MemoryConfig::default().sqlite_journal_mode,
         qdrant: crate::config::QdrantConfig::default(),
     }
 }
@@ -479,57 +490,19 @@ async fn run_quick_setup_with_home(
     // Create memory config based on backend choice
     let memory_config = memory_config_defaults_for_backend(&memory_backend_name);
 
-    let config = Config {
+    let mut config = Config {
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
-        api_key: credential_override.map(|c| {
-            let mut s = String::with_capacity(c.len());
-            s.push_str(c);
-            s
-        }),
-        api_url: None,
-        default_provider: Some(provider_name.clone()),
-        provider_api: None,
-        default_model: Some(model.clone()),
-        model_providers: std::collections::HashMap::new(),
-        default_temperature: 0.7,
-        observability: ObservabilityConfig::default(),
-        autonomy: AutonomyConfig::default(),
-        security: crate::config::SecurityConfig::default(),
-        runtime: RuntimeConfig::default(),
-        research: crate::config::ResearchPhaseConfig::default(),
-        reliability: crate::config::ReliabilityConfig::default(),
-        scheduler: crate::config::schema::SchedulerConfig::default(),
-        agent: crate::config::schema::AgentConfig::default(),
-        skills: crate::config::SkillsConfig::default(),
-        model_routes: Vec::new(),
-        embedding_routes: Vec::new(),
-        heartbeat: HeartbeatConfig::default(),
-        cron: crate::config::CronConfig::default(),
-        channels_config: ChannelsConfig::default(),
-        memory: memory_config,
-        storage: StorageConfig::default(),
-        tunnel: crate::config::TunnelConfig::default(),
-        gateway: crate::config::GatewayConfig::default(),
-        composio: ComposioConfig::default(),
-        secrets: SecretsConfig::default(),
-        browser: BrowserConfig::default(),
-        http_request: crate::config::HttpRequestConfig::default(),
-        multimodal: crate::config::MultimodalConfig::default(),
-        web_fetch: crate::config::WebFetchConfig::default(),
-        web_search: crate::config::WebSearchConfig::default(),
-        proxy: crate::config::ProxyConfig::default(),
-        identity: crate::config::IdentityConfig::default(),
-        cost: crate::config::CostConfig::default(),
-        peripherals: crate::config::PeripheralsConfig::default(),
-        agents: std::collections::HashMap::new(),
-        hooks: crate::config::HooksConfig::default(),
-        hardware: crate::config::HardwareConfig::default(),
-        query_classification: crate::config::QueryClassificationConfig::default(),
-        transcription: crate::config::TranscriptionConfig::default(),
-        agents_ipc: crate::config::AgentsIpcConfig::default(),
-        model_support_vision: None,
+        ..Config::default()
     };
+    config.api_key = credential_override.map(|c| {
+        let mut s = String::with_capacity(c.len());
+        s.push_str(c);
+        s
+    });
+    config.default_provider = Some(provider_name.clone());
+    config.default_model = Some(model.clone());
+    config.memory = memory_config;
 
     config.save().await?;
     persist_workspace_selection(&config.config_path).await?;
@@ -3632,6 +3605,10 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     draft_update_interval_ms: 1000,
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    progress_mode: crate::config::ProgressMode::default(),
+                    group_reply: None,
+                    base_url: None,
+                    ack_enabled: true,
                 });
             }
             ChannelMenuChoice::Discord => {
@@ -3731,6 +3708,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                     listen_to_bots: false,
                     mention_only: false,
+                    group_reply: None,
                 });
             }
             ChannelMenuChoice::Slack => {
@@ -3857,7 +3835,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     } else {
                         Some(channel)
                     },
+                    channel_ids: vec![],
                     allowed_users,
+                    group_reply: None,
                 });
             }
             ChannelMenuChoice::IMessage => {
@@ -4779,6 +4759,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     app_secret,
                     allowed_users,
                     receive_mode,
+                    environment: crate::config::schema::QQEnvironment::Production,
                 });
             }
             ChannelMenuChoice::LarkFeishu => {
@@ -4964,9 +4945,13 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     encrypt_key: None,
                     allowed_users,
                     mention_only: false,
+                    group_reply: None,
                     use_feishu,
                     receive_mode,
                     port,
+                    draft_update_interval_ms:
+                        crate::config::schema::default_lark_draft_update_interval_ms(),
+                    max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
                 });
             }
             ChannelMenuChoice::Nostr => {
@@ -7204,6 +7189,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             thread_replies: Some(true),
             mention_only: Some(false),
+            group_reply: None,
         });
         assert!(has_launchable_channels(&channels));
 
@@ -7213,6 +7199,7 @@ mod tests {
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
             receive_mode: crate::config::schema::QQReceiveMode::Websocket,
+            environment: crate::config::schema::QQEnvironment::Production,
         });
         assert!(has_launchable_channels(&channels));
 

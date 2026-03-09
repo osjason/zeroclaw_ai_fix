@@ -129,9 +129,9 @@ Operational note for container users:
 | `max_history_messages` | `50` | Maximum conversation history messages retained per session |
 | `parallel_tools` | `false` | Enable parallel tool execution within a single iteration |
 | `tool_dispatcher` | `auto` | Tool dispatch strategy |
-| `loop_detection_no_progress_threshold` | `3` | Same tool+args producing identical output this many times triggers loop detection. `0` disables |
-| `loop_detection_ping_pong_cycles` | `2` | A→B→A→B alternating pattern cycle count threshold. `0` disables |
-| `loop_detection_failure_streak` | `3` | Same tool consecutive failure count threshold. `0` disables |
+| `loop_detection_no_progress_threshold` | `3` | Same tool+args producing identical output this many times enters loop recovery prompting. The turn continues until it recovers or reaches `agent.max_tool_iterations`. `0` disables |
+| `loop_detection_ping_pong_cycles` | `2` | A→B→A→B alternating pattern cycle count threshold for loop recovery prompting. The turn continues until it recovers or reaches `agent.max_tool_iterations`. `0` disables |
+| `loop_detection_failure_streak` | `3` | Same tool consecutive failure count threshold for loop recovery prompting. The turn continues until it recovers or reaches `agent.max_tool_iterations`. `0` disables |
 
 Notes:
 

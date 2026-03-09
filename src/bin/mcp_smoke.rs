@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;

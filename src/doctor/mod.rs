@@ -830,7 +830,14 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
         .and_then(serde_json::Value::as_object)
     {
         // Scheduler
-        if let Some(scheduler) = components.get("scheduler") {
+        if !config.cron.enabled {
+            items.push(DiagItem::ok(
+                cat,
+                "cron disabled by config; scheduler not expected",
+            ));
+        } else if !config.scheduler.enabled {
+            items.push(DiagItem::ok(cat, "scheduler disabled by config"));
+        } else if let Some(scheduler) = components.get("scheduler") {
             let scheduler_ok = scheduler
                 .get("status")
                 .and_then(serde_json::Value::as_str)
@@ -1092,6 +1099,64 @@ mod tests {
     }
 
     #[test]
+    fn daemon_diag_reports_scheduler_disabled_by_config() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        config.scheduler.enabled = false;
+
+        let snapshot = serde_json::json!({
+            "updated_at": Utc::now().to_rfc3339(),
+            "components": {}
+        });
+        std::fs::write(
+            crate::daemon::state_file_path(&config),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let mut items = Vec::new();
+        check_daemon_state(&config, &mut items);
+
+        assert!(items
+            .iter()
+            .any(|item| item.message.contains("scheduler disabled by config")));
+    }
+
+    #[test]
+    fn daemon_diag_reports_cron_disabled_when_scheduler_not_expected() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        config.cron.enabled = false;
+
+        let snapshot = serde_json::json!({
+            "updated_at": Utc::now().to_rfc3339(),
+            "components": {}
+        });
+        std::fs::write(
+            crate::daemon::state_file_path(&config),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+
+        let mut items = Vec::new();
+        check_daemon_state(&config, &mut items);
+
+        assert!(items
+            .iter()
+            .any(|item| item.message.contains("cron disabled by config")));
+    }
+
+    #[test]
     fn config_validation_catches_unknown_provider() {
         let mut config = Config::default();
         config.default_provider = Some("totally-fake".into());
@@ -1278,6 +1343,9 @@ mod tests {
                 model: "model-z".into(),
                 system_prompt: None,
                 api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,
@@ -1292,6 +1360,9 @@ mod tests {
                 model: "model-a".into(),
                 system_prompt: None,
                 api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: None,
                 max_depth: 3,
                 agentic: false,

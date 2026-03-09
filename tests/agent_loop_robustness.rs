@@ -36,6 +36,20 @@ impl MockProvider {
     }
 }
 
+struct CapturingProvider {
+    responses: Mutex<Vec<ChatResponse>>,
+    requests: Arc<Mutex<Vec<Vec<(String, String)>>>>,
+}
+
+impl CapturingProvider {
+    fn new(responses: Vec<ChatResponse>, requests: Arc<Mutex<Vec<Vec<(String, String)>>>>) -> Self {
+        Self {
+            responses: Mutex::new(responses),
+            requests,
+        }
+    }
+}
+
 #[async_trait]
 impl Provider for MockProvider {
     async fn chat_with_system(
@@ -54,6 +68,45 @@ impl Provider for MockProvider {
         _model: &str,
         _temperature: f64,
     ) -> Result<ChatResponse> {
+        let mut guard = self.responses.lock().unwrap();
+        if guard.is_empty() {
+            return Ok(ChatResponse {
+                text: Some("done".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+                quota_metadata: None,
+            });
+        }
+        Ok(guard.remove(0))
+    }
+}
+
+#[async_trait]
+impl Provider for CapturingProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: f64,
+    ) -> Result<String> {
+        Ok("fallback".into())
+    }
+
+    async fn chat(
+        &self,
+        request: ChatRequest<'_>,
+        _model: &str,
+        _temperature: f64,
+    ) -> Result<ChatResponse> {
+        let snapshot = request
+            .messages
+            .iter()
+            .map(|msg| (msg.role.clone(), msg.content.clone()))
+            .collect::<Vec<_>>();
+        self.requests.lock().unwrap().push(snapshot);
+
         let mut guard = self.responses.lock().unwrap();
         if guard.is_empty() {
             return Ok(ChatResponse {
@@ -119,6 +172,30 @@ impl Tool for FailingTool {
             success: false,
             output: String::new(),
             error: Some("Service unavailable: connection timeout".into()),
+        })
+    }
+}
+
+struct PolicyBlockedTool;
+
+#[async_trait]
+impl Tool for PolicyBlockedTool {
+    fn name(&self) -> &str {
+        "policy_blocked_tool"
+    }
+    fn description(&self) -> &str {
+        "Always fails due to runtime security policy"
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        json!({"type": "object"})
+    }
+    async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+        Ok(ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(
+                "Reading sensitive file '.env' is blocked by policy. Set [autonomy].allow_sensitive_file_reads = true only when strictly necessary.".into(),
+            ),
         })
     }
 }
@@ -458,11 +535,11 @@ async fn agent_handles_sequential_tool_then_text() {
 // TG4.6: Loop detection
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// No-progress repeat: provider returns same tool call every turn with identical
-/// output (EchoTool with fixed input).  Loop detection should stop early.
+/// No-progress repeat should keep injecting recovery prompts until the
+/// iteration budget is exhausted.
 #[tokio::test]
-async fn loop_detection_no_progress_repeat_stops_early() {
-    let responses: Vec<ChatResponse> = (0..10)
+async fn loop_detection_no_progress_repeat_exhausts_iteration_budget() {
+    let responses: Vec<ChatResponse> = (0..30)
         .map(|i| {
             tool_response(vec![ToolCall {
                 id: format!("tc_{i}"),
@@ -478,8 +555,8 @@ async fn loop_detection_no_progress_repeat_stops_early() {
     assert!(result.is_err(), "should error due to loop detection");
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("detected loop pattern"),
-        "error should mention loop pattern: {err_msg}"
+        err_msg.contains("maximum tool iterations"),
+        "error should exhaust the iteration budget: {err_msg}"
     );
 }
 
@@ -510,10 +587,10 @@ async fn loop_detection_different_outputs_no_false_positive() {
 
 /// Ping-pong: alternating between two tools with fixed input/output.
 #[tokio::test]
-async fn loop_detection_ping_pong_stops_early() {
+async fn loop_detection_ping_pong_exhausts_iteration_budget() {
     // A-B-A-B-A-B pattern (3 cycles, threshold=2)
     let mut responses: Vec<ChatResponse> = Vec::new();
-    for i in 0..6 {
+    for i in 0..30 {
         let (name, args) = if i % 2 == 0 {
             ("echo", r#"{"message": "ping"}"#)
         } else {
@@ -531,17 +608,21 @@ async fn loop_detection_ping_pong_stops_early() {
     let provider = Box::new(MockProvider::new(responses));
     let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
     let result = agent.turn("ping pong").await;
-    // The detector should fire (warning then hard stop) within the iterations
     assert!(
         result.is_err(),
         "should error due to ping-pong loop detection"
     );
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("maximum tool iterations"),
+        "error should exhaust the iteration budget: {err_msg}"
+    );
 }
 
-/// Consecutive failures trigger loop detection.
+/// Consecutive failures trigger recovery prompts until the iteration budget is exhausted.
 #[tokio::test]
-async fn loop_detection_failure_streak_stops_early() {
-    let responses: Vec<ChatResponse> = (0..10)
+async fn loop_detection_failure_streak_exhausts_iteration_budget() {
+    let responses: Vec<ChatResponse> = (0..30)
         .map(|i| {
             tool_response(vec![ToolCall {
                 id: format!("tc_{i}"),
@@ -560,8 +641,79 @@ async fn loop_detection_failure_streak_stops_early() {
     );
     let err_msg = result.unwrap_err().to_string();
     assert!(
-        err_msg.contains("detected loop pattern"),
-        "error should mention loop pattern: {err_msg}"
+        err_msg.contains("maximum tool iterations"),
+        "error should exhaust the iteration budget: {err_msg}"
+    );
+}
+
+#[tokio::test]
+async fn agent_retries_malformed_tool_call_until_plain_answer_arrives() {
+    let provider = Box::new(MockProvider::new(vec![
+        text_response(
+            "<tool_call>{\"name\":\"echo\",\"arguments\":{\"message\":\"hello\"}</tool_call>",
+        ),
+        text_response("Recovered final answer"),
+    ]));
+
+    let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
+    let response = agent.turn("recover malformed tool call").await.unwrap();
+
+    assert_eq!(response, "Recovered final answer");
+}
+
+#[tokio::test]
+async fn agent_retries_orphan_tool_close_tag_until_plain_answer_arrives() {
+    let provider = Box::new(MockProvider::new(vec![
+        text_response("[Used tools: shell]\n</tool_call>"),
+        text_response("Recovered after orphan close tag"),
+    ]));
+
+    let mut agent = build_agent(provider, vec![Box::new(EchoTool)]);
+    let response = agent.turn("recover orphan close tag").await.unwrap();
+
+    assert_eq!(response, "Recovered after orphan close tag");
+}
+
+#[tokio::test]
+async fn agent_informs_model_about_runtime_constraints_after_policy_block() {
+    let captured_requests = Arc::new(Mutex::new(Vec::new()));
+    let provider = Box::new(CapturingProvider::new(
+        vec![
+            tool_response(vec![ToolCall {
+                id: "tc-policy-1".into(),
+                name: "policy_blocked_tool".into(),
+                arguments: "{}".into(),
+            }]),
+            text_response("I need a different approach."),
+        ],
+        captured_requests.clone(),
+    ));
+
+    let mut agent = build_agent(provider, vec![Box::new(PolicyBlockedTool)]);
+    let response = agent.turn("read the secret config").await.unwrap();
+
+    assert_eq!(response, "I need a different approach.");
+
+    let requests = captured_requests.lock().unwrap();
+    assert!(
+        requests.len() >= 2,
+        "expected at least two provider requests, got {}",
+        requests.len()
+    );
+    let second_request = &requests[1];
+    let last_user_message = second_request
+        .iter()
+        .rev()
+        .find(|(role, _)| role == "user")
+        .map(|(_, content)| content.clone())
+        .unwrap_or_default();
+    assert!(
+        last_user_message.contains("Runtime policy blocked one or more tool calls this turn"),
+        "second request should include runtime-constraint guidance: {last_user_message}"
+    );
+    assert!(
+        last_user_message.contains("allow_sensitive_file_reads"),
+        "prompt should surface the relevant config key: {last_user_message}"
     );
 }
 
