@@ -1,6 +1,6 @@
+use super::command_execution_preflight_result;
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
-use crate::security::policy::format_policy_block_event;
 use crate::security::SecurityPolicy;
 use crate::security::SyscallAnomalyDetector;
 use async_trait::async_trait;
@@ -155,41 +155,10 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
-        match self
-            .security
-            .validate_command_execution_with_reason(&command, approved)
+        if let Some(result) =
+            command_execution_preflight_result(self.security.as_ref(), &command, approved)
         {
-            Ok(_) => {}
-            Err(reason) => {
-                let policy_id = reason.policy_id();
-                let command_fragment = reason.command_fragment().to_string();
-                let error_message = format_policy_block_event(
-                    policy_id,
-                    reason.to_string(),
-                    Some(&command_fragment),
-                );
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(error_message),
-                });
-            }
-        }
-
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
+            return Ok(result);
         }
 
         // Execute with timeout to prevent hanging commands.
@@ -274,7 +243,7 @@ mod tests {
     use super::*;
     use crate::config::{AuditConfig, SyscallAnomalyConfig};
     use crate::runtime::{NativeRuntime, RuntimeAdapter};
-    use crate::security::policy::parse_command_policy_block_event;
+    use crate::security::policy::parse_security_policy_block_event;
     use crate::security::{AutonomyLevel, SecurityPolicy, SyscallAnomalyDetector};
     use tempfile::TempDir;
 
@@ -304,6 +273,22 @@ mod tests {
             ..AuditConfig::default()
         };
         Arc::new(SyscallAnomalyDetector::new(cfg, tmp.path(), audit))
+    }
+
+    fn assert_policy_block(
+        result: &ToolResult,
+        policy_id: &str,
+        command_fragment: &str,
+        reason_contains: Option<&str>,
+    ) {
+        assert!(!result.success);
+        let event = parse_security_policy_block_event(result.error.as_deref().unwrap_or(""))
+            .expect("shell policy block should expose structured policy event");
+        assert_eq!(event.policy_id, policy_id);
+        assert_eq!(event.command_fragment, command_fragment);
+        if let Some(fragment) = reason_contains {
+            assert!(event.reason.contains(fragment));
+        }
     }
 
     #[test]
@@ -376,13 +361,12 @@ mod tests {
             .execute(json!({"command": "rm -rf /"}))
             .await
             .expect("disallowed command execution should return a result");
-        assert!(!result.success);
-        let error = result.error.as_deref().unwrap_or("");
-        let event = parse_command_policy_block_event(error)
-            .expect("shell policy block should expose structured policy event");
-        assert_eq!(event.policy_id, "autonomy.allowed_commands");
-        assert_eq!(event.command_fragment, "rm -rf /");
-        assert!(event.reason.contains("not allowed"));
+        assert_policy_block(
+            &result,
+            "autonomy.allowed_commands",
+            "rm -rf /",
+            Some("not allowed"),
+        );
     }
 
     #[tokio::test]
@@ -392,12 +376,12 @@ mod tests {
             .execute(json!({"command": "ls"}))
             .await
             .expect("readonly command execution should return a result");
-        assert!(!result.success);
-        assert!(result
-            .error
-            .as_ref()
-            .expect("error field should be present for blocked command")
-            .contains("not allowed"));
+        assert_policy_block(
+            &result,
+            "autonomy.read_only",
+            "ls",
+            Some("autonomy is read-only"),
+        );
     }
 
     #[tokio::test]
@@ -432,12 +416,12 @@ mod tests {
             .execute(json!({"command": "cat /etc/passwd"}))
             .await
             .expect("absolute path argument should be blocked");
-        assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Path blocked"));
+        assert_policy_block(
+            &result,
+            "autonomy.workspace_path_guard",
+            "cat /etc/passwd",
+            Some("Path blocked"),
+        );
     }
 
     #[tokio::test]
@@ -447,12 +431,12 @@ mod tests {
             .execute(json!({"command": "grep --file=/etc/passwd root ./src"}))
             .await
             .expect("option-assigned forbidden path should be blocked");
-        assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Path blocked"));
+        assert_policy_block(
+            &result,
+            "autonomy.workspace_path_guard",
+            "grep --file=/etc/passwd root ./src",
+            Some("Path blocked"),
+        );
     }
 
     #[tokio::test]
@@ -462,12 +446,12 @@ mod tests {
             .execute(json!({"command": "grep -f/etc/passwd root ./src"}))
             .await
             .expect("short option attached forbidden path should be blocked");
-        assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Path blocked"));
+        assert_policy_block(
+            &result,
+            "autonomy.workspace_path_guard",
+            "grep -f/etc/passwd root ./src",
+            Some("Path blocked"),
+        );
     }
 
     #[tokio::test]
@@ -477,12 +461,12 @@ mod tests {
             .execute(json!({"command": "cat ~root/.ssh/id_rsa"}))
             .await
             .expect("tilde-user path should be blocked");
-        assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Path blocked"));
+        assert_policy_block(
+            &result,
+            "autonomy.workspace_path_guard",
+            "cat ~root/.ssh/id_rsa",
+            Some("Path blocked"),
+        );
     }
 
     #[tokio::test]
@@ -492,12 +476,12 @@ mod tests {
             .execute(json!({"command": "cat </etc/passwd"}))
             .await
             .expect("input redirection bypass should be blocked");
-        assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("policy=autonomy.shell_structure.redirection"));
+        assert_policy_block(
+            &result,
+            "autonomy.shell_structure.redirection",
+            "cat </etc/passwd",
+            Some("redirection"),
+        );
     }
 
     fn test_security_with_env_cmd() -> Arc<SecurityPolicy> {
@@ -590,12 +574,12 @@ mod tests {
             .execute(json!({"command": "echo $HOME"}))
             .await
             .expect("plain variable expansion should be blocked");
-        assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("not allowed"));
+        assert_policy_block(
+            &result,
+            "autonomy.shell_structure.subshell",
+            "echo $HOME",
+            Some("expansion operators"),
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

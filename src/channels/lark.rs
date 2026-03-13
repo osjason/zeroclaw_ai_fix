@@ -235,6 +235,7 @@ struct CachedTenantToken {
 
 #[derive(Debug, Clone)]
 struct DraftEditState {
+    current_message_id: String,
     last_edit_at: Instant,
     edits_used: u32,
 }
@@ -318,6 +319,7 @@ pub struct LarkChannel {
     resolved_bot_open_id: Arc<StdRwLock<Option<String>>>,
     mention_only: bool,
     platform: LarkPlatform,
+    api_base_override: Option<String>,
     /// How to receive events: WebSocket long-connection or HTTP webhook.
     receive_mode: crate::config::schema::LarkReceiveMode,
     /// Cached tenant access token
@@ -368,6 +370,7 @@ impl LarkChannel {
             resolved_bot_open_id: Arc::new(StdRwLock::new(None)),
             mention_only,
             platform,
+            api_base_override: None,
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
@@ -442,6 +445,12 @@ impl LarkChannel {
         self
     }
 
+    #[cfg(test)]
+    fn with_api_base_override(mut self, api_base: String) -> Self {
+        self.api_base_override = Some(api_base);
+        self
+    }
+
     fn http_client(&self) -> reqwest::Client {
         crate::config::build_runtime_proxy_client(self.platform.proxy_service_key())
     }
@@ -450,8 +459,10 @@ impl LarkChannel {
         self.platform.channel_name()
     }
 
-    fn api_base(&self) -> &'static str {
-        self.platform.api_base()
+    fn api_base(&self) -> &str {
+        self.api_base_override
+            .as_deref()
+            .unwrap_or(self.platform.api_base())
     }
 
     fn ws_base(&self) -> &'static str {
@@ -499,6 +510,17 @@ impl LarkChannel {
         format!("{recipient}:{message_id}")
     }
 
+    async fn remove_draft_state(
+        &self,
+        recipient: &str,
+        root_message_id: &str,
+    ) -> Option<DraftEditState> {
+        self.draft_state
+            .lock()
+            .await
+            .remove(&Self::draft_state_key(recipient, root_message_id))
+    }
+
     fn build_text_payload(recipient: &str, text: &str) -> serde_json::Value {
         serde_json::json!({
             "receive_id": recipient,
@@ -512,6 +534,12 @@ impl LarkChannel {
             "msg_type": "text",
             "content": serde_json::json!({ "text": text }).to_string(),
         })
+    }
+
+    fn is_security_block_progress_update(text: &str) -> bool {
+        let lower = text.to_ascii_lowercase();
+        lower.contains("status=blocked_by_security_policy")
+            || (lower.contains("security blocked") && lower.contains("policy="))
     }
 
     async fn fetch_image_marker(&self, image_key: &str) -> anyhow::Result<String> {
@@ -1535,6 +1563,7 @@ impl Channel for LarkChannel {
             self.draft_state.lock().await.insert(
                 Self::draft_state_key(&message.recipient, message_id),
                 DraftEditState {
+                    current_message_id: message_id.to_string(),
                     last_edit_at: Instant::now(),
                     edits_used: 0,
                 },
@@ -1555,25 +1584,65 @@ impl Channel for LarkChannel {
         }
 
         let draft_key = Self::draft_state_key(recipient, message_id);
+        let mut active_message_id = message_id.to_string();
+        let mut should_create_continuation = false;
+        let force_visible_block_message = Self::is_security_block_progress_update(text);
         {
             let draft_state = self.draft_state.lock().await;
             if let Some(state) = draft_state.get(&draft_key) {
+                active_message_id = state.current_message_id.clone();
                 let elapsed_ms =
                     u64::try_from(state.last_edit_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-                if elapsed_ms < self.draft_update_interval_ms
-                    || state.edits_used >= self.max_draft_edits
-                {
-                    return Ok(None);
+                if elapsed_ms < self.draft_update_interval_ms {
+                    if force_visible_block_message {
+                        should_create_continuation = true;
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                if state.edits_used >= self.max_draft_edits {
+                    should_create_continuation = true;
                 }
             }
         }
 
-        self.update_text_message(message_id, text).await?;
+        if should_create_continuation {
+            tracing::debug!(
+                "Lark draft edit cap reached for {active_message_id}; creating continuation progress message"
+            );
+            if let Some(new_message_id) = self.create_text_message(recipient, text).await? {
+                active_message_id = new_message_id;
+            }
+            let mut draft_state = self.draft_state.lock().await;
+            let state = draft_state.entry(draft_key).or_insert(DraftEditState {
+                current_message_id: active_message_id.clone(),
+                last_edit_at: Instant::now(),
+                edits_used: 0,
+            });
+            state.current_message_id = active_message_id;
+            state.last_edit_at = Instant::now();
+            state.edits_used = 0;
+            return Ok(None);
+        }
+
+        match self.update_text_message(&active_message_id, text).await {
+            Ok(()) => {}
+            Err(error) => {
+                tracing::warn!(
+                    "Lark update_draft edit failed for {active_message_id}: {error}; sending fallback progress message"
+                );
+                if let Some(new_message_id) = self.create_text_message(recipient, text).await? {
+                    active_message_id = new_message_id;
+                }
+            }
+        }
         let mut draft_state = self.draft_state.lock().await;
         let state = draft_state.entry(draft_key).or_insert(DraftEditState {
+            current_message_id: active_message_id.clone(),
             last_edit_at: Instant::now(),
             edits_used: 0,
         });
+        state.current_message_id = active_message_id;
         state.last_edit_at = Instant::now();
         state.edits_used = state.edits_used.saturating_add(1);
         Ok(None)
@@ -1586,21 +1655,26 @@ impl Channel for LarkChannel {
         text: &str,
     ) -> anyhow::Result<()> {
         let cleaned_text = super::strip_tool_call_tags(text);
-        self.draft_state
-            .lock()
+        let resolved_message_id = self
+            .remove_draft_state(recipient, message_id)
             .await
-            .remove(&Self::draft_state_key(recipient, message_id));
+            .map(|state| state.current_message_id)
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| message_id.to_string());
 
-        if message_id.trim().is_empty() {
+        if resolved_message_id.trim().is_empty() {
             let _ = self.create_text_message(recipient, &cleaned_text).await?;
             return Ok(());
         }
 
-        match self.update_text_message(message_id, &cleaned_text).await {
+        match self
+            .update_text_message(&resolved_message_id, &cleaned_text)
+            .await
+        {
             Ok(()) => Ok(()),
             Err(error) => {
                 tracing::warn!(
-                    "Lark finalize_draft edit failed for {message_id}: {error}; sending fallback message"
+                    "Lark finalize_draft edit failed for {resolved_message_id}: {error}; sending fallback message"
                 );
                 let _ = self.create_text_message(recipient, &cleaned_text).await?;
                 Ok(())
@@ -1609,16 +1683,24 @@ impl Channel for LarkChannel {
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
-        self.draft_state
-            .lock()
+        let resolved_message_id = self
+            .remove_draft_state(recipient, message_id)
             .await
-            .remove(&Self::draft_state_key(recipient, message_id));
-        if message_id.trim().is_empty() {
+            .map(|state| state.current_message_id)
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                if message_id.trim().is_empty() {
+                    None
+                } else {
+                    Some(message_id.to_string())
+                }
+            });
+        let Some(resolved_message_id) = resolved_message_id else {
             return Ok(());
-        }
+        };
 
-        if let Err(error) = self.delete_message(message_id).await {
-            tracing::debug!("Lark cancel_draft delete failed for {message_id}: {error}");
+        if let Err(error) = self.delete_message(&resolved_message_id).await {
+            tracing::debug!("Lark cancel_draft delete failed for {resolved_message_id}: {error}");
         }
         Ok(())
     }
@@ -2140,6 +2222,10 @@ fn should_respond_in_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{extract::Path, extract::State, routing::patch, routing::post, Json, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+    use tokio::sync::Mutex as AsyncMutex;
 
     fn with_bot_open_id(ch: LarkChannel, bot_open_id: &str) -> LarkChannel {
         ch.set_resolved_bot_open_id(Some(bot_open_id.to_string()));
@@ -2748,6 +2834,273 @@ mod tests {
         assert!(ch.mention_only);
         assert_eq!(ch.draft_update_interval_ms, 1500);
         assert_eq!(ch.max_draft_edits, 7);
+    }
+
+    #[derive(Default)]
+    struct MockDraftApiState {
+        create_calls: AtomicUsize,
+        patched_message_ids: AsyncMutex<Vec<String>>,
+    }
+
+    async fn mock_tenant_token() -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "code": 0,
+            "tenant_access_token": "test-token",
+            "expire": 7200
+        }))
+    }
+
+    async fn mock_create_message(
+        State(state): State<Arc<MockDraftApiState>>,
+    ) -> Json<serde_json::Value> {
+        let call = state.create_calls.fetch_add(1, Ordering::SeqCst);
+        let message_id = if call == 0 {
+            "msg-root"
+        } else {
+            "msg-fallback"
+        };
+        Json(serde_json::json!({
+            "code": 0,
+            "data": {
+                "message_id": message_id
+            }
+        }))
+    }
+
+    async fn mock_patch_message(
+        Path(message_id): Path<String>,
+        State(state): State<Arc<MockDraftApiState>>,
+    ) -> Json<serde_json::Value> {
+        state
+            .patched_message_ids
+            .lock()
+            .await
+            .push(message_id.clone());
+        if message_id == "msg-root" {
+            return Json(serde_json::json!({
+                "code": 19001,
+                "msg": "simulated edit failure"
+            }));
+        }
+        Json(serde_json::json!({ "code": 0 }))
+    }
+
+    async fn mock_patch_message_success(
+        Path(message_id): Path<String>,
+        State(state): State<Arc<MockDraftApiState>>,
+    ) -> Json<serde_json::Value> {
+        state.patched_message_ids.lock().await.push(message_id);
+        Json(serde_json::json!({ "code": 0 }))
+    }
+
+    #[tokio::test]
+    async fn lark_update_draft_edit_failure_falls_back_to_visible_progress_message() {
+        let state = Arc::new(MockDraftApiState::default());
+        let app = Router::new()
+            .route(
+                "/open-apis/auth/v3/tenant_access_token/internal",
+                post(mock_tenant_token),
+            )
+            .route("/open-apis/im/v1/messages", post(mock_create_message))
+            .route(
+                "/open-apis/im/v1/messages/{message_id}",
+                patch(mock_patch_message),
+            )
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let base = format!("http://{addr}/open-apis");
+        let mut channel = LarkChannel::new(
+            "app_id".into(),
+            "app_secret".into(),
+            "verification_token".into(),
+            None,
+            vec!["*".into()],
+            false,
+        )
+        .with_api_base_override(base);
+        channel.draft_update_interval_ms = 0;
+
+        let recipient = "oc_test_chat";
+        let draft_id = channel
+            .send_draft(&SendMessage::new("initial", recipient))
+            .await
+            .unwrap()
+            .expect("draft id should exist");
+        assert_eq!(draft_id, "msg-root");
+
+        channel
+            .update_draft(recipient, &draft_id, "progress update")
+            .await
+            .unwrap();
+        channel
+            .finalize_draft(recipient, &draft_id, "final answer")
+            .await
+            .unwrap();
+
+        let patched_message_ids = state.patched_message_ids.lock().await.clone();
+        assert!(
+            patched_message_ids.iter().any(|id| id == "msg-root"),
+            "expected initial draft edit attempt to hit root id"
+        );
+        assert!(
+            patched_message_ids.iter().any(|id| id == "msg-fallback"),
+            "expected finalize to edit fallback message id after edit failure"
+        );
+        assert_eq!(
+            state.create_calls.load(Ordering::SeqCst),
+            2,
+            "expected one draft send + one fallback progress send"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn lark_update_draft_edit_cap_falls_back_to_continuation_message() {
+        let state = Arc::new(MockDraftApiState::default());
+        let app = Router::new()
+            .route(
+                "/open-apis/auth/v3/tenant_access_token/internal",
+                post(mock_tenant_token),
+            )
+            .route("/open-apis/im/v1/messages", post(mock_create_message))
+            .route(
+                "/open-apis/im/v1/messages/{message_id}",
+                patch(mock_patch_message_success),
+            )
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let base = format!("http://{addr}/open-apis");
+        let mut channel = LarkChannel::new(
+            "app_id".into(),
+            "app_secret".into(),
+            "verification_token".into(),
+            None,
+            vec!["*".into()],
+            false,
+        )
+        .with_api_base_override(base);
+        channel.draft_update_interval_ms = 0;
+        channel.max_draft_edits = 1;
+
+        let recipient = "oc_test_chat";
+        let draft_id = channel
+            .send_draft(&SendMessage::new("initial", recipient))
+            .await
+            .unwrap()
+            .expect("draft id should exist");
+        assert_eq!(draft_id, "msg-root");
+
+        channel
+            .update_draft(recipient, &draft_id, "progress #1")
+            .await
+            .unwrap();
+        channel
+            .update_draft(recipient, &draft_id, "progress #2")
+            .await
+            .unwrap();
+        channel
+            .finalize_draft(recipient, &draft_id, "final answer")
+            .await
+            .unwrap();
+
+        let patched_message_ids = state.patched_message_ids.lock().await.clone();
+        assert!(
+            patched_message_ids.iter().any(|id| id == "msg-root"),
+            "expected first progress update to edit root draft message"
+        );
+        assert!(
+            patched_message_ids.iter().any(|id| id == "msg-fallback"),
+            "expected finalize to target continuation message id after hitting edit cap"
+        );
+        assert_eq!(
+            state.create_calls.load(Ordering::SeqCst),
+            2,
+            "expected one draft send + one continuation progress message"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn lark_update_draft_policy_block_progress_bypasses_interval_throttle() {
+        let state = Arc::new(MockDraftApiState::default());
+        let app = Router::new()
+            .route(
+                "/open-apis/auth/v3/tenant_access_token/internal",
+                post(mock_tenant_token),
+            )
+            .route("/open-apis/im/v1/messages", post(mock_create_message))
+            .route(
+                "/open-apis/im/v1/messages/{message_id}",
+                patch(mock_patch_message_success),
+            )
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let base = format!("http://{addr}/open-apis");
+        let mut channel = LarkChannel::new(
+            "app_id".into(),
+            "app_secret".into(),
+            "verification_token".into(),
+            None,
+            vec!["*".into()],
+            false,
+        )
+        .with_api_base_override(base);
+        channel.draft_update_interval_ms = 60_000;
+
+        let recipient = "oc_test_chat";
+        let draft_id = channel
+            .send_draft(&SendMessage::new("initial", recipient))
+            .await
+            .unwrap()
+            .expect("draft id should exist");
+        assert_eq!(draft_id, "msg-root");
+
+        channel
+            .update_draft(
+                recipient,
+                &draft_id,
+                "🚫 Agent blocked: id=shell name=shell type=tool\nstatus=blocked_by_security_policy",
+            )
+            .await
+            .unwrap();
+        channel
+            .finalize_draft(recipient, &draft_id, "final answer")
+            .await
+            .unwrap();
+
+        let patched_message_ids = state.patched_message_ids.lock().await.clone();
+        assert!(
+            !patched_message_ids.iter().any(|id| id == "msg-root"),
+            "policy block progress should bypass throttled root edit and switch to continuation"
+        );
+        assert!(
+            patched_message_ids.iter().any(|id| id == "msg-fallback"),
+            "expected finalize to target continuation message after policy block progress"
+        );
+        assert_eq!(
+            state.create_calls.load(Ordering::SeqCst),
+            2,
+            "expected one draft send + one immediate policy-block continuation message"
+        );
+
+        server.abort();
     }
 
     #[test]

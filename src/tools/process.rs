@@ -1,7 +1,8 @@
+use super::command_execution_preflight_result;
 use super::shell::collect_allowed_shell_env_vars;
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
-use crate::security::policy::{format_policy_block_event, ToolOperation};
+use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use crate::security::SyscallAnomalyDetector;
 use async_trait::async_trait;
@@ -104,41 +105,16 @@ impl ProcessTool {
             }
         }
 
-        // Reuse shell security chain: rate limit -> command validation -> record.
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
         let approved = args
             .get("approved")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        if let Err(reason) = self
-            .security
-            .validate_command_execution_with_reason(command, approved)
+        // Keep process tool aligned with shell tool security preflight behavior.
+        if let Some(result) =
+            command_execution_preflight_result(self.security.as_ref(), command, approved)
         {
-            let policy_id = reason.policy_id();
-            let command_fragment = reason.command_fragment().to_string();
-            let error_message =
-                format_policy_block_event(policy_id, reason.to_string(), Some(&command_fragment));
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(error_message),
-            });
-        }
-
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
+            return Ok(result);
         }
 
         // Build command via runtime adapter.
@@ -534,8 +510,11 @@ mod tests {
     use super::*;
     use crate::config::{AuditConfig, SyscallAnomalyConfig};
     use crate::runtime::NativeRuntime;
-    use crate::security::policy::parse_command_policy_block_event;
+    use crate::security::policy::{
+        parse_security_policy_block_event, CommandPolicyViolation,
+    };
     use crate::security::{AutonomyLevel, SecurityPolicy, SyscallAnomalyDetector};
+    use crate::tools::policy_blocked_result;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -595,6 +574,36 @@ mod tests {
     fn constants_are_correct() {
         assert_eq!(MAX_OUTPUT_BYTES, 524_288);
         assert_eq!(MAX_PROCESSES, 8);
+    }
+
+    #[test]
+    fn policy_blocked_result_renders_structured_event_fields() {
+        let violation = CommandPolicyViolation::new(
+            "autonomy.allowed_commands",
+            "Command not allowed by security policy: curl https://evil.example",
+            "curl https://evil.example",
+        );
+        let result = policy_blocked_result(&violation);
+        assert!(!result.success);
+        let event = parse_security_policy_block_event(result.error.as_deref().unwrap())
+            .expect("expected structured security policy block event");
+        assert_eq!(event.policy_id, "autonomy.allowed_commands");
+        assert_eq!(event.command_fragment, "curl https://evil.example");
+        assert!(event
+            .reason
+            .contains("Command not allowed by security policy"));
+    }
+
+    #[test]
+    fn parse_security_policy_block_event_extracts_fields() {
+        let message = "blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example";
+        let event = parse_security_policy_block_event(message)
+            .expect("formatted block message should parse into structured event");
+        assert_eq!(event.policy_id, "autonomy.allowed_commands");
+        assert_eq!(event.command_fragment, "curl https://evil.example");
+        assert!(event
+            .reason
+            .contains("Command not allowed by security policy"));
     }
 
     #[tokio::test]
@@ -700,7 +709,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        let event = parse_command_policy_block_event(result.error.as_deref().unwrap())
+        let event = parse_security_policy_block_event(result.error.as_deref().unwrap())
             .expect("expected structured security policy block event");
         assert_eq!(event.policy_id, "autonomy.allowed_commands");
         assert_eq!(event.command_fragment, "rm -rf /");
@@ -717,7 +726,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        let event = parse_command_policy_block_event(result.error.as_deref().unwrap())
+        let event = parse_security_policy_block_event(result.error.as_deref().unwrap())
             .expect("expected structured security policy block event");
         assert_eq!(event.policy_id, "autonomy.workspace_path_guard");
         assert_eq!(event.command_fragment, "cat /etc/passwd");
@@ -781,7 +790,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap().contains("Rate limit"));
+        let event = parse_security_policy_block_event(result.error.as_deref().unwrap())
+            .expect("expected structured security policy block event");
+        assert_eq!(event.policy_id, "autonomy.max_actions_per_hour");
+        assert_eq!(event.command_fragment, "echo test");
+        assert!(event.reason.contains("Rate limit exceeded"));
     }
 
     struct NoLongRunningRuntime;

@@ -1,4 +1,5 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
+use crate::channels::progress_event::{render_execution_event, ExecutionEvent, ExecutionSignal};
 use crate::config::schema::{CostEnforcementMode, ModelPricing};
 use crate::config::{Config, ProgressMode};
 use crate::cost::{BudgetCheck, CostTracker, UsagePeriod};
@@ -11,7 +12,7 @@ use crate::providers::{
 use crate::runtime;
 use crate::security::{
     policy::{
-        format_policy_block_event, parse_command_policy_block_event, summarize_command_policy_block,
+        parse_command_policy_block_event, summarize_command_policy_block, CommandPolicyViolation,
     },
     SecurityPolicy,
 };
@@ -481,6 +482,49 @@ struct ProgressEntry {
     completion: Option<(bool, u64, Option<String>)>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ToolProgressSignal<'a> {
+    Running {
+        tool_name: &'a str,
+        hint: &'a str,
+    },
+    Completed {
+        tool_name: &'a str,
+        secs: u64,
+        success: bool,
+        detail: Option<&'a str>,
+    },
+}
+
+fn render_tool_progress_signal(signal: ToolProgressSignal<'_>) -> String {
+    let mut line = String::new();
+    match signal {
+        ToolProgressSignal::Running { tool_name, hint } => {
+            let _ = write!(line, "\u{23f3} {tool_name}");
+            if !hint.is_empty() {
+                let _ = write!(line, ": {hint}");
+            }
+        }
+        ToolProgressSignal::Completed {
+            tool_name,
+            secs,
+            success,
+            detail,
+        } => {
+            let mark = if success { "\u{2705}" } else { "\u{274c}" };
+            let _ = write!(line, "{mark} {tool_name} ({secs}s)");
+            if !success {
+                if let Some(detail) = detail {
+                    if !detail.is_empty() {
+                        let _ = write!(line, ": {detail}");
+                    }
+                }
+            }
+        }
+    }
+    line
+}
+
 #[derive(Debug, Default)]
 struct ProgressTracker {
     entries: Vec<ProgressEntry>,
@@ -506,27 +550,22 @@ impl ProgressTracker {
     fn render_delta(&self) -> String {
         let mut out = String::from(DRAFT_PROGRESS_BLOCK_SENTINEL);
         for entry in &self.entries {
-            match &entry.completion {
-                None => {
-                    let _ = write!(out, "\u{23f3} {}", entry.name);
-                    if !entry.hint.is_empty() {
-                        let _ = write!(out, ": {}", entry.hint);
-                    }
-                    out.push('\n');
+            let line = match &entry.completion {
+                None => render_tool_progress_signal(ToolProgressSignal::Running {
+                    tool_name: &entry.name,
+                    hint: &entry.hint,
+                }),
+                Some((success, secs, detail)) => {
+                    render_tool_progress_signal(ToolProgressSignal::Completed {
+                        tool_name: &entry.name,
+                        secs: *secs,
+                        success: *success,
+                        detail: detail.as_deref(),
+                    })
                 }
-                Some((true, secs, _)) => {
-                    let _ = writeln!(out, "\u{2705} {} ({secs}s)", entry.name);
-                }
-                Some((false, secs, detail)) => {
-                    let _ = write!(out, "\u{274c} {} ({secs}s)", entry.name);
-                    if let Some(detail) = detail.as_deref() {
-                        if !detail.is_empty() {
-                            let _ = write!(out, ": {detail}");
-                        }
-                    }
-                    out.push('\n');
-                }
-            }
+            };
+            out.push_str(&line);
+            out.push('\n');
         }
         out
     }
@@ -555,8 +594,71 @@ fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len
     }
 }
 
-fn summarize_policy_block_for_progress(reason: Option<&str>) -> Option<String> {
-    reason.and_then(|raw| render_policy_block_summary(raw, 72))
+fn summarize_policy_block_for_progress(tool_name: &str, reason: Option<&str>) -> Option<String> {
+    reason.and_then(|raw| render_policy_block_for_progress(tool_name, raw))
+}
+
+async fn emit_policy_block_progress_delta(
+    on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
+    tool_name: &str,
+    secs: u64,
+    reason: Option<&str>,
+) {
+    if let (Some(tx), Some(detail)) = (
+        on_delta,
+        summarize_policy_block_for_progress(tool_name, reason),
+    ) {
+        let line = render_tool_progress_signal(ToolProgressSignal::Completed {
+            tool_name,
+            secs,
+            success: false,
+            detail: Some(detail.as_str()),
+        });
+        let line = format!("{DRAFT_PROGRESS_SENTINEL}{line}\n");
+        let _ = tx.send(line).await;
+    }
+}
+
+fn render_policy_block_for_progress(tool_name: &str, reason: &str) -> Option<String> {
+    if let Some(event) = parse_command_policy_block_event(reason) {
+        let command = truncate_with_ellipsis(event.command_fragment, 72);
+        let detail_reason = truncate_with_ellipsis(event.reason, 120);
+        let reason_preview = if detail_reason.is_empty() {
+            "Command blocked by security policy.".to_string()
+        } else {
+            detail_reason
+        };
+        return Some(render_execution_event(ExecutionEvent {
+            source: "Agent",
+            id: tool_name,
+            name: tool_name,
+            kind: "tool",
+            schedule: None,
+            signal: ExecutionSignal::Blocked {
+                policy_id: Some(event.policy_id.to_string()),
+                command_preview: Some(command),
+                reason_preview,
+            },
+        }));
+    }
+
+    let trimmed = strip_tool_error_prefix(reason);
+    let fallback_reason = truncate_with_ellipsis(trimmed, 120);
+    if fallback_reason.is_empty() {
+        return None;
+    }
+    Some(render_execution_event(ExecutionEvent {
+        source: "Agent",
+        id: tool_name,
+        name: tool_name,
+        kind: "tool",
+        schedule: None,
+        signal: ExecutionSignal::Blocked {
+            policy_id: None,
+            command_preview: None,
+            reason_preview: fallback_reason,
+        },
+    }))
 }
 
 fn render_policy_block_summary(reason: &str, max_command_chars: usize) -> Option<String> {
@@ -587,6 +689,26 @@ fn strip_tool_error_prefix(reason: &str) -> &str {
         .unwrap_or(trimmed)
 }
 
+fn contains_any_marker(haystack: &str, markers: &[&str]) -> bool {
+    markers.iter().any(|marker| haystack.contains(marker))
+}
+
+fn looks_like_workspace_path_block_reason(lower_reason: &str) -> bool {
+    contains_any_marker(
+        lower_reason,
+        &[
+            "path not allowed by security policy",
+            "path blocked by security policy",
+            "outside the allowed workspace",
+            "escapes workspace",
+        ],
+    )
+}
+
+fn references_workspace_path_policy_knobs(lower_reason: &str) -> bool {
+    contains_any_marker(lower_reason, &["allowed_roots", "workspace_only"])
+}
+
 pub(crate) fn looks_like_runtime_constraint_reason(reason: &str) -> bool {
     if parse_command_policy_block_event(reason).is_some() {
         return true;
@@ -600,15 +722,8 @@ pub(crate) fn looks_like_runtime_constraint_reason(reason: &str) -> bool {
     lower.contains("requires explicit approval")
         || lower.contains("denied by user")
         || lower.contains("not available in this channel")
-        || lower.contains("path not allowed by security policy")
-        || lower.contains("path blocked by security policy")
-        || lower.contains("command not allowed by security policy")
-        || lower.contains("high-risk command is disallowed by policy")
-        || lower.contains("shell command structure is blocked by security policy")
-        || lower.contains("outside the allowed workspace")
-        || lower.contains("escapes workspace")
-        || lower.contains("allowed_roots")
-        || lower.contains("workspace_only")
+        || looks_like_workspace_path_block_reason(&lower)
+        || references_workspace_path_policy_knobs(&lower)
         || lower.contains("allow_sensitive_file_reads")
         || lower.contains("allow_sensitive_file_writes")
         || lower.contains("security.url_access.")
@@ -621,7 +736,7 @@ pub(crate) fn normalize_runtime_constraint_reason(reason: &str) -> String {
         return String::new();
     }
 
-    if let Some(event) = parse_command_policy_block_event(trimmed) {
+    if let Some(event) = parse_command_policy_block_event(reason) {
         let command = truncate_with_ellipsis(event.command_fragment, 72);
         return format!(
             "security blocked (policy={}; command={command}) Guidance: choose an allowed command/tool, or adjust the corresponding `[autonomy]` policy gate.",
@@ -637,12 +752,8 @@ pub(crate) fn normalize_runtime_constraint_reason(reason: &str) -> String {
 
     let lower = trimmed.to_ascii_lowercase();
 
-    if lower.contains("path not allowed by security policy")
-        || lower.contains("path blocked by security policy")
-        || lower.contains("outside the allowed workspace")
-        || lower.contains("escapes workspace")
-    {
-        if lower.contains("allowed_roots") || lower.contains("workspace_only") {
+    if looks_like_workspace_path_block_reason(&lower) {
+        if references_workspace_path_policy_knobs(&lower) {
             return trimmed.to_string();
         }
         return format!(
@@ -659,14 +770,6 @@ pub(crate) fn normalize_runtime_constraint_reason(reason: &str) -> String {
     if lower.contains("not available in this channel") {
         return format!(
             "{trimmed} Guidance: review the channel/runtime tool exclusion list or use another allowed tool."
-        );
-    }
-
-    if lower.contains("command not allowed by security policy")
-        || lower.contains("high-risk command is disallowed by policy")
-    {
-        return format!(
-            "{trimmed} Guidance: use a safer dedicated tool, or adjust `[autonomy]` command/approval policy."
         );
     }
 
@@ -730,6 +833,127 @@ pub(crate) fn build_missing_tool_call_retry_prompt(reason: &str, attempt: usize)
         "Internal correction attempt #{attempt}: your last reply still failed to emit a valid tool call. Recovery reason: {reason}. \
          Either (1) emit one valid <tool_call>...</tool_call> block immediately, or (2) stop using tools and provide the complete final answer now. \
          Do not emit partial tags, protocol fragments, or placeholders."
+    )
+}
+
+fn shell_command_is_read_only_probe(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if contains_any_marker(
+        &lower,
+        &[
+            " >",
+            ">>",
+            "2>",
+            "1>",
+            "| tee",
+            " tee ",
+            "sed -i",
+            " rm ",
+            "rm -",
+            " mv ",
+            " cp ",
+            " chmod ",
+            " chown ",
+            " touch ",
+            " mkdir ",
+            " rmdir ",
+            " del ",
+            " remove-item ",
+            " set-content ",
+            " out-file ",
+        ],
+    ) {
+        return false;
+    }
+
+    let mut words = lower.split_whitespace();
+    let first = words.next().unwrap_or_default();
+    match first {
+        "ls" | "dir" | "pwd" | "cat" | "head" | "tail" | "grep" | "rg" | "find" | "which"
+        | "where" | "echo" | "wc" | "stat" | "type" | "tree" | "git" | "cargo" => true,
+        "powershell" | "pwsh" => contains_any_marker(
+            &lower,
+            &["get-childitem", "get-content", "select-string", "get-process"],
+        ),
+        _ => false,
+    }
+}
+
+fn tool_call_requires_post_action_verification(
+    tool_name: &str,
+    args: &serde_json::Value,
+    success: bool,
+) -> bool {
+    if !success {
+        return false;
+    }
+
+    match tool_name {
+        "file_write" => true,
+        "shell" => args
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|command| !shell_command_is_read_only_probe(command)),
+        _ => false,
+    }
+}
+
+fn tool_call_satisfies_post_action_verification(
+    tool_name: &str,
+    args: &serde_json::Value,
+    success: bool,
+) -> bool {
+    if !success {
+        return false;
+    }
+
+    match tool_name {
+        "file_read" | "image_info" | "cron_list" | "cron_runs" => true,
+        "schedule" => args
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|action| matches!(action, "list" | "get")),
+        "shell" => args
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(shell_command_is_read_only_probe),
+        _ => false,
+    }
+}
+
+fn summarize_post_action_verification_target(tool_name: &str, args: &serde_json::Value) -> String {
+    match tool_name {
+        "file_write" => args
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(|path| format!("file_write(path={})", truncate_with_ellipsis(path, 72)))
+            .unwrap_or_else(|| "file_write".to_string()),
+        "shell" => args
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(|cmd| format!("shell(command={})", truncate_with_ellipsis(cmd, 72)))
+            .unwrap_or_else(|| "shell".to_string()),
+        _ => tool_name.to_string(),
+    }
+}
+
+fn build_post_action_verification_retry_prompt(requirement: &str, attempt: usize) -> String {
+    if attempt <= 1 {
+        return format!(
+            "Internal correction: you already executed mutating actions ({requirement}) but did not verify their effects. \
+             Before giving a final answer, emit one verification tool call now (e.g. file_read, cron_list/cron_runs, or a read-only shell inspection command). \
+             Do not output a final answer yet."
+        );
+    }
+
+    format!(
+        "Internal correction attempt #{attempt}: post-action verification is still missing for ({requirement}). \
+         Emit exactly one valid verification <tool_call>...</tool_call> now, then wait for tool results before answering."
     )
 }
 
@@ -1223,6 +1447,7 @@ pub(crate) async fn run_tool_call_loop(
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
     let mut missing_tool_call_retry_attempts = 0usize;
     let mut missing_tool_call_retry_prompt: Option<String> = None;
+    let mut post_action_verification_requirement: Option<String> = None;
     let mut runtime_constraint_prompt: Option<String> = None;
     let ld_config = LOOP_DETECTION_CONFIG
         .try_with(Clone::clone)
@@ -1696,15 +1921,32 @@ pub(crate) async fn run_tool_call_loop(
             } else {
                 None
             };
+            let missing_verification_requirement = if parse_retry_reason.is_none() {
+                post_action_verification_requirement.as_deref()
+            } else {
+                None
+            };
             let missing_tool_call_followthrough =
-                !tool_specs.is_empty() && parse_retry_reason.is_some();
+                !tool_specs.is_empty()
+                    && (parse_retry_reason.is_some() || missing_verification_requirement.is_some());
             if missing_tool_call_followthrough {
                 missing_tool_call_retry_attempts += 1;
-                let retry_reason = parse_retry_reason.unwrap_or("unknown");
-                missing_tool_call_retry_prompt = Some(build_missing_tool_call_retry_prompt(
-                    retry_reason,
-                    missing_tool_call_retry_attempts,
-                ));
+                let retry_reason = parse_retry_reason.unwrap_or("post_action_verification_missing");
+                missing_tool_call_retry_prompt = Some(
+                    missing_verification_requirement
+                        .map(|requirement| {
+                            build_post_action_verification_retry_prompt(
+                                requirement,
+                                missing_tool_call_retry_attempts,
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            build_missing_tool_call_retry_prompt(
+                                retry_reason,
+                                missing_tool_call_retry_attempts,
+                            )
+                        }),
+                );
 
                 runtime_trace::record_event(
                     "tool_call_followthrough_retry",
@@ -1724,11 +1966,19 @@ pub(crate) async fn run_tool_call_loop(
 
                 if should_emit_verbose_progress(progress_mode) {
                     if let Some(ref tx) = on_delta {
-                        let _ = tx
-                            .send(format!(
+                        let retry_line = if missing_verification_requirement.is_some() {
+                            format!(
+                                "{DRAFT_PROGRESS_SENTINEL}\u{21bb} Retrying to enforce post-action verification (attempt {})\n",
+                                missing_tool_call_retry_attempts
+                            )
+                        } else {
+                            format!(
                                 "{DRAFT_PROGRESS_SENTINEL}\u{21bb} Retrying after malformed or incomplete tool call (attempt {})\n",
                                 missing_tool_call_retry_attempts
-                            ))
+                            )
+                        };
+                        let _ = tx
+                            .send(retry_line)
                             .await;
                     }
                 }
@@ -1862,11 +2112,12 @@ pub(crate) async fn run_tool_call_loop(
                 } else {
                     format!("{tool_name} {hint}")
                 };
-                let blocked = format_policy_block_event(
+                let blocked = CommandPolicyViolation::from_block_event(
                     "runtime.channel.excluded_tools",
                     reason,
                     Some(&command_fragment),
-                );
+                )
+                .format_block_message();
                 runtime_trace::record_event(
                     "tool_call_result",
                     Some(channel_name),
@@ -1888,10 +2139,17 @@ pub(crate) async fn run_tool_call_loop(
                     ToolExecutionOutcome {
                         output: blocked.clone(),
                         success: false,
-                        error_reason: Some(blocked),
+                        error_reason: Some(blocked.clone()),
                         duration: Duration::ZERO,
                     },
                 ));
+                emit_policy_block_progress_delta(
+                    on_delta.as_ref(),
+                    &tool_name,
+                    0,
+                    Some(&blocked),
+                )
+                .await;
                 continue;
             }
 
@@ -2080,6 +2338,8 @@ pub(crate) async fn run_tool_call_loop(
             .await?
         };
 
+        let mut turn_requires_verification: Vec<String> = Vec::new();
+        let mut turn_verification_observed = false;
         for (((idx, call), mut outcome), progress_idx) in executable_indices
             .iter()
             .zip(executable_calls.iter())
@@ -2137,7 +2397,7 @@ pub(crate) async fn run_tool_call_loop(
             let failure_detail = if outcome.success {
                 None
             } else {
-                summarize_policy_block_for_progress(outcome.error_reason.as_deref())
+                summarize_policy_block_for_progress(&call.name, outcome.error_reason.as_deref())
             };
             if let Some(idx) = progress_idx {
                 progress_tracker.complete(*idx, outcome.success, secs, failure_detail.as_deref());
@@ -2146,14 +2406,13 @@ pub(crate) async fn run_tool_call_loop(
                     let _ = tx.send(progress_tracker.render_delta()).await;
                 }
             } else if progress_mode == ProgressMode::Off {
-                if let (Some(ref tx), Some(detail)) = (on_delta.as_ref(), failure_detail.as_deref())
-                {
-                    let line = format!(
-                        "{DRAFT_PROGRESS_SENTINEL}❌ {} ({}s): {}\n",
-                        call.name, secs, detail
-                    );
-                    let _ = tx.send(line).await;
-                }
+                emit_policy_block_progress_delta(
+                    on_delta.as_ref(),
+                    &call.name,
+                    secs,
+                    outcome.error_reason.as_deref(),
+                )
+                .await;
             }
 
             // ── Loop detection: record call ──────────────────────
@@ -2162,7 +2421,29 @@ pub(crate) async fn run_tool_call_loop(
                 loop_detector.record_call(&sig.0, &sig.1, &outcome.output, outcome.success);
             }
 
+            if tool_call_satisfies_post_action_verification(&call.name, &call.arguments, outcome.success)
+            {
+                turn_verification_observed = true;
+            }
+            if tool_call_requires_post_action_verification(&call.name, &call.arguments, outcome.success)
+            {
+                turn_requires_verification
+                    .push(summarize_post_action_verification_target(&call.name, &call.arguments));
+            }
+
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
+        }
+
+        if turn_verification_observed {
+            post_action_verification_requirement = None;
+        }
+        if !turn_requires_verification.is_empty() {
+            if turn_verification_observed {
+                post_action_verification_requirement = None;
+            } else {
+                post_action_verification_requirement =
+                    Some(turn_requires_verification.join(", "));
+            }
         }
 
         let runtime_constraint_reasons = summarize_runtime_constraint_reasons(
@@ -4293,8 +4574,9 @@ mod tests {
         ];
         let observer = NoopObserver;
         let excluded_tools = vec!["shell".to_string()];
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(8);
 
-        let result = run_tool_call_loop(
+        let result = run_tool_call_loop_with_reply_target(
             &provider,
             &mut history,
             &tools_registry,
@@ -4305,12 +4587,14 @@ mod tests {
             true,
             None,
             "telegram",
+            Some("chat-1"),
             &crate::config::MultimodalConfig::default(),
             4,
             None,
-            None,
+            Some(delta_tx),
             None,
             &excluded_tools,
+            ProgressMode::Off,
         )
         .await
         .expect("tool loop should complete with blocked tool execution");
@@ -4342,6 +4626,23 @@ mod tests {
         assert_eq!(parsed.policy_id, "runtime.channel.excluded_tools");
         assert_eq!(parsed.command_fragment, "shell echo hi");
         assert!(parsed.reason.contains("not available in this channel"));
+
+        let mut progress_deltas = Vec::new();
+        while let Ok(delta) = delta_rx.try_recv() {
+            progress_deltas.push(delta);
+        }
+        assert!(
+            progress_deltas
+                .iter()
+                .any(|delta| delta.contains("policy=runtime.channel.excluded_tools")),
+            "excluded-tool policy block should be sent to progress stream, got deltas: {progress_deltas:?}"
+        );
+        assert!(
+            progress_deltas
+                .iter()
+                .any(|delta| delta.contains("command=shell echo hi")),
+            "excluded-tool command fragment should be sent to progress stream, got deltas: {progress_deltas:?}"
+        );
     }
 
     #[tokio::test]
@@ -4509,6 +4810,62 @@ mod tests {
             invocations.load(Ordering::SeqCst),
             1,
             "the fallback retry should lead to an actual tool execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_requires_post_action_verification_before_final_answer() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"touch /tmp/zeroclaw.out"}}
+</tool_call>"#,
+            "done without verification",
+            r#"<tool_call>
+{"name":"file_read","arguments":{"path":"README.md"}}
+</tool_call>"#,
+            "done after verification",
+        ]);
+
+        let shell_invocations = Arc::new(AtomicUsize::new(0));
+        let verify_invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(CountingTool::new("shell", Arc::clone(&shell_invocations))),
+            Box::new(CountingTool::new("file_read", Arc::clone(&verify_invocations))),
+        ];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("apply change and finish"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            6,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("loop should enforce post-action verification before final answer");
+
+        assert_eq!(result, "done after verification");
+        assert_eq!(shell_invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            verify_invocations.load(Ordering::SeqCst),
+            1,
+            "verification tool call should be required before final response"
         );
     }
 
@@ -6358,7 +6715,7 @@ Let me check the result."#;
     #[test]
     fn summarize_policy_block_for_progress_extracts_policy_and_command() {
         let raw = "blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example";
-        let summary = summarize_policy_block_for_progress(Some(raw))
+        let summary = summarize_policy_block_for_progress("shell", Some(raw))
             .expect("security block summary should be rendered for progress");
         assert!(summary.contains("policy=autonomy.allowed_commands"));
         assert!(summary.contains("command=curl https://evil.example"));
@@ -6367,7 +6724,7 @@ Let me check the result."#;
     #[test]
     fn progress_tracker_renders_shell_structure_policy_on_blocked_tool() {
         let raw = "blocked by security policy: policy=autonomy.shell_structure.redirection; command=cat </etc/passwd; reason=Shell command structure is blocked by security policy (allow_unsafe_shell_structures=false): input redirection";
-        let detail = summarize_policy_block_for_progress(Some(raw))
+        let detail = summarize_policy_block_for_progress("shell", Some(raw))
             .expect("shell structure policy block should produce progress detail");
 
         let mut tracker = ProgressTracker::default();
@@ -6378,6 +6735,8 @@ Let me check the result."#;
         assert!(rendered.contains("❌ shell (0s)"));
         assert!(rendered.contains("policy=autonomy.shell_structure.redirection"));
         assert!(rendered.contains("command=cat </etc/passwd"));
+        assert!(rendered.contains("reason=Shell command structure is blocked by security policy"));
+        assert!(rendered.contains("allow_unsafe_shell_structures=false"));
     }
 
     #[test]
@@ -6385,6 +6744,17 @@ Let me check the result."#;
         let raw = "blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example";
         let normalized = normalize_runtime_constraint_reason(raw);
         assert!(normalized.contains("security blocked (policy=autonomy.allowed_commands; command=curl https://evil.example)"));
+        assert!(normalized.contains("Guidance: choose an allowed command/tool"));
+        assert!(!normalized.contains("; reason="));
+    }
+
+    #[test]
+    fn normalize_runtime_constraint_reason_prefers_workspace_path_policy_event_summary() {
+        let raw = "blocked by security policy: policy=autonomy.workspace_path_guard; command=cat /etc/passwd; reason=Path blocked by security policy: /etc/passwd";
+        let normalized = normalize_runtime_constraint_reason(raw);
+        assert!(normalized.contains(
+            "security blocked (policy=autonomy.workspace_path_guard; command=cat /etc/passwd)"
+        ));
         assert!(normalized.contains("Guidance: choose an allowed command/tool"));
         assert!(!normalized.contains("; reason="));
     }

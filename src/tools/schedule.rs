@@ -1,5 +1,5 @@
-use super::traits::{Tool, ToolResult};
 use super::cron_common::{consume_action_budget, ensure_cron_enabled, precheck_action_allowed};
+use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron;
 use crate::security::SecurityPolicy;
@@ -147,7 +147,9 @@ impl ScheduleTool {
                 output: String::new(),
                 error: Some(format!(
                     "{}; cannot perform '{action}'",
-                    blocked.error.unwrap_or_else(|| "cron is disabled by config".to_string())
+                    blocked
+                        .error
+                        .unwrap_or_else(|| "cron is disabled by config".to_string())
                 )),
             });
         }

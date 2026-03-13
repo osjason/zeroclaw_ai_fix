@@ -34,6 +34,7 @@ pub mod mattermost;
 pub mod napcat;
 pub mod nextcloud_talk;
 pub mod nostr;
+pub(crate) mod progress_event;
 pub mod qq;
 pub mod signal;
 pub mod slack;
@@ -800,7 +801,10 @@ fn is_verbose_only_progress_line(delta: &str) -> bool {
 
 fn contains_structured_policy_block_progress(delta: &str) -> bool {
     let lower = delta.to_ascii_lowercase();
-    lower.contains("security blocked (policy=") && lower.contains("command=")
+    (lower.contains("security blocked (policy=") && lower.contains("command="))
+        || (lower.contains("status=blocked_by_security_policy")
+            && lower.contains("policy=")
+            && lower.contains("command="))
 }
 
 fn upsert_progress_section(accumulated: &mut String, block: &str) {
@@ -7452,7 +7456,8 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
-    async fn process_channel_message_streaming_still_surfaces_policy_block_when_progress_mode_off() {
+    async fn process_channel_message_streaming_still_surfaces_policy_block_when_progress_mode_off()
+    {
         let channel_impl = Arc::new(DraftStreamingRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
 

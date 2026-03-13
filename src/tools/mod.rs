@@ -120,6 +120,48 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub(crate) fn policy_blocked_result(
+    reason: &crate::security::policy::CommandPolicyViolation,
+) -> ToolResult {
+    ToolResult {
+        success: false,
+        output: String::new(),
+        error: Some(reason.format_block_message()),
+    }
+}
+
+pub(crate) fn command_execution_preflight_result(
+    security: &crate::security::SecurityPolicy,
+    command: &str,
+    approved: bool,
+) -> Option<ToolResult> {
+    if security.is_rate_limited() {
+        return Some(ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(crate::security::policy::rate_limit_precheck_policy_block_event(
+                Some(command),
+            )),
+        });
+    }
+
+    if let Err(reason) = security.validate_command_execution_with_reason(command, approved) {
+        return Some(policy_blocked_result(&reason));
+    }
+
+    if !security.record_action() {
+        return Some(ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(crate::security::policy::action_budget_exhausted_policy_block_event(
+                Some(command),
+            )),
+        });
+    }
+
+    None
+}
+
 #[derive(Clone)]
 struct ArcDelegatingTool {
     inner: Arc<dyn Tool>,

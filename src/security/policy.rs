@@ -47,11 +47,13 @@ const NO_COMMAND_FRAGMENT: &str = "<none>";
 
 /// Structured metadata extracted from a formatted security policy block event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CommandPolicyBlockEvent<'a> {
+pub(crate) struct PolicyBlockEvent<'a> {
     pub policy_id: &'a str,
     pub command_fragment: &'a str,
     pub reason: &'a str,
 }
+
+pub(crate) type CommandPolicyBlockEvent<'a> = PolicyBlockEvent<'a>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ShellStructureBlock {
@@ -179,13 +181,31 @@ pub fn format_policy_block_event(
     CommandPolicyViolation::from_block_event(policy_id, reason, command).format_block_message()
 }
 
+pub(crate) fn read_only_policy_block_event(command: Option<&str>) -> String {
+    format_policy_block_event("autonomy.read_only", "autonomy is read-only", command)
+}
+
+pub(crate) fn rate_limit_precheck_policy_block_event(command: Option<&str>) -> String {
+    format_policy_block_event(
+        "autonomy.max_actions_per_hour",
+        "Rate limit exceeded: too many actions in the last hour",
+        command,
+    )
+}
+
+pub(crate) fn action_budget_exhausted_policy_block_event(command: Option<&str>) -> String {
+    format_policy_block_event(
+        "autonomy.max_actions_per_hour",
+        "Rate limit exceeded: action budget exhausted",
+        command,
+    )
+}
+
 pub(crate) fn is_command_policy_block_message(message: &str) -> bool {
     strip_security_block_prefix(message).is_some()
 }
 
-pub(crate) fn parse_command_policy_block_event(
-    message: &str,
-) -> Option<CommandPolicyBlockEvent<'_>> {
+pub(crate) fn parse_security_policy_block_event(message: &str) -> Option<PolicyBlockEvent<'_>> {
     let detail = strip_security_block_prefix(message)?;
     let detail = detail.strip_prefix("policy=")?;
     let (policy_id, rest) = detail.split_once("; command=")?;
@@ -196,18 +216,24 @@ pub(crate) fn parse_command_policy_block_event(
         return None;
     }
 
-    Some(CommandPolicyBlockEvent {
+    Some(PolicyBlockEvent {
         policy_id,
         command_fragment,
         reason: reason.trim(),
     })
 }
 
+pub(crate) fn parse_command_policy_block_event(
+    message: &str,
+) -> Option<CommandPolicyBlockEvent<'_>> {
+    parse_security_policy_block_event(message)
+}
+
 pub(crate) fn summarize_command_policy_block(
     message: &str,
     max_command_chars: usize,
 ) -> Option<String> {
-    if let Some(event) = parse_command_policy_block_event(message) {
+    if let Some(event) = parse_security_policy_block_event(message) {
         let command = truncate_chars(event.command_fragment, max_command_chars.max(16));
         return Some(format!("policy={}; command={command}", event.policy_id));
     }
