@@ -1,3 +1,6 @@
+use super::cron_common::{
+    consume_action_budget, ensure_cron_enabled, parse_job_request, precheck_action_allowed,
+};
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron::{self, JobType};
@@ -44,43 +47,18 @@ impl Tool for CronRunTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.config.cron.enabled {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
-            });
+        if let Err(blocked) = ensure_cron_enabled(&self.config) {
+            return Ok(blocked);
         }
-
-        let job_id = match args.get("job_id").and_then(serde_json::Value::as_str) {
-            Some(v) if !v.trim().is_empty() => v,
-            _ => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some("Missing 'job_id' parameter".to_string()),
-                });
-            }
+        let request = match parse_job_request(&args) {
+            Ok(request) => request,
+            Err(blocked) => return Ok(blocked),
         };
-        let approved = args
-            .get("approved")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let job_id = request.job_id;
+        let approved = request.approved;
 
-        if !self.security.can_act() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Security policy: read-only mode, cannot perform 'cron_run'".into()),
-            });
-        }
-
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
+        if let Some(blocked) = precheck_action_allowed(&self.security, "cron_run") {
+            return Ok(blocked);
         }
 
         let job = match cron::get_job(&self.config, job_id) {
@@ -107,12 +85,8 @@ impl Tool for CronRunTool {
             }
         }
 
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
+        if let Some(blocked) = consume_action_budget(&self.security) {
+            return Ok(blocked);
         }
 
         let started_at = Utc::now();

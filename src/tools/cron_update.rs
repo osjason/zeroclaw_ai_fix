@@ -1,3 +1,6 @@
+use super::cron_common::{
+    consume_action_budget, ensure_cron_enabled, parse_job_request, precheck_action_allowed,
+};
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron::{self, CronJobPatch, DeliveryConfig, JobType, Schedule};
@@ -14,36 +17,6 @@ pub struct CronUpdateTool {
 impl CronUpdateTool {
     pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
         Self { config, security }
-    }
-
-    fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
-        if !self.security.can_act() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Security policy: read-only mode, cannot perform '{action}'"
-                )),
-            });
-        }
-
-        if self.security.is_rate_limited() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
-            });
-        }
-
-        if !self.security.record_action() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".to_string()),
-            });
-        }
-
-        None
     }
 
     fn parse_default_delivery(args: &serde_json::Value) -> Result<Option<DeliveryConfig>, String> {
@@ -119,24 +92,15 @@ impl Tool for CronUpdateTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.config.cron.enabled {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
-            });
+        if let Err(blocked) = ensure_cron_enabled(&self.config) {
+            return Ok(blocked);
         }
-
-        let job_id = match args.get("job_id").and_then(serde_json::Value::as_str) {
-            Some(v) if !v.trim().is_empty() => v,
-            _ => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some("Missing 'job_id' parameter".to_string()),
-                });
-            }
+        let request = match parse_job_request(&args) {
+            Ok(request) => request,
+            Err(blocked) => return Ok(blocked),
         };
+        let job_id = request.job_id;
+        let approved = request.approved;
 
         let patch_val = match args.get("patch") {
             Some(v) => v.clone(),
@@ -159,10 +123,6 @@ impl Tool for CronUpdateTool {
                 });
             }
         };
-        let approved = args
-            .get("approved")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
         let default_delivery = match Self::parse_default_delivery(&args) {
             Ok(default_delivery) => default_delivery,
             Err(error) => {
@@ -199,7 +159,10 @@ impl Tool for CronUpdateTool {
             patch.delivery = default_delivery;
         }
 
-        if let Some(blocked) = self.enforce_mutation_allowed("cron_update") {
+        if let Some(blocked) = precheck_action_allowed(&self.security, "cron_update") {
+            return Ok(blocked);
+        }
+        if let Some(blocked) = consume_action_budget(&self.security) {
             return Ok(blocked);
         }
 

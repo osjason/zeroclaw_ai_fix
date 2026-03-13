@@ -1,5 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
+use crate::security::policy::format_policy_block_event;
 use crate::security::SecurityPolicy;
 use crate::security::SyscallAnomalyDetector;
 use async_trait::async_trait;
@@ -162,23 +163,25 @@ impl Tool for ShellTool {
             });
         }
 
-        match self.security.validate_command_execution(&command, approved) {
+        match self
+            .security
+            .validate_command_execution_with_reason(&command, approved)
+        {
             Ok(_) => {}
             Err(reason) => {
+                let policy_id = reason.policy_id();
+                let command_fragment = reason.command_fragment().to_string();
+                let error_message = format_policy_block_event(
+                    policy_id,
+                    reason.to_string(),
+                    Some(&command_fragment),
+                );
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(reason),
+                    error: Some(error_message),
                 });
             }
-        }
-
-        if let Some(path) = self.security.forbidden_path_argument(&command) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Path blocked by security policy: {path}")),
-            });
         }
 
         if !self.security.record_action() {
@@ -271,6 +274,7 @@ mod tests {
     use super::*;
     use crate::config::{AuditConfig, SyscallAnomalyConfig};
     use crate::runtime::{NativeRuntime, RuntimeAdapter};
+    use crate::security::policy::parse_command_policy_block_event;
     use crate::security::{AutonomyLevel, SecurityPolicy, SyscallAnomalyDetector};
     use tempfile::TempDir;
 
@@ -374,7 +378,11 @@ mod tests {
             .expect("disallowed command execution should return a result");
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
-        assert!(error.contains("not allowed") || error.contains("high-risk"));
+        let event = parse_command_policy_block_event(error)
+            .expect("shell policy block should expose structured policy event");
+        assert_eq!(event.policy_id, "autonomy.allowed_commands");
+        assert_eq!(event.command_fragment, "rm -rf /");
+        assert!(event.reason.contains("not allowed"));
     }
 
     #[tokio::test]
@@ -489,7 +497,7 @@ mod tests {
             .error
             .as_deref()
             .unwrap_or("")
-            .contains("not allowed"));
+            .contains("policy=autonomy.shell_structure.redirection"));
     }
 
     fn test_security_with_env_cmd() -> Arc<SecurityPolicy> {

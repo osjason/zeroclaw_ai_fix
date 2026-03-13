@@ -1,3 +1,4 @@
+use super::cron_common::{consume_action_budget, ensure_cron_enabled, precheck_action_allowed};
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron::{self, DeliveryConfig, JobType, Schedule, SessionTarget};
@@ -16,36 +17,6 @@ const MIN_AGENT_EVERY_MS: u64 = 5 * 60 * 1000;
 impl CronAddTool {
     pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
         Self { config, security }
-    }
-
-    fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
-        if !self.security.can_act() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Security policy: read-only mode, cannot perform '{action}'"
-                )),
-            });
-        }
-
-        if self.security.is_rate_limited() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
-            });
-        }
-
-        if !self.security.record_action() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".to_string()),
-            });
-        }
-
-        None
     }
 }
 
@@ -106,12 +77,8 @@ impl Tool for CronAddTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.config.cron.enabled {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
-            });
+        if let Err(blocked) = ensure_cron_enabled(&self.config) {
+            return Ok(blocked);
         }
 
         let schedule = match args.get("schedule") {
@@ -189,7 +156,10 @@ impl Tool for CronAddTool {
                     });
                 }
 
-                if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
+                if let Some(blocked) = precheck_action_allowed(&self.security, "cron_add") {
+                    return Ok(blocked);
+                }
+                if let Some(blocked) = consume_action_budget(&self.security) {
                     return Ok(blocked);
                 }
 
@@ -283,7 +253,10 @@ For one-time reminders, use schedule.kind='at' with an RFC3339 timestamp."
                     None => None,
                 };
 
-                if let Some(blocked) = self.enforce_mutation_allowed("cron_add") {
+                if let Some(blocked) = precheck_action_allowed(&self.security, "cron_add") {
+                    return Ok(blocked);
+                }
+                if let Some(blocked) = consume_action_budget(&self.security) {
                     return Ok(blocked);
                 }
 

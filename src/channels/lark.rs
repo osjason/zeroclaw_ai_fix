@@ -2579,6 +2579,7 @@ mod tests {
             draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
             ),
             max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            progress_mode: crate::config::ProgressMode::default(),
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -2605,6 +2606,7 @@ mod tests {
             draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
             ),
             max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            progress_mode: crate::config::ProgressMode::default(),
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -2643,6 +2645,7 @@ mod tests {
             draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
             ),
             max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            progress_mode: crate::config::ProgressMode::default(),
         };
 
         let ch = LarkChannel::from_config(&cfg);
@@ -2679,6 +2682,7 @@ mod tests {
             draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
             ),
             max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            progress_mode: crate::config::ProgressMode::default(),
         };
 
         let ch = LarkChannel::from_lark_config(&cfg);
@@ -2704,6 +2708,7 @@ mod tests {
             draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
             ),
             max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            progress_mode: crate::config::ProgressMode::default(),
         };
 
         let ch = LarkChannel::from_feishu_config(&cfg);
@@ -2736,6 +2741,7 @@ mod tests {
             port: Some(9898),
             draft_update_interval_ms: 1500,
             max_draft_edits: 7,
+            progress_mode: crate::config::ProgressMode::default(),
         };
 
         let ch = LarkChannel::from_lark_config(&cfg);
@@ -2911,12 +2917,33 @@ mod tests {
             draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
             ),
             max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            progress_mode: crate::config::ProgressMode::default(),
         };
         let ch_feishu = LarkChannel::from_feishu_config(&feishu_cfg);
         assert_eq!(
             ch_feishu.message_reaction_url("om_test_message_id"),
             "https://open.feishu.cn/open-apis/im/v1/messages/om_test_message_id/reactions"
         );
+    }
+
+    #[test]
+    fn lark_text_edit_payload_preserves_policy_block_progress_summary() {
+        let progress_line = "❌ shell (0.2s): security blocked (policy=autonomy.allowed_commands; command=cat /etc/passwd)";
+        let payload = LarkChannel::build_text_edit_payload(progress_line);
+        let content = payload
+            .get("content")
+            .and_then(|value| value.as_str())
+            .expect("text payload should include JSON-encoded content");
+        let parsed: serde_json::Value =
+            serde_json::from_str(content).expect("content should be valid JSON");
+        let rendered = parsed
+            .get("text")
+            .and_then(|value| value.as_str())
+            .expect("content JSON should include text field");
+
+        assert!(rendered.contains("policy=autonomy.allowed_commands"));
+        assert!(rendered.contains("command=cat /etc/passwd"));
+        assert_eq!(rendered, progress_line);
     }
 
     #[test]

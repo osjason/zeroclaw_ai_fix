@@ -11,6 +11,9 @@ use crate::cron::{
     due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
     update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
 };
+use crate::security::policy::{
+    format_policy_block_event, is_command_policy_block_message, summarize_command_policy_block,
+};
 use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -23,6 +26,8 @@ use tokio::time::{self, Duration};
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
+const START_ANNOUNCEMENT_PREVIEW_CHARS: usize = 180;
+const RESULT_ANNOUNCEMENT_PREVIEW_CHARS: usize = 220;
 
 pub(crate) fn is_no_reply_sentinel(output: &str) -> bool {
     output.trim().eq_ignore_ascii_case("NO_REPLY")
@@ -59,7 +64,7 @@ pub async fn run(config: Config) -> Result<()> {
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
     let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-    Box::pin(execute_job_with_retry(config, &security, job)).await
+    Box::pin(execute_job_with_start_announcement(config, &security, job)).await
 }
 
 async fn execute_job_with_retry(
@@ -82,7 +87,7 @@ async fn execute_job_with_retry(
             return (true, last_output);
         }
 
-        if last_output.starts_with("blocked by security policy:") {
+        if is_command_policy_block_message(&last_output) {
             // Deterministic policy violations are not retryable.
             return (false, last_output);
         }
@@ -95,6 +100,21 @@ async fn execute_job_with_retry(
     }
 
     (false, last_output)
+}
+
+async fn execute_job_with_start_announcement(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+) -> (bool, String) {
+    if let Err(e) = deliver_start_if_configured(config, job).await {
+        tracing::warn!("Cron start delivery failed: {e}");
+    }
+    Box::pin(execute_job_with_retry(config, security, job)).await
+}
+
+fn policy_block_output(policy_id: &'static str, reason: &str, command: Option<&str>) -> String {
+    format_policy_block_event(policy_id, reason, command)
 }
 
 async fn process_due_jobs(
@@ -138,9 +158,8 @@ async fn execute_and_persist_job(
 ) -> (String, bool, String) {
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
-
     let started_at = Utc::now();
-    let (success, output) = Box::pin(execute_job_with_retry(config, security, job)).await;
+    let (success, output) = Box::pin(execute_job_with_start_announcement(config, security, job)).await;
     let finished_at = Utc::now();
     let success = persist_job_result(config, job, success, &output, started_at, finished_at).await;
 
@@ -152,24 +171,42 @@ async fn run_agent_job(
     security: &SecurityPolicy,
     job: &CronJob,
 ) -> (bool, String) {
+    let agent_subject = format!(
+        "cron-agent:{} {}",
+        job.id,
+        job.prompt.as_deref().unwrap_or_default()
+    );
+
     if !security.can_act() {
         return (
             false,
-            "blocked by security policy: autonomy is read-only".to_string(),
+            policy_block_output(
+                "autonomy.read_only",
+                "autonomy is read-only",
+                Some(&agent_subject),
+            ),
         );
     }
 
     if security.is_rate_limited() {
         return (
             false,
-            "blocked by security policy: rate limit exceeded".to_string(),
+            policy_block_output(
+                "autonomy.max_actions_per_hour",
+                "rate limit exceeded",
+                Some(&agent_subject),
+            ),
         );
     }
 
     if !security.record_action() {
         return (
             false,
-            "blocked by security policy: action budget exhausted".to_string(),
+            policy_block_output(
+                "autonomy.max_actions_per_hour",
+                "action budget exhausted",
+                Some(&agent_subject),
+            ),
         );
     }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
@@ -215,8 +252,9 @@ async fn persist_job_result(
     finished_at: DateTime<Utc>,
 ) -> bool {
     let duration_ms = (finished_at - started_at).num_milliseconds();
+    let announce_output = build_job_result_announcement(job, success, output);
 
-    if let Err(e) = deliver_if_configured(config, job, output).await {
+    if let Err(e) = deliver_if_configured(config, job, &announce_output).await {
         if job.delivery.best_effort {
             tracing::warn!("Cron delivery failed (best_effort): {e}");
         } else {
@@ -295,10 +333,9 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
 }
 
 async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
-    let delivery: &DeliveryConfig = &job.delivery;
-    if !delivery.mode.eq_ignore_ascii_case("announce") {
+    let Some((channel, target)) = resolve_announce_target(job)? else {
         return Ok(());
-    }
+    };
     if is_no_reply_sentinel(output) {
         tracing::debug!(
             "Cron job '{}' returned NO_REPLY sentinel; skipping announce delivery",
@@ -307,6 +344,25 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         return Ok(());
     }
 
+    deliver_announcement(config, channel, target, output).await
+}
+
+async fn deliver_start_if_configured(config: &Config, job: &CronJob) -> Result<()> {
+    let Some((channel, target)) = resolve_announce_target(job)? else {
+        return Ok(());
+    };
+    let triggered = build_job_trigger_announcement(job);
+    deliver_announcement(config, channel, target, &triggered).await?;
+
+    let running = build_job_running_announcement(job);
+    deliver_announcement(config, channel, target, &running).await
+}
+
+fn resolve_announce_target(job: &CronJob) -> Result<Option<(&str, &str)>> {
+    let delivery: &DeliveryConfig = &job.delivery;
+    if !delivery.mode.eq_ignore_ascii_case("announce") {
+        return Ok(None);
+    }
     let channel = delivery
         .channel
         .as_deref()
@@ -315,8 +371,118 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         .to
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
+    Ok(Some((channel, target)))
+}
 
-    deliver_announcement(config, channel, target, output).await
+fn build_job_trigger_announcement(job: &CronJob) -> String {
+    let name = job.name.as_deref().unwrap_or("cron-job");
+    let schedule = describe_schedule(&job.schedule);
+    match job.job_type {
+        JobType::Agent => {
+            let prompt = compact_preview(
+                job.prompt.as_deref().unwrap_or(""),
+                START_ANNOUNCEMENT_PREVIEW_CHARS,
+            );
+            format!(
+                "⏱️ Cron triggered: id={} name={name} type=agent\nschedule={schedule}\nagent_task={prompt}\nstatus=triggered",
+                job.id
+            )
+        }
+        JobType::Shell => {
+            let command = compact_preview(&job.command, START_ANNOUNCEMENT_PREVIEW_CHARS);
+            format!(
+                "⏱️ Cron triggered: id={} name={name} type=shell\nschedule={schedule}\ncommand={command}\nstatus=triggered",
+                job.id
+            )
+        }
+    }
+}
+
+fn build_job_running_announcement(job: &CronJob) -> String {
+    let name = job.name.as_deref().unwrap_or("cron-job");
+    match job.job_type {
+        JobType::Agent => format!(
+            "▶️ Cron running: id={} name={name} type=agent\nstatus=agent is now executing",
+            job.id
+        ),
+        JobType::Shell => format!(
+            "▶️ Cron running: id={} name={name} type=shell\nstatus=shell command is now executing",
+            job.id
+        ),
+    }
+}
+
+fn build_job_result_announcement(job: &CronJob, success: bool, output: &str) -> String {
+    if is_no_reply_sentinel(output) {
+        return output.to_string();
+    }
+
+    if !success {
+        if let Some(summary) =
+            summarize_command_policy_block(output, RESULT_ANNOUNCEMENT_PREVIEW_CHARS)
+        {
+            let name = job.name.as_deref().unwrap_or("cron-job");
+            let schedule = describe_schedule(&job.schedule);
+            let kind = match job.job_type {
+                JobType::Agent => "agent",
+                JobType::Shell => "shell",
+            };
+            let reason_preview = compact_preview(output, RESULT_ANNOUNCEMENT_PREVIEW_CHARS);
+            return format!(
+                "🚫 Cron blocked: id={} name={name} type={kind}\nschedule={schedule}\n{summary}\nstatus=blocked_by_security_policy\nreason={reason_preview}",
+                job.id
+            );
+        }
+    }
+
+    output.to_string()
+}
+
+fn describe_schedule(schedule: &Schedule) -> String {
+    match schedule {
+        Schedule::Cron { expr, tz } => {
+            if let Some(tz) = tz {
+                format!("cron({expr}) tz={tz}")
+            } else {
+                format!("cron({expr})")
+            }
+        }
+        Schedule::At { at } => format!("at({})", at.to_rfc3339()),
+        Schedule::Every { every_ms } => format!("every({every_ms}ms)"),
+    }
+}
+
+fn compact_preview(raw: &str, max_chars: usize) -> String {
+    let compact = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return "<empty>".to_string();
+    }
+    let mut chars = compact.chars();
+    let preview: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+#[cfg(test)]
+type TestAnnouncement = (String, String, String);
+
+#[cfg(test)]
+fn test_announcements_store() -> &'static tokio::sync::Mutex<Vec<TestAnnouncement>> {
+    static STORE: std::sync::OnceLock<tokio::sync::Mutex<Vec<TestAnnouncement>>> =
+        std::sync::OnceLock::new();
+    STORE.get_or_init(|| tokio::sync::Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
+async fn push_test_announcement(channel: &str, target: &str, output: &str) {
+    test_announcements_store().lock().await.push((
+        channel.to_string(),
+        target.to_string(),
+        output.to_string(),
+    ));
 }
 
 pub(crate) async fn deliver_announcement(
@@ -325,6 +491,12 @@ pub(crate) async fn deliver_announcement(
     target: &str,
     output: &str,
 ) -> Result<()> {
+    #[cfg(test)]
+    if channel.eq_ignore_ascii_case("__test__") {
+        push_test_announcement(channel, target, output).await;
+        return Ok(());
+    }
+
     let normalized = channel.to_ascii_lowercase();
     match normalized.as_str() {
         "telegram" => {
@@ -544,38 +716,41 @@ async fn run_job_command_with_timeout(
     if !security.can_act() {
         return (
             false,
-            "blocked by security policy: autonomy is read-only".to_string(),
+            policy_block_output(
+                "autonomy.read_only",
+                "autonomy is read-only",
+                Some(&job.command),
+            ),
         );
     }
 
     if security.is_rate_limited() {
         return (
             false,
-            "blocked by security policy: rate limit exceeded".to_string(),
-        );
-    }
-
-    if !security.is_command_allowed(&job.command) {
-        return (
-            false,
-            format!(
-                "blocked by security policy: command not allowed: {}",
-                job.command
+            policy_block_output(
+                "autonomy.max_actions_per_hour",
+                "rate limit exceeded",
+                Some(&job.command),
             ),
         );
     }
 
-    if let Some(path) = security.forbidden_path_argument(&job.command) {
-        return (
-            false,
-            format!("blocked by security policy: forbidden path argument: {path}"),
-        );
+    if let Err(reason) = security.validate_command_execution_with_reason(&job.command, false) {
+        let policy_id = reason.policy_id();
+        let command_fragment = reason.command_fragment().to_string();
+        let block_message =
+            format_policy_block_event(policy_id, reason.to_string(), Some(&command_fragment));
+        return (false, block_message);
     }
 
     if !security.record_action() {
         return (
             false,
-            "blocked by security policy: action budget exhausted".to_string(),
+            policy_block_output(
+                "autonomy.max_actions_per_hour",
+                "action budget exhausted",
+                Some(&job.command),
+            ),
         );
     }
 
@@ -618,6 +793,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::cron::{self, DeliveryConfig};
+    use crate::security::policy::parse_command_policy_block_event;
     use crate::security::SecurityPolicy;
     use chrono::{Duration as ChronoDuration, Utc};
     use std::sync::OnceLock;
@@ -693,6 +869,14 @@ mod tests {
         format!("{prefix}-{}", uuid::Uuid::new_v4())
     }
 
+    async fn clear_test_announcements() {
+        test_announcements_store().lock().await.clear();
+    }
+
+    async fn snapshot_test_announcements() -> Vec<TestAnnouncement> {
+        test_announcements_store().lock().await.clone()
+    }
+
     #[tokio::test]
     async fn run_job_command_success() {
         let tmp = TempDir::new().unwrap();
@@ -743,8 +927,11 @@ mod tests {
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("command not allowed"));
+        let event = parse_command_policy_block_event(&output)
+            .expect("expected structured security policy block event");
+        assert_eq!(event.policy_id, "autonomy.allowed_commands");
+        assert_eq!(event.command_fragment, "curl https://evil.example");
+        assert!(event.reason.to_ascii_lowercase().contains("command not allowed"));
     }
 
     #[tokio::test]
@@ -818,7 +1005,8 @@ mod tests {
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("command not allowed"));
+        assert!(output.contains("policy=autonomy.shell_structure.redirection"));
+        assert!(output.contains("Shell redirection operators"));
     }
 
     #[tokio::test]
@@ -832,6 +1020,8 @@ mod tests {
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("policy=autonomy.read_only"));
+        assert!(output.contains("command=echo should-not-run"));
         assert!(output.contains("read-only"));
     }
 
@@ -933,6 +1123,8 @@ mod tests {
         let (success, output) = run_agent_job(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
+        assert!(output.contains("policy=autonomy.max_actions_per_hour"));
+        assert!(output.contains("command=cron-agent:"));
         assert!(output.contains("rate limit exceeded"));
     }
 
@@ -973,6 +1165,45 @@ mod tests {
         let snapshot = crate::health::snapshot_json();
         let entry = &snapshot["components"][component.as_str()];
         assert_eq!(entry["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn process_due_jobs_delivers_trigger_running_then_result_announcements() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = Arc::new(SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+        ));
+        let component = unique_component("scheduler-announce-order");
+        let mut job = test_job("echo due-job-order");
+        job.name = Some("ordered-due-job".into());
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("__test__".into()),
+            to: Some("chat-due-order".into()),
+            best_effort: false,
+        };
+
+        clear_test_announcements().await;
+        process_due_jobs(&config, &security, vec![job], &component).await;
+        let announcements = snapshot_test_announcements().await;
+
+        assert_eq!(announcements.len(), 3);
+        assert_eq!(announcements[0].0, "__test__");
+        assert_eq!(announcements[0].1, "chat-due-order");
+        assert!(announcements[0].2.contains("status=triggered"));
+        assert!(announcements[0].2.contains("Cron triggered: id=test-job"));
+        assert_eq!(announcements[1].0, "__test__");
+        assert_eq!(announcements[1].1, "chat-due-order");
+        assert!(announcements[1]
+            .2
+            .contains("status=shell command is now executing"));
+        assert!(announcements[1].2.contains("Cron running: id=test-job"));
+        assert_eq!(announcements[2].0, "__test__");
+        assert_eq!(announcements[2].1, "chat-due-order");
+        assert!(announcements[2].2.contains("stdout:"));
+        assert!(announcements[2].2.contains("due-job-order"));
     }
 
     #[tokio::test]
@@ -1213,6 +1444,136 @@ mod tests {
         assert!(deliver_if_configured(&config, &job, "  no_reply  ")
             .await
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn execute_and_persist_job_delivers_trigger_then_running_then_result_announcements() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        let mut job = test_job("echo scheduler-start-and-result");
+        job.name = Some("announced-job".into());
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("__test__".into()),
+            to: Some("chat-42".into()),
+            best_effort: false,
+        };
+
+        clear_test_announcements().await;
+        let (job_id, success, output) =
+            execute_and_persist_job(&config, &security, &job, "scheduler-test").await;
+        let announcements = snapshot_test_announcements().await;
+
+        assert_eq!(job_id, "test-job");
+        assert!(success);
+        assert!(output.contains("scheduler-start-and-result"));
+        assert_eq!(announcements.len(), 3);
+        assert_eq!(announcements[0].0, "__test__");
+        assert_eq!(announcements[0].1, "chat-42");
+        assert!(announcements[0].2.contains("status=triggered"));
+        assert!(announcements[0].2.contains("Cron triggered: id=test-job"));
+        assert_eq!(announcements[1].0, "__test__");
+        assert_eq!(announcements[1].1, "chat-42");
+        assert!(announcements[1]
+            .2
+            .contains("status=shell command is now executing"));
+        assert!(announcements[1].2.contains("Cron running: id=test-job"));
+        assert_eq!(announcements[2].0, "__test__");
+        assert_eq!(announcements[2].1, "chat-42");
+        assert!(announcements[2].2.contains("stdout:"));
+        assert!(announcements[2].2.contains("scheduler-start-and-result"));
+    }
+
+    #[tokio::test]
+    async fn execute_and_persist_job_includes_policy_summary_in_blocked_result_announcement() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.autonomy.allowed_commands = vec!["echo".into()];
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        let mut job = test_job("curl https://evil.example");
+        job.name = Some("blocked-job".into());
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("__test__".into()),
+            to: Some("chat-77".into()),
+            best_effort: false,
+        };
+
+        clear_test_announcements().await;
+        let (_job_id, success, output) =
+            execute_and_persist_job(&config, &security, &job, "scheduler-test").await;
+        let announcements = snapshot_test_announcements().await;
+
+        assert!(!success);
+        assert!(output.contains("blocked by security policy"));
+        assert_eq!(announcements.len(), 3);
+        assert!(announcements[2].2.contains("Cron blocked: id=test-job"));
+        assert!(announcements[2].2.contains("status=blocked_by_security_policy"));
+        assert!(announcements[2]
+            .2
+            .contains("policy=autonomy.allowed_commands"));
+        assert!(announcements[2]
+            .2
+            .contains("command=curl https://evil.example"));
+    }
+
+    #[tokio::test]
+    async fn execute_job_now_delivers_start_announcement_for_announce_mode() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("echo run-now-start-announce");
+        job.name = Some("run-now-job".into());
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("__test__".into()),
+            to: Some("chat-99".into()),
+            best_effort: false,
+        };
+
+        clear_test_announcements().await;
+        let (success, output) = execute_job_now(&config, &job).await;
+        let announcements = snapshot_test_announcements().await;
+
+        assert!(success, "{output}");
+        assert!(output.contains("run-now-start-announce"));
+        assert_eq!(announcements.len(), 2);
+        assert_eq!(announcements[0].0, "__test__");
+        assert_eq!(announcements[0].1, "chat-99");
+        assert!(announcements[0].2.contains("status=triggered"));
+        assert!(announcements[0].2.contains("Cron triggered: id=test-job"));
+        assert_eq!(announcements[1].0, "__test__");
+        assert_eq!(announcements[1].1, "chat-99");
+        assert!(announcements[1]
+            .2
+            .contains("status=shell command is now executing"));
+        assert!(announcements[1].2.contains("Cron running: id=test-job"));
+    }
+
+    #[test]
+    fn build_job_trigger_announcement_includes_agent_execution_context() {
+        let mut job = test_job("echo ignored");
+        job.job_type = JobType::Agent;
+        job.name = Some("daily-sync".into());
+        job.prompt = Some("Summarize the latest error logs and verify fixes".into());
+        job.schedule = Schedule::Every { every_ms: 60_000 };
+
+        let message = build_job_trigger_announcement(&job);
+        assert!(message.contains("Cron triggered: id=test-job name=daily-sync type=agent"));
+        assert!(message.contains("schedule=every(60000ms)"));
+        assert!(message.contains("agent_task=Summarize the latest error logs and verify fixes"));
+        assert!(message.contains("status=triggered"));
+    }
+
+    #[test]
+    fn build_job_running_announcement_includes_agent_execution_context() {
+        let mut job = test_job("echo ignored");
+        job.job_type = JobType::Agent;
+        job.name = Some("daily-sync".into());
+
+        let message = build_job_running_announcement(&job);
+        assert!(message.contains("Cron running: id=test-job name=daily-sync type=agent"));
+        assert!(message.contains("status=agent is now executing"));
     }
 
     #[test]

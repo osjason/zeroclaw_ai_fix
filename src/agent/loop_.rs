@@ -9,7 +9,12 @@ use crate::providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
 };
 use crate::runtime;
-use crate::security::SecurityPolicy;
+use crate::security::{
+    policy::{
+        format_policy_block_event, parse_command_policy_block_event, summarize_command_policy_block,
+    },
+    SecurityPolicy,
+};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -473,7 +478,7 @@ fn budget_exceeded_message(
 struct ProgressEntry {
     name: String,
     hint: String,
-    completion: Option<(bool, u64)>,
+    completion: Option<(bool, u64, Option<String>)>,
 }
 
 #[derive(Debug, Default)]
@@ -492,16 +497,16 @@ impl ProgressTracker {
         idx
     }
 
-    fn complete(&mut self, idx: usize, success: bool, secs: u64) {
+    fn complete(&mut self, idx: usize, success: bool, secs: u64, failure_detail: Option<&str>) {
         if let Some(entry) = self.entries.get_mut(idx) {
-            entry.completion = Some((success, secs));
+            entry.completion = Some((success, secs, failure_detail.map(ToString::to_string)));
         }
     }
 
     fn render_delta(&self) -> String {
         let mut out = String::from(DRAFT_PROGRESS_BLOCK_SENTINEL);
         for entry in &self.entries {
-            match entry.completion {
+            match &entry.completion {
                 None => {
                     let _ = write!(out, "\u{23f3} {}", entry.name);
                     if !entry.hint.is_empty() {
@@ -509,11 +514,17 @@ impl ProgressTracker {
                     }
                     out.push('\n');
                 }
-                Some((true, secs)) => {
+                Some((true, secs, _)) => {
                     let _ = writeln!(out, "\u{2705} {} ({secs}s)", entry.name);
                 }
-                Some((false, secs)) => {
-                    let _ = writeln!(out, "\u{274c} {} ({secs}s)", entry.name);
+                Some((false, secs, detail)) => {
+                    let _ = write!(out, "\u{274c} {} ({secs}s)", entry.name);
+                    if let Some(detail) = detail.as_deref() {
+                        if !detail.is_empty() {
+                            let _ = write!(out, ": {detail}");
+                        }
+                    }
+                    out.push('\n');
                 }
             }
         }
@@ -544,6 +555,15 @@ fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len
     }
 }
 
+fn summarize_policy_block_for_progress(reason: Option<&str>) -> Option<String> {
+    reason.and_then(|raw| render_policy_block_summary(raw, 72))
+}
+
+fn render_policy_block_summary(reason: &str, max_command_chars: usize) -> Option<String> {
+    summarize_command_policy_block(reason, max_command_chars)
+        .map(|summary| format!("security blocked ({summary})"))
+}
+
 pub(crate) fn looks_like_deferred_action_without_tool_call(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -568,12 +588,23 @@ fn strip_tool_error_prefix(reason: &str) -> &str {
 }
 
 pub(crate) fn looks_like_runtime_constraint_reason(reason: &str) -> bool {
+    if parse_command_policy_block_event(reason).is_some() {
+        return true;
+    }
+
+    if render_policy_block_summary(reason, 48).is_some() {
+        return true;
+    }
+
     let lower = strip_tool_error_prefix(reason).to_ascii_lowercase();
-    lower.contains("security policy")
-        || lower.contains("blocked by policy")
-        || lower.contains("requires explicit approval")
+    lower.contains("requires explicit approval")
         || lower.contains("denied by user")
         || lower.contains("not available in this channel")
+        || lower.contains("path not allowed by security policy")
+        || lower.contains("path blocked by security policy")
+        || lower.contains("command not allowed by security policy")
+        || lower.contains("high-risk command is disallowed by policy")
+        || lower.contains("shell command structure is blocked by security policy")
         || lower.contains("outside the allowed workspace")
         || lower.contains("escapes workspace")
         || lower.contains("allowed_roots")
@@ -588,6 +619,20 @@ pub(crate) fn normalize_runtime_constraint_reason(reason: &str) -> String {
     let trimmed = strip_tool_error_prefix(reason);
     if trimmed.is_empty() {
         return String::new();
+    }
+
+    if let Some(event) = parse_command_policy_block_event(trimmed) {
+        let command = truncate_with_ellipsis(event.command_fragment, 72);
+        return format!(
+            "security blocked (policy={}; command={command}) Guidance: choose an allowed command/tool, or adjust the corresponding `[autonomy]` policy gate.",
+            event.policy_id
+        );
+    }
+
+    if let Some(summary) = render_policy_block_summary(trimmed, 72) {
+        return format!(
+            "{summary} Guidance: choose an allowed command/tool, or adjust the corresponding `[autonomy]` policy gate."
+        );
     }
 
     let lower = trimmed.to_ascii_lowercase();
@@ -1810,7 +1855,18 @@ pub(crate) async fn run_tool_call_loop(
             );
 
             if excluded_tools.iter().any(|ex| ex == &tool_name) {
-                let blocked = format!("Tool '{tool_name}' is not available in this channel.");
+                let reason = format!("Tool '{tool_name}' is not available in this channel.");
+                let hint = truncate_tool_args_for_progress(&tool_name, &tool_args, 96);
+                let command_fragment = if hint.is_empty() {
+                    tool_name.clone()
+                } else {
+                    format!("{tool_name} {hint}")
+                };
+                let blocked = format_policy_block_event(
+                    "runtime.channel.excluded_tools",
+                    reason,
+                    Some(&command_fragment),
+                );
                 runtime_trace::record_event(
                     "tool_call_result",
                     Some(channel_name),
@@ -2077,12 +2133,26 @@ pub(crate) async fn run_tool_call_loop(
                     .await;
             }
 
+            let secs = outcome.duration.as_secs();
+            let failure_detail = if outcome.success {
+                None
+            } else {
+                summarize_policy_block_for_progress(outcome.error_reason.as_deref())
+            };
             if let Some(idx) = progress_idx {
-                let secs = outcome.duration.as_secs();
-                progress_tracker.complete(*idx, outcome.success, secs);
+                progress_tracker.complete(*idx, outcome.success, secs, failure_detail.as_deref());
                 if let Some(ref tx) = on_delta {
                     tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
                     let _ = tx.send(progress_tracker.render_delta()).await;
+                }
+            } else if progress_mode == ProgressMode::Off {
+                if let (Some(ref tx), Some(detail)) = (on_delta.as_ref(), failure_detail.as_deref())
+                {
+                    let line = format!(
+                        "{DRAFT_PROGRESS_SENTINEL}❌ {} ({}s): {}\n",
+                        call.name, secs, detail
+                    );
+                    let _ = tx.send(line).await;
                 }
             }
 
@@ -4262,6 +4332,16 @@ mod tests {
                 .contains("not available in this channel"),
             "blocked reason should be visible to the model"
         );
+        let blocked_line = tool_results_message
+            .content
+            .lines()
+            .find(|line| line.contains("blocked by security policy"))
+            .expect("structured policy block line should be included");
+        let parsed = parse_command_policy_block_event(blocked_line)
+            .expect("blocked tool reason should be parseable as a policy block event");
+        assert_eq!(parsed.policy_id, "runtime.channel.excluded_tools");
+        assert_eq!(parsed.command_fragment, "shell echo hi");
+        assert!(parsed.reason.contains("not available in this channel"));
     }
 
     #[tokio::test]
@@ -6268,10 +6348,68 @@ Let me check the result."#;
         assert!(started.contains("⏳ shell: ls -la"));
         assert!(started.contains("⏳ web_search: rust async test"));
 
-        tracker.complete(first, true, 2);
-        tracker.complete(second, false, 1);
+        tracker.complete(first, true, 2, None);
+        tracker.complete(second, false, 1, None);
         let completed = tracker.render_delta();
         assert!(completed.contains("✅ shell (2s)"));
         assert!(completed.contains("❌ web_search (1s)"));
+    }
+
+    #[test]
+    fn summarize_policy_block_for_progress_extracts_policy_and_command() {
+        let raw = "blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example";
+        let summary = summarize_policy_block_for_progress(Some(raw))
+            .expect("security block summary should be rendered for progress");
+        assert!(summary.contains("policy=autonomy.allowed_commands"));
+        assert!(summary.contains("command=curl https://evil.example"));
+    }
+
+    #[test]
+    fn progress_tracker_renders_shell_structure_policy_on_blocked_tool() {
+        let raw = "blocked by security policy: policy=autonomy.shell_structure.redirection; command=cat </etc/passwd; reason=Shell command structure is blocked by security policy (allow_unsafe_shell_structures=false): input redirection";
+        let detail = summarize_policy_block_for_progress(Some(raw))
+            .expect("shell structure policy block should produce progress detail");
+
+        let mut tracker = ProgressTracker::default();
+        let idx = tracker.add("shell", "cat </etc/passwd");
+        tracker.complete(idx, false, 0, Some(detail.as_str()));
+
+        let rendered = tracker.render_delta();
+        assert!(rendered.contains("❌ shell (0s)"));
+        assert!(rendered.contains("policy=autonomy.shell_structure.redirection"));
+        assert!(rendered.contains("command=cat </etc/passwd"));
+    }
+
+    #[test]
+    fn normalize_runtime_constraint_reason_prefers_policy_event_summary() {
+        let raw = "blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example";
+        let normalized = normalize_runtime_constraint_reason(raw);
+        assert!(normalized.contains("security blocked (policy=autonomy.allowed_commands; command=curl https://evil.example)"));
+        assert!(normalized.contains("Guidance: choose an allowed command/tool"));
+        assert!(!normalized.contains("; reason="));
+    }
+
+    #[test]
+    fn looks_like_runtime_constraint_reason_requires_specific_block_signals() {
+        assert!(!looks_like_runtime_constraint_reason(
+            "This is just a generic mention of a security policy."
+        ));
+
+        let structured_block = "blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example";
+        assert!(looks_like_runtime_constraint_reason(structured_block));
+    }
+
+    #[test]
+    fn summarize_runtime_constraint_reasons_preserves_policy_and_command_for_retry_prompt() {
+        let raw = "blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example";
+        let reasons = summarize_runtime_constraint_reasons([raw], 3);
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("policy=autonomy.allowed_commands"));
+        assert!(reasons[0].contains("command=curl https://evil.example"));
+
+        let prompt =
+            build_runtime_constraint_retry_prompt(&reasons).expect("retry prompt should exist");
+        assert!(prompt.contains("policy=autonomy.allowed_commands"));
+        assert!(prompt.contains("command=curl https://evil.example"));
     }
 }

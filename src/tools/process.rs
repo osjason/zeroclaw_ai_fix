@@ -1,7 +1,7 @@
 use super::shell::collect_allowed_shell_env_vars;
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
-use crate::security::policy::ToolOperation;
+use crate::security::policy::{format_policy_block_event, ToolOperation};
 use crate::security::SecurityPolicy;
 use crate::security::SyscallAnomalyDetector;
 use async_trait::async_trait;
@@ -104,7 +104,7 @@ impl ProcessTool {
             }
         }
 
-        // Reuse shell security chain: rate limit → command validation → path check → record.
+        // Reuse shell security chain: rate limit -> command validation -> record.
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
                 success: false,
@@ -118,19 +118,18 @@ impl ProcessTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        if let Err(reason) = self.security.validate_command_execution(command, approved) {
+        if let Err(reason) = self
+            .security
+            .validate_command_execution_with_reason(command, approved)
+        {
+            let policy_id = reason.policy_id();
+            let command_fragment = reason.command_fragment().to_string();
+            let error_message =
+                format_policy_block_event(policy_id, reason.to_string(), Some(&command_fragment));
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(reason),
-            });
-        }
-
-        if let Some(path) = self.security.forbidden_path_argument(command) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Path blocked by security policy: {path}")),
+                error: Some(error_message),
             });
         }
 
@@ -535,6 +534,7 @@ mod tests {
     use super::*;
     use crate::config::{AuditConfig, SyscallAnomalyConfig};
     use crate::runtime::NativeRuntime;
+    use crate::security::policy::parse_command_policy_block_event;
     use crate::security::{AutonomyLevel, SecurityPolicy, SyscallAnomalyDetector};
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -700,6 +700,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
+        let event = parse_command_policy_block_event(result.error.as_deref().unwrap())
+            .expect("expected structured security policy block event");
+        assert_eq!(event.policy_id, "autonomy.allowed_commands");
+        assert_eq!(event.command_fragment, "rm -rf /");
     }
 
     #[tokio::test]
@@ -713,7 +717,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap().contains("Path blocked"));
+        let event = parse_command_policy_block_event(result.error.as_deref().unwrap())
+            .expect("expected structured security policy block event");
+        assert_eq!(event.policy_id, "autonomy.workspace_path_guard");
+        assert_eq!(event.command_fragment, "cat /etc/passwd");
+        assert!(event.reason.contains("Path blocked"));
     }
 
     #[tokio::test]

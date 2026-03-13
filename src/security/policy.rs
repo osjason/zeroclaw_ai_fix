@@ -1,6 +1,7 @@
 use parking_lot::Mutex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -38,6 +39,238 @@ pub enum CommandRiskLevel {
     Low,
     Medium,
     High,
+}
+
+const MAX_COMMAND_FRAGMENT_CHARS: usize = 160;
+const SECURITY_BLOCK_MESSAGE_PREFIX: &str = "blocked by security policy:";
+const NO_COMMAND_FRAGMENT: &str = "<none>";
+
+/// Structured metadata extracted from a formatted security policy block event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CommandPolicyBlockEvent<'a> {
+    pub policy_id: &'a str,
+    pub command_fragment: &'a str,
+    pub reason: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShellStructureBlock {
+    policy_id: &'static str,
+    reason: &'static str,
+}
+
+fn detect_shell_structure_block(command: &str) -> Option<ShellStructureBlock> {
+    if command.contains('`')
+        || contains_unquoted_shell_variable_expansion(command)
+        || command.contains("<(")
+        || command.contains(">(")
+    {
+        return Some(ShellStructureBlock {
+            policy_id: "autonomy.shell_structure.subshell",
+            reason:
+                "Shell subshell/expansion operators (`...`, `$()`, `${}`, `<(`, `>(`) are blocked by security policy",
+        });
+    }
+
+    // Ignore quoted literals, e.g. `echo \"a>b\"` and `echo \"a<b\"`.
+    if contains_unquoted_char(command, '>') || contains_unquoted_char(command, '<') {
+        return Some(ShellStructureBlock {
+            policy_id: "autonomy.shell_structure.redirection",
+            reason:
+                "Shell redirection operators (`<`, `>`, `>>`) are blocked by security policy",
+        });
+    }
+
+    if command
+        .split_whitespace()
+        .any(|w| w == "tee" || w.ends_with("/tee"))
+    {
+        return Some(ShellStructureBlock {
+            policy_id: "autonomy.shell_structure.tee",
+            reason: "The `tee` command is blocked by security policy",
+        });
+    }
+
+    // Keep `&&` allowed; only block unquoted single ampersand operator.
+    if contains_unquoted_single_ampersand(command) {
+        return Some(ShellStructureBlock {
+            policy_id: "autonomy.shell_structure.background",
+            reason: "Single `&` background chaining is blocked by security policy",
+        });
+    }
+
+    None
+}
+
+fn shell_structure_violation(command: &str) -> Option<CommandPolicyViolation> {
+    detect_shell_structure_block(command).map(|block| {
+        CommandPolicyViolation::new(
+            block.policy_id,
+            format!(
+                "{}. Set `[autonomy].allow_unsafe_shell_structures = true` to opt in.",
+                block.reason
+            ),
+            command,
+        )
+    })
+}
+
+/// Structured reason for a command blocked by security policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandPolicyViolation {
+    policy_id: &'static str,
+    reason: String,
+    command_fragment: String,
+}
+
+impl CommandPolicyViolation {
+    pub fn new(policy_id: &'static str, reason: impl Into<String>, command: &str) -> Self {
+        Self {
+            policy_id,
+            reason: reason.into(),
+            command_fragment: command_fragment(command),
+        }
+    }
+
+    pub fn from_block_event(
+        policy_id: &'static str,
+        reason: impl Into<String>,
+        command: Option<&str>,
+    ) -> Self {
+        Self::new(
+            policy_id,
+            reason,
+            command
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(NO_COMMAND_FRAGMENT),
+        )
+    }
+
+    pub fn policy_id(&self) -> &'static str {
+        self.policy_id
+    }
+
+    pub fn command_fragment(&self) -> &str {
+        &self.command_fragment
+    }
+
+    pub fn format_block_message(&self) -> String {
+        format!(
+            "blocked by security policy: policy={}; command={}; reason={}",
+            self.policy_id, self.command_fragment, self.reason
+        )
+    }
+}
+
+impl fmt::Display for CommandPolicyViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for CommandPolicyViolation {}
+
+pub fn format_policy_block_event(
+    policy_id: &'static str,
+    reason: impl Into<String>,
+    command: Option<&str>,
+) -> String {
+    CommandPolicyViolation::from_block_event(policy_id, reason, command).format_block_message()
+}
+
+pub(crate) fn is_command_policy_block_message(message: &str) -> bool {
+    strip_security_block_prefix(message).is_some()
+}
+
+pub(crate) fn parse_command_policy_block_event(
+    message: &str,
+) -> Option<CommandPolicyBlockEvent<'_>> {
+    let detail = strip_security_block_prefix(message)?;
+    let detail = detail.strip_prefix("policy=")?;
+    let (policy_id, rest) = detail.split_once("; command=")?;
+    let (command_fragment, reason) = rest.split_once("; reason=").unwrap_or((rest, ""));
+    let policy_id = policy_id.trim();
+    let command_fragment = command_fragment.trim();
+    if policy_id.is_empty() || command_fragment.is_empty() {
+        return None;
+    }
+
+    Some(CommandPolicyBlockEvent {
+        policy_id,
+        command_fragment,
+        reason: reason.trim(),
+    })
+}
+
+pub(crate) fn summarize_command_policy_block(
+    message: &str,
+    max_command_chars: usize,
+) -> Option<String> {
+    if let Some(event) = parse_command_policy_block_event(message) {
+        let command = truncate_chars(event.command_fragment, max_command_chars.max(16));
+        return Some(format!("policy={}; command={command}", event.policy_id));
+    }
+
+    let detail = strip_security_block_prefix(message)?;
+    if let Some((policy_id, command)) = parse_policy_and_command(detail) {
+        let command = truncate_chars(command, max_command_chars.max(16));
+        return Some(format!("policy={policy_id}; command={command}"));
+    }
+
+    Some(truncate_chars(
+        detail,
+        max_command_chars.saturating_add(40).max(40),
+    ))
+}
+
+fn strip_tool_error_prefix(message: &str) -> &str {
+    message
+        .strip_prefix("Error:")
+        .map(str::trim)
+        .unwrap_or(message)
+}
+
+fn strip_security_block_prefix(message: &str) -> Option<&str> {
+    let trimmed = strip_tool_error_prefix(message.trim());
+    if trimmed.len() < SECURITY_BLOCK_MESSAGE_PREFIX.len() {
+        return None;
+    }
+    let (prefix, rest) = trimmed.split_at(SECURITY_BLOCK_MESSAGE_PREFIX.len());
+    if !prefix.eq_ignore_ascii_case(SECURITY_BLOCK_MESSAGE_PREFIX) {
+        return None;
+    }
+    Some(rest.trim())
+}
+
+fn parse_policy_and_command(detail: &str) -> Option<(&str, &str)> {
+    let detail = detail.strip_prefix("policy=")?;
+    let (policy_id, rest) = detail.split_once("; command=")?;
+    let (command, _) = rest.split_once("; reason=").unwrap_or((rest, ""));
+    let policy_id = policy_id.trim();
+    let command = command.trim();
+    if policy_id.is_empty() || command.is_empty() {
+        return None;
+    }
+    Some((policy_id, command))
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let total_chars = value.chars().count();
+    if total_chars <= max_chars {
+        return value.to_string();
+    }
+
+    let truncated: String = value.chars().take(max_chars).collect();
+    format!("{truncated}...")
+}
+
+fn command_fragment(command: &str) -> String {
+    let compact = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return "<empty>".to_string();
+    }
+    truncate_chars(&compact, MAX_COMMAND_FRAGMENT_CHARS)
 }
 
 /// Classifies whether a tool operation is read-only or side-effecting.
@@ -105,6 +338,7 @@ pub struct SecurityPolicy {
     pub max_cost_per_day_cents: u32,
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
+    pub allow_unsafe_shell_structures: bool,
     pub shell_env_passthrough: Vec<String>,
     pub allow_sensitive_file_reads: bool,
     pub allow_sensitive_file_writes: bool,
@@ -160,6 +394,7 @@ impl Default for SecurityPolicy {
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
+            allow_unsafe_shell_structures: false,
             shell_env_passthrough: vec![],
             allow_sensitive_file_reads: false,
             allow_sensitive_file_writes: false,
@@ -693,12 +928,45 @@ impl SecurityPolicy {
         command: &str,
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
+        self.validate_command_execution_with_reason(command, approved)
+            .map_err(|err| err.to_string())
+    }
+
+    /// Validate full command execution policy and return structured policy
+    /// metadata when blocked.
+    pub fn validate_command_execution_with_reason(
+        &self,
+        command: &str,
+        approved: bool,
+    ) -> Result<CommandRiskLevel, CommandPolicyViolation> {
+        if self.autonomy == AutonomyLevel::ReadOnly {
+            return Err(CommandPolicyViolation::new(
+                "autonomy.read_only",
+                format!("Command not allowed by security policy (autonomy is read-only): {command}"),
+                command,
+            ));
+        }
+
+        if !self.allow_unsafe_shell_structures {
+            if let Some(violation) = shell_structure_violation(command) {
+                return Err(violation);
+            }
+        }
+
         if !self.is_command_allowed(command) {
-            return Err(format!("Command not allowed by security policy: {command}"));
+            return Err(CommandPolicyViolation::new(
+                "autonomy.allowed_commands",
+                format!("Command not allowed by security policy: {command}"),
+                command,
+            ));
         }
 
         if let Some(path) = self.forbidden_path_argument(command) {
-            return Err(format!("Path blocked by security policy: {path}"));
+            return Err(CommandPolicyViolation::new(
+                "autonomy.workspace_path_guard",
+                format!("Path blocked by security policy: {path}"),
+                command,
+            ));
         }
 
         let risk = self.command_risk_level(command);
@@ -707,18 +975,24 @@ impl SecurityPolicy {
             if self.block_high_risk_commands {
                 let lower = command.to_ascii_lowercase();
                 if lower.contains("curl") || lower.contains("wget") {
-                    return Err(
-                        "Command blocked: high-risk command is disallowed by policy. Shell curl/wget are blocked; use `http_request` or `web_fetch` with configured allowed_domains."
-                            .into(),
-                    );
+                    return Err(CommandPolicyViolation::new(
+                        "autonomy.block_high_risk_commands",
+                        "Command blocked: high-risk command is disallowed by policy. Shell curl/wget are blocked; use `http_request` or `web_fetch` with configured allowed_domains.",
+                        command,
+                    ));
                 }
-                return Err("Command blocked: high-risk command is disallowed by policy".into());
+                return Err(CommandPolicyViolation::new(
+                    "autonomy.block_high_risk_commands",
+                    "Command blocked: high-risk command is disallowed by policy",
+                    command,
+                ));
             }
             if self.autonomy == AutonomyLevel::Supervised && !approved {
-                return Err(
-                    "Command requires explicit approval (approved=true): high-risk operation"
-                        .into(),
-                );
+                return Err(CommandPolicyViolation::new(
+                    "autonomy.require_approval_for_high_risk",
+                    "Command requires explicit approval (approved=true): high-risk operation",
+                    command,
+                ));
             }
         }
 
@@ -727,9 +1001,11 @@ impl SecurityPolicy {
             && self.require_approval_for_medium_risk
             && !approved
         {
-            return Err(
-                "Command requires explicit approval (approved=true): medium-risk operation".into(),
-            );
+            return Err(CommandPolicyViolation::new(
+                "autonomy.require_approval_for_medium_risk",
+                "Command requires explicit approval (approved=true): medium-risk operation",
+                command,
+            ));
         }
 
         Ok(risk)
@@ -754,38 +1030,7 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Block subshell/expansion operators — these allow hiding arbitrary
-        // commands inside an allowed command (e.g. `echo $(rm -rf /)`) and
-        // bypassing path checks through variable indirection. The helper below
-        // ignores escapes and literals inside single quotes, so `$(` or `${`
-        // literals are permitted there.
-        if command.contains('`')
-            || contains_unquoted_shell_variable_expansion(command)
-            || command.contains("<(")
-            || command.contains(">(")
-        {
-            return false;
-        }
-
-        // Block shell redirections (`<`, `>`, `>>`) — they can read/write
-        // arbitrary paths and bypass path checks.
-        // Ignore quoted literals, e.g. `echo "a>b"` and `echo "a<b"`.
-        if contains_unquoted_char(command, '>') || contains_unquoted_char(command, '<') {
-            return false;
-        }
-
-        // Block `tee` — it can write to arbitrary files, bypassing the
-        // redirect check above (e.g. `echo secret | tee /etc/crontab`)
-        if command
-            .split_whitespace()
-            .any(|w| w == "tee" || w.ends_with("/tee"))
-        {
-            return false;
-        }
-
-        // Block background command chaining (`&`), which can hide extra
-        // sub-commands and outlive timeout expectations. Keep `&&` allowed.
-        if contains_unquoted_single_ampersand(command) {
+        if !self.allow_unsafe_shell_structures && detect_shell_structure_block(command).is_some() {
             return false;
         }
 
@@ -1257,6 +1502,7 @@ impl SecurityPolicy {
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
+            allow_unsafe_shell_structures: autonomy_config.allow_unsafe_shell_structures,
             shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),
             allow_sensitive_file_reads: autonomy_config.allow_sensitive_file_reads,
             allow_sensitive_file_writes: autonomy_config.allow_sensitive_file_writes,
@@ -1317,6 +1563,74 @@ mod tests {
     #[test]
     fn can_act_full_true() {
         assert!(full_policy().can_act());
+    }
+
+    #[test]
+    fn summarize_command_policy_block_extracts_policy_and_command() {
+        let violation = CommandPolicyViolation::new(
+            "autonomy.allowed_commands",
+            "Command not allowed by security policy: curl https://evil.example",
+            "curl https://evil.example",
+        );
+        let summary = summarize_command_policy_block(&violation.format_block_message(), 64)
+            .expect("formatted block message should parse");
+        assert_eq!(
+            summary,
+            "policy=autonomy.allowed_commands; command=curl https://evil.example"
+        );
+    }
+
+    #[test]
+    fn parse_command_policy_block_event_extracts_fields() {
+        let message = "blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example";
+        let parsed = parse_command_policy_block_event(message)
+            .expect("formatted block message should parse into structured event");
+        assert_eq!(parsed.policy_id, "autonomy.allowed_commands");
+        assert_eq!(parsed.command_fragment, "curl https://evil.example");
+        assert_eq!(
+            parsed.reason,
+            "Command not allowed by security policy: curl https://evil.example"
+        );
+    }
+
+    #[test]
+    fn is_command_policy_block_message_accepts_error_prefixed_payload() {
+        let message =
+            "Error: blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example";
+        assert!(is_command_policy_block_message(message));
+        let summary = summarize_command_policy_block(message, 64)
+            .expect("error-prefixed block message should still summarize");
+        assert_eq!(
+            summary,
+            "policy=autonomy.allowed_commands; command=curl https://evil.example"
+        );
+    }
+
+    #[test]
+    fn format_policy_block_event_uses_placeholder_command_when_missing() {
+        let message = format_policy_block_event(
+            "autonomy.read_only",
+            "autonomy is read-only",
+            None,
+        );
+        assert!(message.contains("policy=autonomy.read_only"));
+        assert!(message.contains("command=<none>"));
+        assert!(message.contains("reason=autonomy is read-only"));
+    }
+
+    #[test]
+    fn validate_command_execution_reports_shell_structure_policy_id() {
+        let p = default_policy();
+        let violation = p
+            .validate_command_execution_with_reason("cat </etc/passwd", false)
+            .expect_err("redirection should be blocked with explicit structure policy");
+        assert_eq!(
+            violation.policy_id(),
+            "autonomy.shell_structure.redirection"
+        );
+        assert!(violation
+            .to_string()
+            .contains("allow_unsafe_shell_structures"));
     }
 
     #[test]
@@ -1622,6 +1936,7 @@ mod tests {
             max_cost_per_day_cents: 1000,
             require_approval_for_medium_risk: false,
             block_high_risk_commands: false,
+            allow_unsafe_shell_structures: true,
             shell_env_passthrough: vec!["DATABASE_URL".into()],
             allow_sensitive_file_reads: true,
             allow_sensitive_file_writes: true,
@@ -1638,6 +1953,7 @@ mod tests {
         assert_eq!(policy.max_cost_per_day_cents, 1000);
         assert!(!policy.require_approval_for_medium_risk);
         assert!(!policy.block_high_risk_commands);
+        assert!(policy.allow_unsafe_shell_structures);
         assert_eq!(policy.shell_env_passthrough, vec!["DATABASE_URL"]);
         assert!(policy.allow_sensitive_file_reads);
         assert!(policy.allow_sensitive_file_writes);
@@ -1874,6 +2190,26 @@ mod tests {
         assert!(!p.is_command_allowed("ls >> /tmp/exfil.txt"));
         assert!(!p.is_command_allowed("cat </etc/passwd"));
         assert!(!p.is_command_allowed("cat</etc/passwd"));
+    }
+
+    #[test]
+    fn wildcard_allowlist_still_blocks_unsafe_shell_structures_by_default() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed("echo hello > output.txt"));
+        assert!(!p.is_command_allowed("echo $(date)"));
+    }
+
+    #[test]
+    fn allow_unsafe_shell_structures_opt_in_allows_redirection() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            allow_unsafe_shell_structures: true,
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("echo hello > output.txt"));
     }
 
     #[test]
