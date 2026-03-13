@@ -13,10 +13,9 @@ use crate::cron::{
     update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
 };
 use crate::security::policy::{
-    is_command_policy_block_message, parse_security_policy_block_event, CommandPolicyViolation,
+    action_command_preflight_with_approval_violation, parse_security_policy_block_event,
 };
 use crate::security::SecurityPolicy;
-use crate::tools::action_command_preflight_result;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{stream, StreamExt};
@@ -179,9 +178,10 @@ async fn run_agent_job(
         job.prompt.as_deref().unwrap_or_default()
     );
 
-    if let Some(blocked_output) = cron_action_preflight_block_output(security, &agent_subject, None)
+    if let Some(blocked) =
+        action_command_preflight_with_approval_violation(security, &agent_subject, None, false)
     {
-        return (false, blocked_output);
+        return (false, blocked.format_block_message());
     }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
@@ -215,15 +215,6 @@ async fn run_agent_job(
         ),
         Err(e) => (false, format!("agent job failed: {e}")),
     }
-}
-
-fn cron_action_preflight_block_output(
-    security: &SecurityPolicy,
-    action_subject: &str,
-    command: Option<&str>,
-) -> Option<String> {
-    action_command_preflight_result(security, action_subject, command, false)
-        .and_then(|blocked| blocked.error)
 }
 
 async fn persist_job_result(
@@ -440,6 +431,15 @@ fn build_job_result_announcement(job: &CronJob, success: bool, output: &str) -> 
         return output.to_string();
     }
 
+    if success {
+        return render_cron_execution_signal(
+            job,
+            ExecutionSignal::Completed {
+                result_preview: compact_preview(output, RESULT_ANNOUNCEMENT_PREVIEW_CHARS),
+            },
+        );
+    }
+
     if !success {
         if let Some(blocked_signal) = policy_block_details_for_output(job, output)
             .map(PolicyBlockDetails::into_execution_signal)
@@ -474,7 +474,7 @@ impl PolicyBlockDetails {
 }
 
 fn policy_block_details_for_output(job: &CronJob, output: &str) -> Option<PolicyBlockDetails> {
-    let block_message = embedded_security_block_message(output).unwrap_or_else(|| output.trim());
+    let block_message = embedded_security_block_message(output)?;
 
     if let Some(event) = parse_security_policy_block_event(block_message) {
         return Some(PolicyBlockDetails {
@@ -484,16 +484,12 @@ fn policy_block_details_for_output(job: &CronJob, output: &str) -> Option<Policy
         });
     }
 
-    if is_command_policy_block_message(block_message) {
-        let details = cron_lifecycle_details(job);
-        return Some(PolicyBlockDetails {
-            policy_id: LEGACY_BLOCKED_POLICY_ID.to_string(),
-            command_fragment: details.blocked_subject.to_string(),
-            reason: block_message.to_string(),
-        });
-    }
-
-    None
+    let details = cron_lifecycle_details(job);
+    Some(PolicyBlockDetails {
+        policy_id: LEGACY_BLOCKED_POLICY_ID.to_string(),
+        command_fragment: details.blocked_subject.to_string(),
+        reason: block_message.to_string(),
+    })
 }
 
 fn embedded_security_block_message(output: &str) -> Option<&str> {
@@ -789,10 +785,14 @@ async fn run_job_command_with_timeout(
     job: &CronJob,
     timeout: Duration,
 ) -> (bool, String) {
-    if let Some(blocked_output) =
-        cron_action_preflight_block_output(security, &job.command, Some(&job.command))
+    if let Some(blocked) = action_command_preflight_with_approval_violation(
+        security,
+        &job.command,
+        Some(&job.command),
+        false,
+    )
     {
-        return (false, blocked_output);
+        return (false, blocked.format_block_message());
     }
 
     let child = match Command::new("sh")
@@ -832,9 +832,10 @@ async fn run_job_command_with_timeout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::progress_event::is_high_priority_progress_update;
     use crate::config::Config;
     use crate::cron::{self, DeliveryConfig};
-    use crate::security::policy::parse_security_policy_block_event;
+    use crate::security::policy::{parse_security_policy_block_event, CommandPolicyViolation};
     use crate::security::SecurityPolicy;
     use chrono::{Duration as ChronoDuration, Utc};
     use std::sync::OnceLock;
@@ -921,6 +922,12 @@ mod tests {
             "expected reason to contain `{expected_reason_fragment}`, got `{}`",
             event.reason
         );
+    }
+
+    fn status_line(message: &str) -> Option<&str> {
+        message
+            .lines()
+            .find_map(|line| line.strip_prefix("status="))
     }
 
     fn unique_component(prefix: &str) -> String {
@@ -1288,7 +1295,9 @@ mod tests {
         assert!(announcements[1].2.contains("Cron running: id=test-job"));
         assert_eq!(announcements[2].0, "__test__");
         assert_eq!(announcements[2].1, "chat-due-order");
-        assert!(announcements[2].2.contains("stdout:"));
+        assert!(announcements[2].2.contains("Cron completed: id=test-job"));
+        assert!(announcements[2].2.contains("status=completed"));
+        assert!(announcements[2].2.contains("result="));
         assert!(announcements[2].2.contains("due-job-order"));
     }
 
@@ -1352,15 +1361,45 @@ mod tests {
         let announcements = snapshot_test_announcements().await;
 
         assert_eq!(announcements.len(), 3);
+        let statuses: Vec<&str> = announcements
+            .iter()
+            .map(|entry| status_line(&entry.2).expect("announcement should include status"))
+            .collect();
+        assert_eq!(
+            statuses,
+            vec![
+                "triggered",
+                "shell command is now executing",
+                "blocked_by_security_policy"
+            ]
+        );
+
+        for (channel, target, message) in &announcements {
+            assert_eq!(channel, "__test__");
+            assert_eq!(target, "chat-due-shell-blocked");
+            assert!(
+                message.contains("id=test-job name=blocked-due-job type=shell"),
+                "expected stable lifecycle identity in message: {message}"
+            );
+            assert!(
+                is_high_priority_progress_update(message),
+                "expected high-priority lifecycle visibility: {message}"
+            );
+        }
+
         assert_eq!(announcements[0].0, "__test__");
         assert_eq!(announcements[0].1, "chat-due-shell-blocked");
+        assert!(announcements[0].2.contains("Cron triggered: id=test-job"));
         assert!(announcements[0].2.contains("status=triggered"));
+        assert!(announcements[0].2.contains("schedule=cron(* * * * *)"));
+        assert!(announcements[1].2.contains("Cron running: id=test-job"));
         assert!(announcements[1]
             .2
             .contains("status=shell command is now executing"));
         assert_eq!(announcements[2].0, "__test__");
         assert_eq!(announcements[2].1, "chat-due-shell-blocked");
         assert!(announcements[2].2.contains("Cron blocked: id=test-job"));
+        assert!(announcements[2].2.contains("schedule=cron(* * * * *)"));
         assert!(announcements[2]
             .2
             .contains("status=blocked_by_security_policy"));
@@ -1650,7 +1689,9 @@ mod tests {
         assert!(announcements[1].2.contains("Cron running: id=test-job"));
         assert_eq!(announcements[2].0, "__test__");
         assert_eq!(announcements[2].1, "chat-42");
-        assert!(announcements[2].2.contains("stdout:"));
+        assert!(announcements[2].2.contains("Cron completed: id=test-job"));
+        assert!(announcements[2].2.contains("status=completed"));
+        assert!(announcements[2].2.contains("result="));
         assert!(announcements[2].2.contains("scheduler-start-and-result"));
     }
 
@@ -1737,6 +1778,17 @@ mod tests {
         assert!(announcement.contains("policy=autonomy.unknown"));
         assert!(announcement.contains("command=echo legacy-shell-command"));
         assert!(announcement.contains("reason=blocked by security policy"));
+    }
+
+    #[test]
+    fn build_job_result_announcement_success_uses_completed_lifecycle_signal() {
+        let job = test_job("echo done");
+        let announcement = build_job_result_announcement(&job, true, "stdout:\ndone\n");
+
+        assert!(announcement.contains("Cron completed: id=test-job"));
+        assert!(announcement.contains("status=completed"));
+        assert!(announcement.contains("result="));
+        assert!(announcement.contains("done"));
     }
 
     #[test]

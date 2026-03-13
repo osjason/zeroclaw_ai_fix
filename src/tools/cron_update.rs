@@ -1,4 +1,4 @@
-use super::cron_common::{enforce_action_command_gate, ensure_cron_enabled, parse_job_request};
+use super::cron_common::{ensure_cron_enabled, parse_job_request, preflight_command_allowed};
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron::{self, CronJobPatch, DeliveryConfig, JobType, Schedule};
@@ -17,6 +17,12 @@ struct CronUpdateRequest {
     approved: bool,
     patch: CronJobPatch,
     default_delivery: Option<DeliveryConfig>,
+}
+
+impl CronUpdateRequest {
+    fn command_for_preflight(&self) -> Option<&str> {
+        self.patch.command.as_deref()
+    }
 }
 
 impl CronUpdateTool {
@@ -126,17 +132,17 @@ impl Tool for CronUpdateTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if let Err(blocked) = ensure_cron_enabled(&self.config) {
+        if let Err(blocked) = ensure_cron_enabled(&self.config, "cron_update") {
             return Ok(blocked);
         }
         let request = match Self::parse_request(&args) {
             Ok(request) => request,
             Err(blocked) => return Ok(blocked),
         };
-        if let Err(blocked) = enforce_action_command_gate(
-            &self.security,
+        if let Some(blocked) = preflight_command_allowed(
+            self.security.as_ref(),
             "cron_update",
-            request.patch.command.as_deref(),
+            request.command_for_preflight(),
             request.approved,
         ) {
             return Ok(blocked);
@@ -177,7 +183,7 @@ mod tests {
     use crate::config::Config;
     use crate::security::policy::parse_security_policy_block_event;
     use crate::security::AutonomyLevel;
-    use crate::tools::action_command_preflight_result;
+    use crate::tools::{action_command_preflight_for, ActionCommandPreflight};
     use tempfile::TempDir;
 
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
@@ -265,9 +271,11 @@ mod tests {
         let cfg = Arc::new(config);
         let security = test_security(&cfg);
         let command = "curl https://example.com";
-        let preflight =
-            action_command_preflight_result(security.as_ref(), "cron_update", Some(command), false)
-                .expect("expected cron_update preflight to block disallowed command");
+        let preflight = action_command_preflight_for(
+            security.as_ref(),
+            ActionCommandPreflight::new("cron_update", Some(command), false),
+        )
+        .expect("expected cron_update preflight to block disallowed command");
         assert!(!preflight.success);
         let preflight_event = parse_security_policy_block_event(
             preflight
@@ -342,26 +350,50 @@ mod tests {
         config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let cfg = Arc::new(config);
+        let security = test_security(&cfg);
+        let command = "touch cron-update-approval-test";
+        let preflight = action_command_preflight_for(
+            security.as_ref(),
+            ActionCommandPreflight::new("cron_update", Some(command), false),
+        )
+        .expect("expected cron_update preflight to require explicit approval");
+        assert!(!preflight.success);
+        let preflight_event = parse_security_policy_block_event(
+            preflight
+                .error
+                .as_deref()
+                .expect("preflight approval block should include structured error"),
+        )
+        .expect("preflight approval block should parse into structured policy event");
         let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
-        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        let tool = CronUpdateTool::new(cfg.clone(), security);
 
         let denied = tool
             .execute(json!({
                 "job_id": job.id,
-                "patch": { "command": "touch cron-update-approval-test" }
+                "patch": { "command": command }
             }))
             .await
             .unwrap();
         assert!(!denied.success);
-        assert!(denied
-            .error
-            .unwrap_or_default()
-            .contains("explicit approval"));
+        let denied_event = parse_security_policy_block_event(
+            denied
+                .error
+                .as_deref()
+                .expect("cron_update approval block should include structured error"),
+        )
+        .expect("cron_update approval block should parse into structured policy event");
+        assert_eq!(denied_event.policy_id, preflight_event.policy_id);
+        assert_eq!(
+            denied_event.command_fragment,
+            preflight_event.command_fragment
+        );
+        assert_eq!(denied_event.reason, preflight_event.reason);
 
         let approved = tool
             .execute(json!({
                 "job_id": job.id,
-                "patch": { "command": "touch cron-update-approval-test" },
+                "patch": { "command": command },
                 "approved": true
             }))
             .await

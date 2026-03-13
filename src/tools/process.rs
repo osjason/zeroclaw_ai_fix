@@ -1,6 +1,6 @@
-use super::command_execution_preflight_result;
 use super::shell::collect_allowed_shell_env_vars;
 use super::traits::{Tool, ToolResult};
+use super::{action_command_preflight_for, ActionCommandPreflight};
 use crate::runtime::RuntimeAdapter;
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
@@ -111,10 +111,11 @@ impl ProcessTool {
             .unwrap_or(false);
 
         // Keep process tool aligned with shell tool security preflight behavior.
-        if let Some(result) =
-            command_execution_preflight_result(self.security.as_ref(), command, approved)
-        {
-            return Ok(result);
+        if let Some(blocked_result) = action_command_preflight_for(
+            self.security.as_ref(),
+            ActionCommandPreflight::new("process.spawn", Some(command), approved),
+        ) {
+            return Ok(blocked_result);
         }
 
         // Build command via runtime adapter.
@@ -512,7 +513,7 @@ mod tests {
     use crate::runtime::NativeRuntime;
     use crate::security::policy::{parse_security_policy_block_event, CommandPolicyViolation};
     use crate::security::{AutonomyLevel, SecurityPolicy, SyscallAnomalyDetector};
-    use crate::tools::policy_blocked_result;
+    use crate::tools::{action_command_preflight_for, policy_blocked_result};
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -720,8 +721,11 @@ mod tests {
     async fn spawn_blocks_disallowed_command_matches_preflight_event_fields() {
         let security = test_security();
         let command = "rm -rf /";
-        let preflight = command_execution_preflight_result(security.as_ref(), command, false)
-            .expect("expected command preflight to block disallowed command");
+        let preflight = action_command_preflight_for(
+            security.as_ref(),
+            ActionCommandPreflight::new("process.spawn", Some(command), false),
+        )
+        .expect("expected command preflight to block disallowed command");
         assert!(!preflight.success);
         let preflight_event = parse_security_policy_block_event(
             preflight

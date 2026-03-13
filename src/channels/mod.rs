@@ -1873,8 +1873,10 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 
     for turn in &mut compacted {
         if turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS {
-            turn.content =
-                truncate_with_ellipsis(&turn.content, CHANNEL_HISTORY_COMPACT_CONTENT_CHARS);
+            turn.content = truncate_compacted_turn_content_preserving_lifecycle(
+                &turn.content,
+                CHANNEL_HISTORY_COMPACT_CONTENT_CHARS,
+            );
         }
     }
 
@@ -1885,6 +1887,62 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 
     *turns = compacted;
     true
+}
+
+fn truncate_compacted_turn_content_preserving_lifecycle(content: &str, max_chars: usize) -> String {
+    if content.chars().count() <= max_chars {
+        return content.to_string();
+    }
+
+    if !is_high_priority_progress_update(content) {
+        return truncate_with_ellipsis(content, max_chars);
+    }
+
+    let pinned_lifecycle = collect_structured_lifecycle_lines(content);
+    if pinned_lifecycle.is_empty() {
+        return truncate_with_ellipsis(content, max_chars);
+    }
+
+    let pinned_prefix = pinned_lifecycle.join("\n");
+    let budget_for_body = max_chars.saturating_sub(pinned_prefix.chars().count());
+    let body = truncate_with_ellipsis(content, budget_for_body.saturating_sub(2));
+    let merged = format!("{pinned_prefix}\n\n{body}");
+    truncate_with_ellipsis(&merged, max_chars)
+}
+
+fn collect_structured_lifecycle_lines(content: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    for line in content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let lower = line.to_ascii_lowercase();
+        let lifecycle_status = lower
+            .strip_prefix("status=")
+            .map(str::trim)
+            .is_some_and(|status| {
+                matches!(
+                    status,
+                    "blocked_by_security_policy" | "triggered" | "running" | "completed"
+                )
+            });
+        let structured_stage = lower.contains("triggered: id=")
+            || lower.contains("running: id=")
+            || lower.contains("blocked: id=")
+            || lower.contains("completed: id=");
+        let policy_detail = lower.contains("policy=") && lower.contains("command=");
+        let blocked_reason = lower.starts_with("reason=");
+
+        if lifecycle_status || structured_stage || policy_detail || blocked_reason {
+            if lines.last().map_or(true, |last| last != line) {
+                lines.push(line.to_string());
+            }
+        }
+    }
+
+    lines
 }
 
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
@@ -6191,6 +6249,26 @@ mod tests {
                 || (len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3
                     && turn.content.ends_with("..."))
         }));
+    }
+
+    #[test]
+    fn compact_truncation_preserves_structured_lifecycle_markers() {
+        let noise = "x".repeat(CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 300);
+        let content = format!(
+            "{noise}\n⏱️ Cron triggered: id=job1 name=nightly type=shell\nstatus=triggered\n▶️ Cron running: id=job1 name=nightly type=shell\nstatus=running\n🚫 Cron blocked: id=job1 name=nightly type=shell\npolicy=autonomy.allowed_commands; command=curl https://evil.example\nstatus=blocked_by_security_policy\nreason=Command not allowed by security policy"
+        );
+
+        let truncated = truncate_compacted_turn_content_preserving_lifecycle(
+            &content,
+            CHANNEL_HISTORY_COMPACT_CONTENT_CHARS,
+        );
+
+        assert!(truncated.contains("triggered: id=job1"));
+        assert!(truncated.contains("running: id=job1"));
+        assert!(truncated.contains("status=blocked_by_security_policy"));
+        assert!(truncated.contains("policy=autonomy.allowed_commands; command="));
+        assert!(truncated.contains("reason=Command not allowed by security policy"));
+        assert!(truncated.chars().count() <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3);
     }
 
     #[test]

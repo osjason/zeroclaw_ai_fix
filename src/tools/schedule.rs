@@ -141,7 +141,7 @@ impl Tool for ScheduleTool {
 
 impl ScheduleTool {
     fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
-        if let Err(blocked) = ensure_cron_enabled(&self.config) {
+        if let Err(blocked) = ensure_cron_enabled(&self.config, action) {
             return Some(ToolResult {
                 success: false,
                 output: String::new(),

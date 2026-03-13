@@ -1,7 +1,10 @@
-use super::policy_blocked_result;
 use super::traits::ToolResult;
+use super::{action_command_preflight_for, ActionCommandPreflight};
+use super::policy_blocked_result;
 use crate::config::Config;
-use crate::security::policy::{action_budget_violation, action_precheck_violation};
+use crate::security::policy::{
+    action_budget_violation, action_precheck_violation, CommandPolicyViolation,
+};
 use crate::security::SecurityPolicy;
 use serde_json::Value;
 
@@ -10,13 +13,17 @@ pub(crate) struct CronJobRequest<'a> {
     pub(crate) approved: bool,
 }
 
-pub(crate) fn ensure_cron_enabled(config: &Config) -> Result<(), ToolResult> {
+const CRON_ENABLED_POLICY_ID: &str = "cron.enabled";
+const CRON_DISABLED_REASON: &str = "cron is disabled by config (cron.enabled=false)";
+
+pub(crate) fn ensure_cron_enabled(config: &Config, action: &str) -> Result<(), ToolResult> {
     if !config.cron.enabled {
-        return Err(ToolResult {
-            success: false,
-            output: String::new(),
-            error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
-        });
+        let violation = CommandPolicyViolation::from_block_event(
+            CRON_ENABLED_POLICY_ID,
+            CRON_DISABLED_REASON,
+            Some(action),
+        );
+        return Err(policy_blocked_result(&violation));
     }
     Ok(())
 }
@@ -42,17 +49,20 @@ pub(crate) fn precheck_action_allowed(
     action_precheck_violation(security, action).map(|blocked| policy_blocked_result(&blocked))
 }
 
-pub(crate) fn consume_action_budget(security: &SecurityPolicy, action: &str) -> Option<ToolResult> {
-    action_budget_violation(security, action).map(|blocked| policy_blocked_result(&blocked))
-}
-
-pub(crate) fn enforce_action_command_gate(
+pub(crate) fn preflight_command_allowed(
     security: &SecurityPolicy,
     action: &str,
     command: Option<&str>,
     approved: bool,
-) -> Result<(), ToolResult> {
-    super::action_command_preflight_result(security, action, command, approved).map_or(Ok(()), Err)
+) -> Option<ToolResult> {
+    action_command_preflight_for(
+        security,
+        ActionCommandPreflight::new(action, command, approved),
+    )
+}
+
+pub(crate) fn consume_action_budget(security: &SecurityPolicy, action: &str) -> Option<ToolResult> {
+    action_budget_violation(security, action).map(|blocked| policy_blocked_result(&blocked))
 }
 
 fn missing_param(name: &str) -> ToolResult {

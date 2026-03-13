@@ -8,6 +8,9 @@ pub(crate) enum ExecutionSignal {
     Running {
         status: &'static str,
     },
+    Completed {
+        result_preview: String,
+    },
     Blocked {
         policy_id: Option<String>,
         command_preview: Option<String>,
@@ -47,11 +50,13 @@ pub(crate) fn is_high_priority_progress_update(text: &str) -> bool {
         lower.contains("security blocked (policy=") && lower.contains("command=");
     let is_structured_lifecycle = is_structured_lifecycle_progress(lower.as_str());
     let is_tool_result_progress = text.lines().any(is_tool_result_progress_line);
+    let is_tool_running_progress = text.lines().any(is_tool_running_progress_line);
 
     is_policy_block_summary
         || status.is_some_and(is_lifecycle_status)
         || is_structured_lifecycle
         || is_tool_result_progress
+        || is_tool_running_progress
 }
 
 fn is_lifecycle_status(status: &str) -> bool {
@@ -87,6 +92,12 @@ fn is_tool_result_progress_line(line: &str) -> bool {
     body.contains('(') && (body.contains("s)") || body.contains("s):"))
 }
 
+fn is_tool_running_progress_line(line: &str) -> bool {
+    line.trim_start()
+        .strip_prefix('⏳')
+        .is_some_and(|body| !body.trim().is_empty())
+}
+
 pub(crate) fn render_execution_event(event: ExecutionEvent<'_>) -> String {
     let source = event.source;
     let id = event.id;
@@ -105,6 +116,15 @@ pub(crate) fn render_execution_event(event: ExecutionEvent<'_>) -> String {
         }
         ExecutionSignal::Running { status } => {
             format!("▶️ {source} running: id={id} name={name} type={kind}\nstatus={status}")
+        }
+        ExecutionSignal::Completed { result_preview } => {
+            let schedule_line = event
+                .schedule
+                .map(|schedule| format!("schedule={schedule}\n"))
+                .unwrap_or_default();
+            format!(
+                "✅ {source} completed: id={id} name={name} type={kind}\n{schedule_line}result={result_preview}\nstatus=completed"
+            )
         }
         ExecutionSignal::Blocked {
             policy_id,
@@ -190,5 +210,12 @@ mod tests {
         assert!(is_high_priority_progress_update(
             "❌ shell (0s): command timed out"
         ));
+    }
+
+    #[test]
+    fn high_priority_progress_detects_running_tool_lines() {
+        assert!(is_high_priority_progress_update("⏳ shell: ls -la"));
+        assert!(is_high_priority_progress_update("⏳ file_read: src/main.rs"));
+        assert!(!is_high_priority_progress_update("⏳"));
     }
 }

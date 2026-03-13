@@ -1041,29 +1041,29 @@ fn determine_tool_call_followthrough_requirement(
 
 #[derive(Default)]
 struct PostActionVerificationTurn {
-    requires_verification: Vec<String>,
+    pending_requirements: Vec<String>,
     verification_observed: bool,
 }
 
 impl PostActionVerificationTurn {
     fn observe_tool_call(&mut self, tool_name: &str, args: &serde_json::Value, success: bool) {
         if tool_call_satisfies_post_action_verification(tool_name, args, success) {
+            // A verification call only clears requirements that existed before it.
+            // Any mutating call after this point must re-establish a pending requirement.
             self.verification_observed = true;
+            self.pending_requirements.clear();
         }
         if tool_call_requires_post_action_verification(tool_name, args, success) {
-            self.requires_verification
+            self.pending_requirements
                 .push(summarize_post_action_verification_target(tool_name, args));
         }
     }
 
     fn apply(self, current_requirement: &mut Option<String>) {
-        if self.verification_observed {
+        if !self.pending_requirements.is_empty() {
+            *current_requirement = Some(self.pending_requirements.join(", "));
+        } else if self.verification_observed {
             *current_requirement = None;
-            return;
-        }
-
-        if !self.requires_verification.is_empty() {
-            *current_requirement = Some(self.requires_verification.join(", "));
         }
     }
 }
@@ -5144,6 +5144,68 @@ mod tests {
             verify_invocations.load(Ordering::SeqCst),
             1,
             "verification tool call should be required before final response"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_requires_post_action_verification_after_latest_mutation_in_turn() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"file_read","arguments":{"path":"README.md"}}
+</tool_call>
+<tool_call>
+{"name":"shell","arguments":{"command":"touch /tmp/zeroclaw.out"}}
+</tool_call>"#,
+            "done without post-mutation verification",
+            r#"<tool_call>
+{"name":"file_read","arguments":{"path":"Cargo.toml"}}
+</tool_call>"#,
+            "done after post-mutation verification",
+        ]);
+
+        let shell_invocations = Arc::new(AtomicUsize::new(0));
+        let verify_invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(CountingTool::new(
+                "file_read",
+                Arc::clone(&verify_invocations),
+            )),
+            Box::new(CountingTool::new("shell", Arc::clone(&shell_invocations))),
+        ];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("modify and verify"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            6,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("loop should require verification after the latest mutation in a turn");
+
+        assert_eq!(result, "done after post-mutation verification");
+        assert_eq!(shell_invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            verify_invocations.load(Ordering::SeqCst),
+            2,
+            "verification before mutation should not satisfy the post-mutation verification gate"
         );
     }
 

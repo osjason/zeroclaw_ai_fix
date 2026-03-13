@@ -39,7 +39,7 @@ impl Tool for CronRemoveTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if let Err(blocked) = ensure_cron_enabled(&self.config) {
+        if let Err(blocked) = ensure_cron_enabled(&self.config, "cron_remove") {
             return Ok(blocked);
         }
 

@@ -268,16 +268,6 @@ pub(crate) fn action_command_preflight_with_approval_violation(
     )
 }
 
-pub(crate) fn action_command_preflight_with_approval_block_event(
-    security: &SecurityPolicy,
-    action_subject: &str,
-    command: Option<&str>,
-    approved: bool,
-) -> Option<String> {
-    action_command_preflight_with_approval_violation(security, action_subject, command, approved)
-        .map(|blocked| blocked.format_block_message())
-}
-
 fn command_validation_subject<'a>(
     action_subject: &'a str,
     command_validation: Option<(&'a str, bool)>,

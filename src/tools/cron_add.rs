@@ -1,4 +1,4 @@
-use super::cron_common::{enforce_action_command_gate, ensure_cron_enabled};
+use super::cron_common::{ensure_cron_enabled, preflight_command_allowed};
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron::{self, DeliveryConfig, JobType, Schedule, SessionTarget};
@@ -27,6 +27,15 @@ enum CronAddJob {
         model: Option<String>,
         delivery: Option<DeliveryConfig>,
     },
+}
+
+impl CronAddJob {
+    fn command_for_preflight(&self) -> Option<&str> {
+        match self {
+            Self::Shell { command } => Some(command.as_str()),
+            Self::Agent { .. } => None,
+        }
+    }
 }
 
 impl CronAddTool {
@@ -92,7 +101,7 @@ impl Tool for CronAddTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if let Err(blocked) = ensure_cron_enabled(&self.config) {
+        if let Err(blocked) = ensure_cron_enabled(&self.config, "cron_add") {
             return Ok(blocked);
         }
 
@@ -255,13 +264,12 @@ impl Tool for CronAddTool {
             }
         };
 
-        let command_for_preflight = match &job {
-            CronAddJob::Shell { command } => Some(command.as_str()),
-            CronAddJob::Agent { .. } => None,
-        };
-        if let Err(blocked) =
-            enforce_action_command_gate(&self.security, "cron_add", command_for_preflight, approved)
-        {
+        if let Some(blocked) = preflight_command_allowed(
+            self.security.as_ref(),
+            "cron_add",
+            job.command_for_preflight(),
+            approved,
+        ) {
             return Ok(blocked);
         }
 
@@ -314,7 +322,7 @@ mod tests {
     use crate::config::Config;
     use crate::security::policy::parse_security_policy_block_event;
     use crate::security::AutonomyLevel;
-    use crate::tools::action_command_preflight_result;
+    use crate::tools::{action_command_preflight_for, ActionCommandPreflight};
     use tempfile::TempDir;
 
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
@@ -404,9 +412,11 @@ mod tests {
         let cfg = Arc::new(config);
         let security = test_security(&cfg);
         let command = "curl https://example.com";
-        let preflight =
-            action_command_preflight_result(security.as_ref(), "cron_add", Some(command), false)
-                .expect("expected cron_add preflight to block disallowed command");
+        let preflight = action_command_preflight_for(
+            security.as_ref(),
+            ActionCommandPreflight::new("cron_add", Some(command), false),
+        )
+        .expect("expected cron_add preflight to block disallowed command");
         assert!(!preflight.success);
         let preflight_event = parse_security_policy_block_event(
             preflight
@@ -462,8 +472,12 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        let error = result.error.unwrap_or_default();
-        assert!(error.contains("read-only") || error.contains("not allowed"));
+        let blocked = result.error.unwrap_or_default();
+        let event = parse_security_policy_block_event(&blocked)
+            .expect("cron_add read-only block should expose structured security block event");
+        assert_eq!(event.policy_id, "autonomy.read_only");
+        assert_eq!(event.command_fragment, "echo ok");
+        assert!(event.reason.contains("read-only"));
     }
 
     #[tokio::test]
@@ -490,10 +504,12 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("Rate limit exceeded"));
+        let blocked = result.error.unwrap_or_default();
+        let event = parse_security_policy_block_event(&blocked)
+            .expect("cron_add rate-limit block should expose structured security block event");
+        assert_eq!(event.policy_id, "autonomy.max_actions_per_hour");
+        assert_eq!(event.command_fragment, "echo ok");
+        assert!(event.reason.contains("Rate limit exceeded"));
         assert!(cron::list_jobs(&cfg).unwrap().is_empty());
     }
 
@@ -509,27 +525,51 @@ mod tests {
         config.autonomy.level = AutonomyLevel::Supervised;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let cfg = Arc::new(config);
-        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let security = test_security(&cfg);
+        let tool = CronAddTool::new(cfg.clone(), security.clone());
+        let command = "touch cron-approval-test";
+        let preflight = action_command_preflight_for(
+            security.as_ref(),
+            ActionCommandPreflight::new("cron_add", Some(command), false),
+        )
+        .expect("expected cron_add preflight to require approval");
+        assert!(!preflight.success);
+        let preflight_event = parse_security_policy_block_event(
+            preflight
+                .error
+                .as_deref()
+                .expect("preflight block should include structured error"),
+        )
+        .expect("preflight block should parse into structured policy event");
 
         let denied = tool
             .execute(json!({
                 "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
                 "job_type": "shell",
-                "command": "touch cron-approval-test"
+                "command": command
             }))
             .await
             .unwrap();
         assert!(!denied.success);
-        assert!(denied
-            .error
-            .unwrap_or_default()
-            .contains("explicit approval"));
+        let denied_event = parse_security_policy_block_event(
+            denied
+                .error
+                .as_deref()
+                .expect("cron_add approval block should include structured error"),
+        )
+        .expect("cron_add approval block should parse into structured policy event");
+        assert_eq!(denied_event.policy_id, preflight_event.policy_id);
+        assert_eq!(
+            denied_event.command_fragment,
+            preflight_event.command_fragment
+        );
+        assert_eq!(denied_event.reason, preflight_event.reason);
 
         let approved = tool
             .execute(json!({
                 "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
                 "job_type": "shell",
-                "command": "touch cron-approval-test",
+                "command": command,
                 "approved": true
             }))
             .await

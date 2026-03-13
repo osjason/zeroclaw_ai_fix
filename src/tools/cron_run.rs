@@ -1,5 +1,5 @@
 use super::cron_common::{
-    consume_action_budget, ensure_cron_enabled, parse_job_request, precheck_action_allowed,
+    ensure_cron_enabled, parse_job_request, preflight_command_allowed,
 };
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
@@ -47,7 +47,7 @@ impl Tool for CronRunTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if let Err(blocked) = ensure_cron_enabled(&self.config) {
+        if let Err(blocked) = ensure_cron_enabled(&self.config, "cron_run") {
             return Ok(blocked);
         }
         let request = match parse_job_request(&args) {
@@ -56,10 +56,6 @@ impl Tool for CronRunTool {
         };
         let job_id = request.job_id;
         let approved = request.approved;
-
-        if let Some(blocked) = precheck_action_allowed(&self.security, "cron_run") {
-            return Ok(blocked);
-        }
 
         let job = match cron::get_job(&self.config, job_id) {
             Ok(job) => job,
@@ -72,20 +68,13 @@ impl Tool for CronRunTool {
             }
         };
 
-        if matches!(job.job_type, JobType::Shell) {
-            if let Err(reason) = self
-                .security
-                .validate_command_execution(&job.command, approved)
-            {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(reason),
-                });
-            }
-        }
-
-        if let Some(blocked) = consume_action_budget(&self.security, "cron_run") {
+        let command_for_preflight = matches!(job.job_type, JobType::Shell).then_some(job.command.as_str());
+        if let Some(blocked) = preflight_command_allowed(
+            self.security.as_ref(),
+            "cron_run",
+            command_for_preflight,
+            approved,
+        ) {
             return Ok(blocked);
         }
 
