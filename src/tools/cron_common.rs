@@ -1,5 +1,10 @@
+use super::policy_blocked_result;
 use super::traits::ToolResult;
 use crate::config::Config;
+use crate::security::policy::{
+    action_budget_violation, action_command_preflight_with_approval_violation,
+    action_precheck_violation,
+};
 use crate::security::SecurityPolicy;
 use serde_json::Value;
 
@@ -37,37 +42,21 @@ pub(crate) fn precheck_action_allowed(
     security: &SecurityPolicy,
     action: &str,
 ) -> Option<ToolResult> {
-    if !security.can_act() {
-        return Some(ToolResult {
-            success: false,
-            output: String::new(),
-            error: Some(format!(
-                "Security policy: read-only mode, cannot perform '{action}'"
-            )),
-        });
-    }
-
-    if security.is_rate_limited() {
-        return Some(ToolResult {
-            success: false,
-            output: String::new(),
-            error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
-        });
-    }
-
-    None
+    action_precheck_violation(security, action).map(|blocked| policy_blocked_result(&blocked))
 }
 
-pub(crate) fn consume_action_budget(security: &SecurityPolicy) -> Option<ToolResult> {
-    if security.record_action() {
-        None
-    } else {
-        Some(ToolResult {
-            success: false,
-            output: String::new(),
-            error: Some("Rate limit exceeded: action budget exhausted".to_string()),
-        })
-    }
+pub(crate) fn consume_action_budget(security: &SecurityPolicy, action: &str) -> Option<ToolResult> {
+    action_budget_violation(security, action).map(|blocked| policy_blocked_result(&blocked))
+}
+
+pub(crate) fn preflight_action_with_optional_command(
+    security: &SecurityPolicy,
+    action: &str,
+    command: Option<&str>,
+    approved: bool,
+) -> Option<ToolResult> {
+    action_command_preflight_with_approval_violation(security, action, command, approved)
+        .map(|blocked| policy_blocked_result(&blocked))
 }
 
 fn missing_param(name: &str) -> ToolResult {

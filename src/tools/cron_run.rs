@@ -85,7 +85,7 @@ impl Tool for CronRunTool {
             }
         }
 
-        if let Some(blocked) = consume_action_budget(&self.security) {
+        if let Some(blocked) = consume_action_budget(&self.security, "cron_run") {
             return Ok(blocked);
         }
 

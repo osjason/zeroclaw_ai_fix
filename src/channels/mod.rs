@@ -95,6 +95,7 @@ use crate::security::{LeakDetector, LeakResult, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
+use progress_event::is_high_priority_progress_update;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -799,12 +800,13 @@ fn is_verbose_only_progress_line(delta: &str) -> bool {
         || trimmed.starts_with("\u{26a0}\u{fe0f} Loop detected")
 }
 
-fn contains_structured_policy_block_progress(delta: &str) -> bool {
-    let lower = delta.to_ascii_lowercase();
-    (lower.contains("security blocked (policy=") && lower.contains("command="))
-        || (lower.contains("status=blocked_by_security_policy")
-            && lower.contains("policy=")
-            && lower.contains("command="))
+fn should_show_progress_update(mode: ProgressMode, delta: &str) -> bool {
+    mode != ProgressMode::Off || is_high_priority_progress_update(delta)
+}
+
+fn should_skip_internal_progress_line(mode: ProgressMode, delta: &str) -> bool {
+    !should_show_progress_update(mode, delta)
+        || (mode == ProgressMode::Compact && is_verbose_only_progress_line(delta))
 }
 
 fn upsert_progress_section(accumulated: &mut String, block: &str) {
@@ -3750,26 +3752,16 @@ or tune thresholds in config.",
                 if let Some(block) =
                     delta.strip_prefix(crate::agent::loop_::DRAFT_PROGRESS_BLOCK_SENTINEL)
                 {
-                    if mode == ProgressMode::Off
-                        && !contains_structured_policy_block_progress(block)
-                    {
+                    if !should_show_progress_update(mode, block) {
                         continue;
                     }
                     upsert_progress_section(&mut accumulated, block);
                 } else {
                     let (is_internal_progress, visible_delta) =
                         split_internal_progress_delta(&delta);
-                    if is_internal_progress {
-                        if mode == ProgressMode::Off
-                            && !contains_structured_policy_block_progress(visible_delta)
-                        {
-                            continue;
-                        }
-                        if mode == ProgressMode::Compact
-                            && is_verbose_only_progress_line(visible_delta)
-                        {
-                            continue;
-                        }
+                    if is_internal_progress && should_skip_internal_progress_line(mode, visible_delta)
+                    {
+                        continue;
                     }
 
                     accumulated.push_str(visible_delta);

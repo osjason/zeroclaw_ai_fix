@@ -1,4 +1,4 @@
-use super::cron_common::{consume_action_budget, ensure_cron_enabled, precheck_action_allowed};
+use super::cron_common::{ensure_cron_enabled, preflight_action_with_optional_command};
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron::{self, DeliveryConfig, JobType, Schedule, SessionTarget};
@@ -147,19 +147,12 @@ impl Tool for CronAddTool {
                         });
                     }
                 };
-
-                if let Err(reason) = self.security.validate_command_execution(command, approved) {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(reason),
-                    });
-                }
-
-                if let Some(blocked) = precheck_action_allowed(&self.security, "cron_add") {
-                    return Ok(blocked);
-                }
-                if let Some(blocked) = consume_action_budget(&self.security) {
+                if let Some(blocked) = preflight_action_with_optional_command(
+                    &self.security,
+                    "cron_add",
+                    Some(command),
+                    approved,
+                ) {
                     return Ok(blocked);
                 }
 
@@ -253,10 +246,9 @@ For one-time reminders, use schedule.kind='at' with an RFC3339 timestamp."
                     None => None,
                 };
 
-                if let Some(blocked) = precheck_action_allowed(&self.security, "cron_add") {
-                    return Ok(blocked);
-                }
-                if let Some(blocked) = consume_action_budget(&self.security) {
+                if let Some(blocked) =
+                    preflight_action_with_optional_command(&self.security, "cron_add", None, approved)
+                {
                     return Ok(blocked);
                 }
 
@@ -299,6 +291,7 @@ For one-time reminders, use schedule.kind='at' with an RFC3339 timestamp."
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::security::policy::parse_security_policy_block_event;
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
@@ -365,7 +358,12 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("not allowed"));
+        let blocked = result.error.unwrap_or_default();
+        let event = parse_security_policy_block_event(&blocked)
+            .expect("cron_add should expose structured security block event");
+        assert_eq!(event.policy_id, "autonomy.allowed_commands");
+        assert_eq!(event.command_fragment, "curl https://example.com");
+        assert!(event.reason.contains("not allowed"));
     }
 
     #[tokio::test]

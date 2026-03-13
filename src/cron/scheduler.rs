@@ -13,9 +13,8 @@ use crate::cron::{
     update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
 };
 use crate::security::policy::{
-    action_budget_exhausted_policy_block_event, is_command_policy_block_message,
-    parse_security_policy_block_event, rate_limit_precheck_policy_block_event,
-    read_only_policy_block_event,
+    action_command_preflight_with_approval_violation, is_command_policy_block_message,
+    parse_security_policy_block_event, CommandPolicyViolation,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -31,6 +30,7 @@ const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
 const START_ANNOUNCEMENT_PREVIEW_CHARS: usize = 180;
 const RESULT_ANNOUNCEMENT_PREVIEW_CHARS: usize = 220;
+const LEGACY_BLOCKED_POLICY_ID: &str = "autonomy.unknown";
 
 pub(crate) fn is_no_reply_sentinel(output: &str) -> bool {
     output.trim().eq_ignore_ascii_case("NO_REPLY")
@@ -177,10 +177,10 @@ async fn run_agent_job(
         job.prompt.as_deref().unwrap_or_default()
     );
 
-    if let Err(blocked_output) =
-        cron_execution_preflight(security, &agent_subject, CronCommandValidation::Skip)
+    if let Some(blocked) =
+        action_command_preflight_with_approval_violation(security, &agent_subject, None, false)
     {
-        return (false, blocked_output);
+        return (false, blocked.format_block_message());
     }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
@@ -214,37 +214,6 @@ async fn run_agent_job(
         ),
         Err(e) => (false, format!("agent job failed: {e}")),
     }
-}
-
-enum CronCommandValidation<'a> {
-    Skip,
-    Validate { command: &'a str, approved: bool },
-}
-
-fn cron_execution_preflight(
-    security: &SecurityPolicy,
-    action_subject: &str,
-    command_validation: CronCommandValidation<'_>,
-) -> Result<(), String> {
-    if !security.can_act() {
-        return Err(read_only_policy_block_event(Some(action_subject)));
-    }
-
-    if security.is_rate_limited() {
-        return Err(rate_limit_precheck_policy_block_event(Some(action_subject)));
-    }
-
-    if let CronCommandValidation::Validate { command, approved } = command_validation {
-        if let Err(reason) = security.validate_command_execution_with_reason(command, approved) {
-            return Err(reason.format_block_message());
-        }
-    }
-
-    if !security.record_action() {
-        return Err(action_budget_exhausted_policy_block_event(Some(action_subject)));
-    }
-
-    Ok(())
 }
 
 async fn persist_job_result(
@@ -337,9 +306,6 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
 }
 
 async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
-    let Some((channel, target)) = resolve_announce_target(job)? else {
-        return Ok(());
-    };
     if is_no_reply_sentinel(output) {
         tracing::debug!(
             "Cron job '{}' returned NO_REPLY sentinel; skipping announce delivery",
@@ -348,15 +314,27 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         return Ok(());
     }
 
-    deliver_announcement(config, channel, target, output).await
+    deliver_announcements_if_configured(config, job, [output]).await
 }
 
 async fn deliver_start_if_configured(config: &Config, job: &CronJob) -> Result<()> {
+    deliver_announcements_if_configured(config, job, build_start_announcements(job)).await
+}
+
+async fn deliver_announcements_if_configured<I, S>(
+    config: &Config,
+    job: &CronJob,
+    announcements: I,
+) -> Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     let Some((channel, target)) = resolve_announce_target(job)? else {
         return Ok(());
     };
-    for announcement in build_start_announcements(job) {
-        deliver_announcement(config, channel, target, &announcement).await?;
+    for announcement in announcements {
+        deliver_announcement(config, channel, target, announcement.as_ref()).await?;
     }
     Ok(())
 }
@@ -438,41 +416,49 @@ fn build_job_result_announcement(job: &CronJob, success: bool, output: &str) -> 
     }
 
     if !success {
-        if let Some(blocked_announcement) = render_security_blocked_announcement(job, output) {
-            return blocked_announcement;
+        if let Some(blocked_signal) = build_security_blocked_signal(job, output) {
+            return render_cron_execution_signal(job, blocked_signal);
         }
     }
 
     output.to_string()
 }
 
-fn render_security_blocked_announcement(job: &CronJob, output: &str) -> Option<String> {
-    if let Some(event) = parse_security_policy_block_event(output) {
-        return Some(render_cron_execution_signal(
-            job,
-            ExecutionSignal::Blocked {
-                policy_id: Some(event.policy_id.to_string()),
-                command_preview: Some(compact_preview(
-                    event.command_fragment,
-                    RESULT_ANNOUNCEMENT_PREVIEW_CHARS,
-                )),
-                reason_preview: compact_preview(event.reason, RESULT_ANNOUNCEMENT_PREVIEW_CHARS),
-            },
-        ));
-    }
+fn build_security_blocked_signal(job: &CronJob, output: &str) -> Option<ExecutionSignal> {
+    let blocked_signal = if let Some(event) = parse_security_policy_block_event(output) {
+        ExecutionSignal::Blocked {
+            policy_id: Some(event.policy_id.to_string()),
+            command_preview: Some(compact_preview(
+                event.command_fragment,
+                RESULT_ANNOUNCEMENT_PREVIEW_CHARS,
+            )),
+            reason_preview: compact_preview(event.reason, RESULT_ANNOUNCEMENT_PREVIEW_CHARS),
+        }
+    } else if is_command_policy_block_message(output) {
+        ExecutionSignal::Blocked {
+            policy_id: Some(LEGACY_BLOCKED_POLICY_ID.to_string()),
+            command_preview: Some(compact_preview(
+                blocked_command_subject(job),
+                RESULT_ANNOUNCEMENT_PREVIEW_CHARS,
+            )),
+            reason_preview: compact_preview(output, RESULT_ANNOUNCEMENT_PREVIEW_CHARS),
+        }
+    } else {
+        return None;
+    };
 
-    if is_command_policy_block_message(output) {
-        return Some(render_cron_execution_signal(
-            job,
-            ExecutionSignal::Blocked {
-                policy_id: None,
-                command_preview: None,
-                reason_preview: compact_preview(output, RESULT_ANNOUNCEMENT_PREVIEW_CHARS),
-            },
-        ));
-    }
+    Some(blocked_signal)
+}
 
-    None
+fn blocked_command_subject(job: &CronJob) -> &str {
+    match job.job_type {
+        JobType::Shell => &job.command,
+        JobType::Agent => job
+            .prompt
+            .as_deref()
+            .filter(|prompt| !prompt.trim().is_empty())
+            .unwrap_or("<agent-task>"),
+    }
 }
 
 fn describe_schedule(schedule: &Schedule) -> String {
@@ -750,15 +736,13 @@ async fn run_job_command_with_timeout(
     job: &CronJob,
     timeout: Duration,
 ) -> (bool, String) {
-    if let Err(blocked_output) = cron_execution_preflight(
+    if let Some(blocked) = action_command_preflight_with_approval_violation(
         security,
         &job.command,
-        CronCommandValidation::Validate {
-            command: &job.command,
-            approved: false,
-        },
+        Some(&job.command),
+        false,
     ) {
-        return (false, blocked_output);
+        return (false, blocked.format_block_message());
     }
 
     let child = match Command::new("sh")
@@ -872,6 +856,23 @@ mod tests {
         }
     }
 
+    fn assert_security_policy_block(
+        output: &str,
+        expected_policy_id: &str,
+        expected_command_fragment: &str,
+        expected_reason_fragment: &str,
+    ) {
+        let event = parse_security_policy_block_event(output)
+            .expect("expected structured security policy block event");
+        assert_eq!(event.policy_id, expected_policy_id);
+        assert_eq!(event.command_fragment, expected_command_fragment);
+        assert!(
+            event.reason.contains(expected_reason_fragment),
+            "expected reason to contain `{expected_reason_fragment}`, got `{}`",
+            event.reason
+        );
+    }
+
     fn unique_component(prefix: &str) -> String {
         format!("{prefix}-{}", uuid::Uuid::new_v4())
     }
@@ -954,9 +955,12 @@ mod tests {
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
+        assert_security_policy_block(
+            &output,
+            "autonomy.workspace_path_guard",
+            "cat /etc/passwd",
+            "Path blocked by security policy",
+        );
     }
 
     #[tokio::test]
@@ -969,9 +973,12 @@ mod tests {
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
+        assert_security_policy_block(
+            &output,
+            "autonomy.workspace_path_guard",
+            "grep --file=/etc/passwd root ./src",
+            "Path blocked by security policy",
+        );
     }
 
     #[tokio::test]
@@ -984,9 +991,12 @@ mod tests {
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
+        assert_security_policy_block(
+            &output,
+            "autonomy.workspace_path_guard",
+            "grep -f/etc/passwd root ./src",
+            "Path blocked by security policy",
+        );
     }
 
     #[tokio::test]
@@ -999,9 +1009,12 @@ mod tests {
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("~root/.ssh/id_rsa"));
+        assert_security_policy_block(
+            &output,
+            "autonomy.workspace_path_guard",
+            "cat ~root/.ssh/id_rsa",
+            "Path blocked by security policy",
+        );
     }
 
     #[tokio::test]
@@ -1014,9 +1027,12 @@ mod tests {
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("policy=autonomy.shell_structure.redirection"));
-        assert!(output.contains("Shell redirection operators"));
+        assert_security_policy_block(
+            &output,
+            "autonomy.shell_structure.redirection",
+            "cat </etc/passwd",
+            "Shell redirection operators",
+        );
     }
 
     #[tokio::test]
@@ -1029,10 +1045,11 @@ mod tests {
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("policy=autonomy.read_only"));
-        assert!(output.contains("command=echo should-not-run"));
-        assert!(output.contains("read-only"));
+        let event = parse_security_policy_block_event(&output)
+            .expect("expected structured security policy block event");
+        assert_eq!(event.policy_id, "autonomy.read_only");
+        assert_eq!(event.command_fragment, "echo should-not-run");
+        assert!(event.reason.contains("read-only"));
     }
 
     #[tokio::test]
@@ -1119,8 +1136,12 @@ mod tests {
 
         let (success, output) = run_agent_job(&config, &security, &job).await;
         assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("read-only"));
+        assert_security_policy_block(
+            &output,
+            "autonomy.read_only",
+            "cron-agent:test-job Say hello",
+            "read-only",
+        );
     }
 
     #[tokio::test]
@@ -1135,10 +1156,12 @@ mod tests {
 
         let (success, output) = run_agent_job(&config, &security, &job).await;
         assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("policy=autonomy.max_actions_per_hour"));
-        assert!(output.contains("command=cron-agent:"));
-        assert!(output.contains("Rate limit exceeded"));
+        assert_security_policy_block(
+            &output,
+            "autonomy.max_actions_per_hour",
+            "cron-agent:test-job Say hello",
+            "Rate limit exceeded",
+        );
     }
 
     #[tokio::test]
@@ -1282,7 +1305,9 @@ mod tests {
         assert_eq!(announcements[0].0, "__test__");
         assert_eq!(announcements[0].1, "chat-due-shell-blocked");
         assert!(announcements[0].2.contains("status=triggered"));
-        assert!(announcements[1].2.contains("status=shell command is now executing"));
+        assert!(announcements[1]
+            .2
+            .contains("status=shell command is now executing"));
         assert_eq!(announcements[2].0, "__test__");
         assert_eq!(announcements[2].1, "chat-due-shell-blocked");
         assert!(announcements[2].2.contains("Cron blocked: id=test-job"));
@@ -1647,6 +1672,46 @@ mod tests {
         assert!(announcements[2]
             .2
             .contains("command=curl https://evil.example"));
+    }
+
+    #[test]
+    fn build_job_result_announcement_legacy_security_block_includes_policy_and_command() {
+        let job = test_job("echo legacy-shell-command");
+        let announcement = build_job_result_announcement(
+            &job,
+            false,
+            "blocked by security policy: legacy shell guard denied execution",
+        );
+
+        assert!(announcement.contains("status=blocked_by_security_policy"));
+        assert!(announcement.contains("policy=autonomy.unknown"));
+        assert!(announcement.contains("command=echo legacy-shell-command"));
+        assert!(announcement.contains("reason=blocked by security policy"));
+    }
+
+    #[test]
+    fn lifecycle_announcements_keep_identity_fields_consistent_for_blocked_shell_job() {
+        let mut job = test_job("curl https://evil.example");
+        job.name = Some("blocked-job".into());
+        job.schedule = Schedule::Every { every_ms: 30_000 };
+
+        let [triggered, running] = build_start_announcements(&job);
+        let blocked_output = CommandPolicyViolation::from_block_event(
+            "autonomy.allowed_commands",
+            "Command not allowed by security policy",
+            Some("curl https://evil.example"),
+        )
+        .format_block_message();
+        let blocked = build_job_result_announcement(&job, false, &blocked_output);
+
+        for announcement in [&triggered, &running, &blocked] {
+            assert!(announcement.contains("id=test-job name=blocked-job type=shell"));
+        }
+        assert!(triggered.contains("schedule=every(30000ms)"));
+        assert!(blocked.contains("schedule=every(30000ms)"));
+        assert!(blocked.contains("status=blocked_by_security_policy"));
+        assert!(blocked.contains("policy=autonomy.allowed_commands"));
+        assert!(blocked.contains("command=curl https://evil.example"));
     }
 
     #[tokio::test]

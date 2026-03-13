@@ -44,6 +44,11 @@ pub enum CommandRiskLevel {
 const MAX_COMMAND_FRAGMENT_CHARS: usize = 160;
 const SECURITY_BLOCK_MESSAGE_PREFIX: &str = "blocked by security policy:";
 const NO_COMMAND_FRAGMENT: &str = "<none>";
+const READ_ONLY_POLICY_ID: &str = "autonomy.read_only";
+const READ_ONLY_REASON: &str = "autonomy is read-only";
+const MAX_ACTIONS_POLICY_ID: &str = "autonomy.max_actions_per_hour";
+const RATE_LIMIT_PRECHECK_REASON: &str = "Rate limit exceeded: too many actions in the last hour";
+const RATE_LIMIT_BUDGET_REASON: &str = "Rate limit exceeded: action budget exhausted";
 
 /// Structured metadata extracted from a formatted security policy block event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,8 +83,7 @@ fn detect_shell_structure_block(command: &str) -> Option<ShellStructureBlock> {
     if contains_unquoted_char(command, '>') || contains_unquoted_char(command, '<') {
         return Some(ShellStructureBlock {
             policy_id: "autonomy.shell_structure.redirection",
-            reason:
-                "Shell redirection operators (`<`, `>`, `>>`) are blocked by security policy",
+            reason: "Shell redirection operators (`<`, `>`, `>>`) are blocked by security policy",
         });
     }
 
@@ -182,23 +186,116 @@ pub fn format_policy_block_event(
 }
 
 pub(crate) fn read_only_policy_block_event(command: Option<&str>) -> String {
-    format_policy_block_event("autonomy.read_only", "autonomy is read-only", command)
+    format_policy_block_event(READ_ONLY_POLICY_ID, READ_ONLY_REASON, command)
 }
 
 pub(crate) fn rate_limit_precheck_policy_block_event(command: Option<&str>) -> String {
-    format_policy_block_event(
-        "autonomy.max_actions_per_hour",
-        "Rate limit exceeded: too many actions in the last hour",
-        command,
-    )
+    format_policy_block_event(MAX_ACTIONS_POLICY_ID, RATE_LIMIT_PRECHECK_REASON, command)
 }
 
 pub(crate) fn action_budget_exhausted_policy_block_event(command: Option<&str>) -> String {
-    format_policy_block_event(
-        "autonomy.max_actions_per_hour",
-        "Rate limit exceeded: action budget exhausted",
-        command,
+    format_policy_block_event(MAX_ACTIONS_POLICY_ID, RATE_LIMIT_BUDGET_REASON, command)
+}
+
+pub(crate) fn action_precheck_violation(
+    security: &SecurityPolicy,
+    action_subject: &str,
+) -> Option<CommandPolicyViolation> {
+    if !security.can_act() {
+        return Some(CommandPolicyViolation::from_block_event(
+            READ_ONLY_POLICY_ID,
+            READ_ONLY_REASON,
+            Some(action_subject),
+        ));
+    }
+
+    if security.is_rate_limited() {
+        return Some(CommandPolicyViolation::from_block_event(
+            MAX_ACTIONS_POLICY_ID,
+            RATE_LIMIT_PRECHECK_REASON,
+            Some(action_subject),
+        ));
+    }
+
+    None
+}
+
+pub(crate) fn action_budget_violation(
+    security: &SecurityPolicy,
+    action_subject: &str,
+) -> Option<CommandPolicyViolation> {
+    if security.record_action() {
+        None
+    } else {
+        Some(CommandPolicyViolation::from_block_event(
+            MAX_ACTIONS_POLICY_ID,
+            RATE_LIMIT_BUDGET_REASON,
+            Some(action_subject),
+        ))
+    }
+}
+
+pub(crate) fn action_command_preflight_violation(
+    security: &SecurityPolicy,
+    action_subject: &str,
+    command_validation: Option<(&str, bool)>,
+) -> Option<CommandPolicyViolation> {
+    let subject = command_validation_subject(action_subject, command_validation);
+
+    if let Some(blocked) = action_precheck_violation(security, subject) {
+        return Some(blocked);
+    }
+
+    if let Some((command, approved)) = command_validation {
+        if let Some(blocked) = command_policy_precheck_violation(security, command, approved) {
+            return Some(blocked);
+        }
+    }
+
+    action_budget_violation(security, subject)
+}
+
+pub(crate) fn action_command_preflight_with_approval_violation(
+    security: &SecurityPolicy,
+    action_subject: &str,
+    command: Option<&str>,
+    approved: bool,
+) -> Option<CommandPolicyViolation> {
+    action_command_preflight_violation(
+        security,
+        action_subject,
+        command.map(|value| (value, approved)),
     )
+}
+
+pub(crate) fn action_command_preflight_with_approval_block_event(
+    security: &SecurityPolicy,
+    action_subject: &str,
+    command: Option<&str>,
+    approved: bool,
+) -> Option<String> {
+    action_command_preflight_with_approval_violation(security, action_subject, command, approved)
+        .map(|blocked| blocked.format_block_message())
+}
+
+fn command_validation_subject<'a>(
+    action_subject: &'a str,
+    command_validation: Option<(&'a str, bool)>,
+) -> &'a str {
+    command_validation
+        .map(|(command, _)| command.trim())
+        .filter(|command| !command.is_empty())
+        .unwrap_or(action_subject)
+}
+
+pub(crate) fn command_policy_precheck_violation(
+    security: &SecurityPolicy,
+    command: &str,
+    approved: bool,
+) -> Option<CommandPolicyViolation> {
+    security
+        .validate_command_execution_with_reason(command, approved)
+        .err()
 }
 
 pub(crate) fn is_command_policy_block_message(message: &str) -> bool {
@@ -968,7 +1065,9 @@ impl SecurityPolicy {
         if self.autonomy == AutonomyLevel::ReadOnly {
             return Err(CommandPolicyViolation::new(
                 "autonomy.read_only",
-                format!("Command not allowed by security policy (autonomy is read-only): {command}"),
+                format!(
+                    "Command not allowed by security policy (autonomy is read-only): {command}"
+                ),
                 command,
             ));
         }
@@ -1634,11 +1733,8 @@ mod tests {
 
     #[test]
     fn format_policy_block_event_uses_placeholder_command_when_missing() {
-        let message = format_policy_block_event(
-            "autonomy.read_only",
-            "autonomy is read-only",
-            None,
-        );
+        let message =
+            format_policy_block_event("autonomy.read_only", "autonomy is read-only", None);
         assert!(message.contains("policy=autonomy.read_only"));
         assert!(message.contains("command=<none>"));
         assert!(message.contains("reason=autonomy is read-only"));

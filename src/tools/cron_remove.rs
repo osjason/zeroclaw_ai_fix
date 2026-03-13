@@ -57,7 +57,7 @@ impl Tool for CronRemoveTool {
         if let Some(blocked) = precheck_action_allowed(&self.security, "cron_remove") {
             return Ok(blocked);
         }
-        if let Some(blocked) = consume_action_budget(&self.security) {
+        if let Some(blocked) = consume_action_budget(&self.security, "cron_remove") {
             return Ok(blocked);
         }
 

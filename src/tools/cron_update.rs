@@ -1,9 +1,10 @@
 use super::cron_common::{
-    consume_action_budget, ensure_cron_enabled, parse_job_request, precheck_action_allowed,
+    ensure_cron_enabled, parse_job_request,
 };
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron::{self, CronJobPatch, DeliveryConfig, JobType, Schedule};
+use crate::security::policy::action_command_preflight_with_approval_block_event;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -134,16 +135,6 @@ impl Tool for CronUpdateTool {
             }
         };
 
-        if let Some(command) = &patch.command {
-            if let Err(reason) = self.security.validate_command_execution(command, approved) {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(reason),
-                });
-            }
-        }
-
         let mut patch = patch;
         let existing_job = match cron::get_job(&self.config, job_id) {
             Ok(job) => job,
@@ -159,11 +150,17 @@ impl Tool for CronUpdateTool {
             patch.delivery = default_delivery;
         }
 
-        if let Some(blocked) = precheck_action_allowed(&self.security, "cron_update") {
-            return Ok(blocked);
-        }
-        if let Some(blocked) = consume_action_budget(&self.security) {
-            return Ok(blocked);
+        if let Some(blocked) = action_command_preflight_with_approval_block_event(
+            &self.security,
+            "cron_update",
+            patch.command.as_deref(),
+            approved,
+        ) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(blocked),
+            });
         }
 
         match cron::update_job(&self.config, job_id, patch) {
@@ -185,6 +182,7 @@ impl Tool for CronUpdateTool {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::security::policy::parse_security_policy_block_event;
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
@@ -250,7 +248,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("not allowed"));
+        let blocked = result.error.unwrap_or_default();
+        let event = parse_security_policy_block_event(&blocked)
+            .expect("cron_update should expose structured security block event");
+        assert_eq!(event.policy_id, "autonomy.allowed_commands");
+        assert_eq!(event.command_fragment, "curl https://example.com");
+        assert!(event.reason.contains("not allowed"));
     }
 
     #[tokio::test]
@@ -275,7 +278,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("read-only"));
+        let blocked = result.error.unwrap_or_default();
+        let event = parse_security_policy_block_event(&blocked)
+            .expect("cron_update read-only block should expose structured security block event");
+        assert_eq!(event.policy_id, "autonomy.read_only");
+        assert_eq!(event.command_fragment, "cron_update");
+        assert!(event.reason.contains("read-only"));
     }
 
     #[tokio::test]
@@ -335,16 +343,18 @@ mod tests {
         let result = tool
             .execute(json!({
                 "job_id": job.id,
-                "patch": { "enabled": false }
+                "patch": { "command": "echo should-not-run" }
             }))
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("Rate limit exceeded"));
-        assert!(cron::get_job(&cfg, &job.id).unwrap().enabled);
+        let blocked = result.error.unwrap_or_default();
+        let event = parse_security_policy_block_event(&blocked)
+            .expect("cron_update rate-limit block should expose structured security block event");
+        assert_eq!(event.policy_id, "autonomy.max_actions_per_hour");
+        assert_eq!(event.command_fragment, "echo should-not-run");
+        assert!(event.reason.contains("Rate limit exceeded"));
+        assert_eq!(cron::get_job(&cfg, &job.id).unwrap().command, "echo ok");
     }
 
     #[tokio::test]

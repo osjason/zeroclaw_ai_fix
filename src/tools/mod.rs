@@ -115,6 +115,7 @@ pub use web_search_tool::WebSearchTool;
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
+use crate::security::policy::command_policy_precheck_violation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -139,13 +140,13 @@ pub(crate) fn command_execution_preflight_result(
         return Some(ToolResult {
             success: false,
             output: String::new(),
-            error: Some(crate::security::policy::rate_limit_precheck_policy_block_event(
-                Some(command),
-            )),
+            error: Some(
+                crate::security::policy::rate_limit_precheck_policy_block_event(Some(command)),
+            ),
         });
     }
 
-    if let Err(reason) = security.validate_command_execution_with_reason(command, approved) {
+    if let Some(reason) = command_policy_precheck_violation(security, command, approved) {
         return Some(policy_blocked_result(&reason));
     }
 
@@ -153,9 +154,9 @@ pub(crate) fn command_execution_preflight_result(
         return Some(ToolResult {
             success: false,
             output: String::new(),
-            error: Some(crate::security::policy::action_budget_exhausted_policy_block_event(
-                Some(command),
-            )),
+            error: Some(
+                crate::security::policy::action_budget_exhausted_policy_block_event(Some(command)),
+            ),
         });
     }
 

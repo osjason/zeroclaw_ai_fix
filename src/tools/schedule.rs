@@ -156,7 +156,7 @@ impl ScheduleTool {
         if let Some(blocked) = precheck_action_allowed(&self.security, action) {
             return Some(blocked);
         }
-        consume_action_budget(&self.security)
+        consume_action_budget(&self.security, action)
     }
 
     fn handle_list(&self) -> Result<ToolResult> {

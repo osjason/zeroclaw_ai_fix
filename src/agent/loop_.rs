@@ -598,6 +598,22 @@ fn summarize_policy_block_for_progress(tool_name: &str, reason: Option<&str>) ->
     reason.and_then(|raw| render_policy_block_for_progress(tool_name, raw))
 }
 
+fn format_tool_policy_block_event(
+    policy_id: &'static str,
+    reason: impl Into<String>,
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+) -> String {
+    let hint = truncate_tool_args_for_progress(tool_name, tool_args, 96);
+    let command_fragment = if hint.is_empty() {
+        tool_name.to_string()
+    } else {
+        format!("{tool_name} {hint}")
+    };
+    CommandPolicyViolation::from_block_event(policy_id, reason, Some(&command_fragment))
+        .format_block_message()
+}
+
 async fn emit_policy_block_progress_delta(
     on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
     tool_name: &str,
@@ -878,7 +894,12 @@ fn shell_command_is_read_only_probe(command: &str) -> bool {
         | "where" | "echo" | "wc" | "stat" | "type" | "tree" | "git" | "cargo" => true,
         "powershell" | "pwsh" => contains_any_marker(
             &lower,
-            &["get-childitem", "get-content", "select-string", "get-process"],
+            &[
+                "get-childitem",
+                "get-content",
+                "select-string",
+                "get-process",
+            ],
         ),
         _ => false,
     }
@@ -895,6 +916,11 @@ fn tool_call_requires_post_action_verification(
 
     match tool_name {
         "file_write" => true,
+        "cron_add" | "cron_update" | "cron_remove" | "cron_run" => true,
+        "schedule" => args
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|action| matches!(action, "create" | "cancel" | "pause" | "resume")),
         "shell" => args
             .get("command")
             .and_then(serde_json::Value::as_str)
@@ -955,6 +981,91 @@ fn build_post_action_verification_retry_prompt(requirement: &str, attempt: usize
         "Internal correction attempt #{attempt}: post-action verification is still missing for ({requirement}). \
          Emit exactly one valid verification <tool_call>...</tool_call> now, then wait for tool results before answering."
     )
+}
+
+enum ToolCallFollowthroughRequirement {
+    RetryToolCall { reason: &'static str },
+    PostActionVerification { requirement: String },
+}
+
+impl ToolCallFollowthroughRequirement {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::RetryToolCall { reason } => reason,
+            Self::PostActionVerification { .. } => "post_action_verification_missing",
+        }
+    }
+
+    fn retry_prompt(&self, attempt: usize) -> String {
+        match self {
+            Self::RetryToolCall { reason } => build_missing_tool_call_retry_prompt(reason, attempt),
+            Self::PostActionVerification { requirement } => {
+                build_post_action_verification_retry_prompt(requirement, attempt)
+            }
+        }
+    }
+
+    fn progress_retry_line(&self, attempt: usize) -> String {
+        match self {
+            Self::PostActionVerification { .. } => format!(
+                "{DRAFT_PROGRESS_SENTINEL}\u{21bb} Retrying to enforce post-action verification (attempt {attempt})\n"
+            ),
+            Self::RetryToolCall { .. } => format!(
+                "{DRAFT_PROGRESS_SENTINEL}\u{21bb} Retrying after malformed or incomplete tool call (attempt {attempt})\n"
+            ),
+        }
+    }
+}
+
+fn determine_tool_call_followthrough_requirement(
+    parse_issue_detected: bool,
+    display_text: &str,
+    post_action_verification_requirement: Option<&str>,
+) -> Option<ToolCallFollowthroughRequirement> {
+    if parse_issue_detected {
+        return Some(ToolCallFollowthroughRequirement::RetryToolCall {
+            reason: "parse_issue_detected",
+        });
+    }
+    if looks_like_deferred_action_without_tool_call(display_text) {
+        return Some(ToolCallFollowthroughRequirement::RetryToolCall {
+            reason: "deferred_action_text_detected",
+        });
+    }
+    post_action_verification_requirement.map(|requirement| {
+        ToolCallFollowthroughRequirement::PostActionVerification {
+            requirement: requirement.to_string(),
+        }
+    })
+}
+
+#[derive(Default)]
+struct PostActionVerificationTurn {
+    requires_verification: Vec<String>,
+    verification_observed: bool,
+}
+
+impl PostActionVerificationTurn {
+    fn observe_tool_call(&mut self, tool_name: &str, args: &serde_json::Value, success: bool) {
+        if tool_call_satisfies_post_action_verification(tool_name, args, success) {
+            self.verification_observed = true;
+        }
+        if tool_call_requires_post_action_verification(tool_name, args, success) {
+            self.requires_verification
+                .push(summarize_post_action_verification_target(tool_name, args));
+        }
+    }
+
+    fn apply(self, current_requirement: &mut Option<String>) {
+        if self.verification_observed {
+            *current_requirement = None;
+            return;
+        }
+
+        if !self.requires_verification.is_empty() {
+            *current_requirement = Some(self.requires_verification.join(", "));
+        }
+    }
 }
 
 fn build_cron_default_delivery(
@@ -1052,37 +1163,71 @@ fn maybe_inject_cron_delivery_defaults(
 
 async fn await_non_cli_approval_decision(
     mgr: &ApprovalManager,
+    tool_name: &str,
     request_id: &str,
     sender: &str,
     channel_name: &str,
     reply_target: &str,
     cancellation_token: Option<&CancellationToken>,
-) -> ApprovalResponse {
+) -> NonCliApprovalDecisionOutcome {
+    let denied_by_user_reason = format!(
+        "Command requires explicit approval for tool '{tool_name}' and was denied by user."
+    );
     let started = Instant::now();
 
     loop {
         if let Some(decision) = mgr.take_non_cli_pending_resolution(request_id) {
-            return decision;
+            return NonCliApprovalDecisionOutcome {
+                decision,
+                denied_policy: "runtime.approval.user_decision",
+                denied_reason: denied_by_user_reason.clone(),
+            };
         }
 
         if !mgr.has_non_cli_pending_request(request_id) {
             // Fail closed when the request disappears without an explicit resolution.
-            return ApprovalResponse::No;
+            return NonCliApprovalDecisionOutcome {
+                decision: ApprovalResponse::No,
+                denied_policy: "runtime.approval.pending_request_not_found",
+                denied_reason: format!(
+                    "Pending approval request '{request_id}' for tool '{tool_name}' was removed before a user decision was received."
+                ),
+            };
         }
 
         if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
-            return ApprovalResponse::No;
+            return NonCliApprovalDecisionOutcome {
+                decision: ApprovalResponse::No,
+                denied_policy: "runtime.approval.pending_request_cancelled",
+                denied_reason: format!(
+                    "Pending approval request '{request_id}' for tool '{tool_name}' was cancelled before a user decision was received."
+                ),
+            };
         }
 
         if started.elapsed() >= Duration::from_secs(NON_CLI_APPROVAL_WAIT_TIMEOUT_SECS) {
             let _ =
                 mgr.reject_non_cli_pending_request(request_id, sender, channel_name, reply_target);
             let _ = mgr.take_non_cli_pending_resolution(request_id);
-            return ApprovalResponse::No;
+            return NonCliApprovalDecisionOutcome {
+                decision: ApprovalResponse::No,
+                denied_policy: "runtime.approval.pending_request_timeout",
+                denied_reason: format!(
+                    "Pending approval request '{request_id}' for tool '{tool_name}' timed out after {} seconds without a user decision.",
+                    NON_CLI_APPROVAL_WAIT_TIMEOUT_SECS
+                ),
+            };
         }
 
         tokio::time::sleep(Duration::from_millis(NON_CLI_APPROVAL_POLL_INTERVAL_MS)).await;
     }
+}
+
+#[derive(Debug)]
+struct NonCliApprovalDecisionOutcome {
+    decision: ApprovalResponse,
+    denied_policy: &'static str,
+    denied_reason: String,
 }
 
 /// Convert a tool registry to OpenAI function-calling format for native tool support.
@@ -1914,39 +2059,20 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
-            let parse_retry_reason = if parse_issue_detected {
-                Some("parse_issue_detected")
-            } else if looks_like_deferred_action_without_tool_call(&display_text) {
-                Some("deferred_action_text_detected")
-            } else {
-                None
-            };
-            let missing_verification_requirement = if parse_retry_reason.is_none() {
-                post_action_verification_requirement.as_deref()
-            } else {
-                None
-            };
-            let missing_tool_call_followthrough =
-                !tool_specs.is_empty()
-                    && (parse_retry_reason.is_some() || missing_verification_requirement.is_some());
-            if missing_tool_call_followthrough {
+            let followthrough_requirement = (!tool_specs.is_empty())
+                .then(|| {
+                    determine_tool_call_followthrough_requirement(
+                        parse_issue_detected,
+                        &display_text,
+                        post_action_verification_requirement.as_deref(),
+                    )
+                })
+                .flatten();
+            if let Some(requirement) = followthrough_requirement {
                 missing_tool_call_retry_attempts += 1;
-                let retry_reason = parse_retry_reason.unwrap_or("post_action_verification_missing");
-                missing_tool_call_retry_prompt = Some(
-                    missing_verification_requirement
-                        .map(|requirement| {
-                            build_post_action_verification_retry_prompt(
-                                requirement,
-                                missing_tool_call_retry_attempts,
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            build_missing_tool_call_retry_prompt(
-                                retry_reason,
-                                missing_tool_call_retry_attempts,
-                            )
-                        }),
-                );
+                let retry_reason = requirement.reason();
+                missing_tool_call_retry_prompt =
+                    Some(requirement.retry_prompt(missing_tool_call_retry_attempts));
 
                 runtime_trace::record_event(
                     "tool_call_followthrough_retry",
@@ -1966,20 +2092,9 @@ pub(crate) async fn run_tool_call_loop(
 
                 if should_emit_verbose_progress(progress_mode) {
                     if let Some(ref tx) = on_delta {
-                        let retry_line = if missing_verification_requirement.is_some() {
-                            format!(
-                                "{DRAFT_PROGRESS_SENTINEL}\u{21bb} Retrying to enforce post-action verification (attempt {})\n",
-                                missing_tool_call_retry_attempts
-                            )
-                        } else {
-                            format!(
-                                "{DRAFT_PROGRESS_SENTINEL}\u{21bb} Retrying after malformed or incomplete tool call (attempt {})\n",
-                                missing_tool_call_retry_attempts
-                            )
-                        };
-                        let _ = tx
-                            .send(retry_line)
-                            .await;
+                        let retry_line =
+                            requirement.progress_retry_line(missing_tool_call_retry_attempts);
+                        let _ = tx.send(retry_line).await;
                     }
                 }
 
@@ -2106,18 +2221,12 @@ pub(crate) async fn run_tool_call_loop(
 
             if excluded_tools.iter().any(|ex| ex == &tool_name) {
                 let reason = format!("Tool '{tool_name}' is not available in this channel.");
-                let hint = truncate_tool_args_for_progress(&tool_name, &tool_args, 96);
-                let command_fragment = if hint.is_empty() {
-                    tool_name.clone()
-                } else {
-                    format!("{tool_name} {hint}")
-                };
-                let blocked = CommandPolicyViolation::from_block_event(
+                let blocked = format_tool_policy_block_event(
                     "runtime.channel.excluded_tools",
                     reason,
-                    Some(&command_fragment),
-                )
-                .format_block_message();
+                    &tool_name,
+                    &tool_args,
+                );
                 runtime_trace::record_event(
                     "tool_call_result",
                     Some(channel_name),
@@ -2143,13 +2252,8 @@ pub(crate) async fn run_tool_call_loop(
                         duration: Duration::ZERO,
                     },
                 ));
-                emit_policy_block_progress_delta(
-                    on_delta.as_ref(),
-                    &tool_name,
-                    0,
-                    Some(&blocked),
-                )
-                .await;
+                emit_policy_block_progress_delta(on_delta.as_ref(), &tool_name, 0, Some(&blocked))
+                    .await;
                 continue;
             }
 
@@ -2185,8 +2289,14 @@ pub(crate) async fn run_tool_call_loop(
                         arguments: tool_args.clone(),
                     };
 
-                    let decision = if channel_name == "cli" {
-                        mgr.prompt_cli(&request)
+                    let (decision, denied_policy, denied_reason) = if channel_name == "cli" {
+                        (
+                            mgr.prompt_cli(&request),
+                            "runtime.approval.user_decision",
+                            format!(
+                                "Command requires explicit approval for tool '{tool_name}' and was denied by user."
+                            ),
+                        )
                     } else if let Some(ctx) = non_cli_approval_context.as_ref() {
                         let pending = mgr.create_non_cli_pending_request(
                             &tool_name,
@@ -2205,23 +2315,40 @@ pub(crate) async fn run_tool_call_loop(
                             arguments: tool_args.clone(),
                         });
 
-                        await_non_cli_approval_decision(
+                        let pending_outcome = await_non_cli_approval_decision(
                             mgr,
+                            &tool_name,
                             &pending.request_id,
                             &ctx.sender,
                             channel_name,
                             &ctx.reply_target,
                             cancellation_token.as_ref(),
                         )
-                        .await
+                        .await;
+                        (
+                            pending_outcome.decision,
+                            pending_outcome.denied_policy,
+                            pending_outcome.denied_reason,
+                        )
                     } else {
-                        ApprovalResponse::No
+                        (
+                            ApprovalResponse::No,
+                            "runtime.approval.non_cli_context_required",
+                            format!(
+                                "Command requires explicit approval for tool '{tool_name}' on channel '{channel_name}', but no approval context is available."
+                            ),
+                        )
                     };
 
                     mgr.record_decision(&tool_name, &tool_args, decision, channel_name);
 
                     if decision == ApprovalResponse::No {
-                        let denied = "Denied by user.".to_string();
+                        let denied = format_tool_policy_block_event(
+                            denied_policy,
+                            denied_reason,
+                            &tool_name,
+                            &tool_args,
+                        );
                         runtime_trace::record_event(
                             "tool_call_result",
                             Some(channel_name),
@@ -2242,10 +2369,17 @@ pub(crate) async fn run_tool_call_loop(
                             ToolExecutionOutcome {
                                 output: denied.clone(),
                                 success: false,
-                                error_reason: Some(denied),
+                                error_reason: Some(denied.clone()),
                                 duration: Duration::ZERO,
                             },
                         ));
+                        emit_policy_block_progress_delta(
+                            on_delta.as_ref(),
+                            &tool_name,
+                            0,
+                            Some(&denied),
+                        )
+                        .await;
                         continue;
                     }
                 }
@@ -2338,8 +2472,7 @@ pub(crate) async fn run_tool_call_loop(
             .await?
         };
 
-        let mut turn_requires_verification: Vec<String> = Vec::new();
-        let mut turn_verification_observed = false;
+        let mut post_action_verification_turn = PostActionVerificationTurn::default();
         for (((idx, call), mut outcome), progress_idx) in executable_indices
             .iter()
             .zip(executable_calls.iter())
@@ -2421,30 +2554,13 @@ pub(crate) async fn run_tool_call_loop(
                 loop_detector.record_call(&sig.0, &sig.1, &outcome.output, outcome.success);
             }
 
-            if tool_call_satisfies_post_action_verification(&call.name, &call.arguments, outcome.success)
-            {
-                turn_verification_observed = true;
-            }
-            if tool_call_requires_post_action_verification(&call.name, &call.arguments, outcome.success)
-            {
-                turn_requires_verification
-                    .push(summarize_post_action_verification_target(&call.name, &call.arguments));
-            }
+            post_action_verification_turn
+                .observe_tool_call(&call.name, &call.arguments, outcome.success);
 
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
-        if turn_verification_observed {
-            post_action_verification_requirement = None;
-        }
-        if !turn_requires_verification.is_empty() {
-            if turn_verification_observed {
-                post_action_verification_requirement = None;
-            } else {
-                post_action_verification_requirement =
-                    Some(turn_requires_verification.join(", "));
-            }
-        }
+        post_action_verification_turn.apply(&mut post_action_verification_requirement);
 
         let runtime_constraint_reasons = summarize_runtime_constraint_reasons(
             ordered_results
@@ -4322,8 +4438,9 @@ mod tests {
             ChatMessage::user("run shell"),
         ];
         let observer = NoopObserver;
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(8);
 
-        let result = run_tool_call_loop(
+        let result = run_tool_call_loop_with_reply_target(
             &provider,
             &mut history,
             &tools_registry,
@@ -4334,12 +4451,14 @@ mod tests {
             true,
             Some(&approval_mgr),
             "telegram",
+            Some("chat-approval"),
             &crate::config::MultimodalConfig::default(),
             4,
             None,
-            None,
+            Some(delta_tx),
             None,
             &[],
+            ProgressMode::Off,
         )
         .await
         .expect("tool loop should complete with denied tool execution");
@@ -4349,6 +4468,45 @@ mod tests {
             max_active.load(Ordering::SeqCst),
             0,
             "shell tool must not execute when approval is unavailable on non-CLI channels"
+        );
+
+        let tool_results_message = history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("tool results message should be present");
+        let blocked_line = tool_results_message
+            .content
+            .lines()
+            .find(|line| line.contains("blocked by security policy"))
+            .expect("structured policy block line should be included");
+        let parsed = parse_command_policy_block_event(blocked_line)
+            .expect("blocked reason should be parseable as a policy block event");
+        assert_eq!(
+            parsed.policy_id,
+            "runtime.approval.non_cli_context_required"
+        );
+        assert_eq!(parsed.command_fragment, "shell echo hi");
+        assert!(
+            parsed.reason.contains("no approval context is available"),
+            "approval block reason should explain unavailable context, got: {}",
+            parsed.reason
+        );
+
+        let mut progress_deltas = Vec::new();
+        while let Ok(delta) = delta_rx.try_recv() {
+            progress_deltas.push(delta);
+        }
+        assert!(
+            progress_deltas
+                .iter()
+                .any(|delta| delta.contains("policy=runtime.approval.non_cli_context_required")),
+            "approval policy block should be sent to progress stream, got deltas: {progress_deltas:?}"
+        );
+        assert!(
+            progress_deltas
+                .iter()
+                .any(|delta| delta.contains("command=shell echo hi")),
+            "approval command fragment should be sent to progress stream, got deltas: {progress_deltas:?}"
         );
     }
 
@@ -4489,6 +4647,120 @@ mod tests {
             max_active.load(Ordering::SeqCst),
             1,
             "shell tool should execute after non-cli approval is resolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_reports_block_when_non_cli_pending_request_disappears() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"echo hi"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
+            "shell",
+            50,
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        ))];
+
+        let approval_mgr = Arc::new(ApprovalManager::from_config(
+            &crate::config::AutonomyConfig::default(),
+        ));
+        let (prompt_tx, mut prompt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<NonCliApprovalPrompt>();
+        let approval_mgr_for_task = Arc::clone(&approval_mgr);
+        let cleanup_task = tokio::spawn(async move {
+            let prompt = prompt_rx
+                .recv()
+                .await
+                .expect("approval prompt should arrive");
+            let removed =
+                approval_mgr_for_task.clear_non_cli_pending_requests_for_tool(&prompt.tool_name);
+            assert!(
+                removed >= 1,
+                "at least one pending request should be removed for tool cleanup"
+            );
+        });
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run shell"),
+        ];
+        let observer = NoopObserver;
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(8);
+
+        let result = run_tool_call_loop_with_non_cli_approval_context(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(approval_mgr.as_ref()),
+            "telegram",
+            Some(NonCliApprovalContext {
+                sender: "alice".to_string(),
+                reply_target: "chat-approval".to_string(),
+                prompt_tx,
+            }),
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            Some(delta_tx),
+            None,
+            &[],
+            ProgressMode::Off,
+            None,
+        )
+        .await
+        .expect("tool loop should complete with structured pending-request block");
+
+        cleanup_task.await.expect("cleanup task should complete");
+        assert_eq!(result, "done");
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            0,
+            "shell tool must not execute when pending approval request disappears"
+        );
+
+        let tool_results_message = history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("tool results message should be present");
+        let blocked_line = tool_results_message
+            .content
+            .lines()
+            .find(|line| line.contains("blocked by security policy"))
+            .expect("structured policy block line should be included");
+        let parsed = parse_command_policy_block_event(blocked_line)
+            .expect("blocked reason should be parseable as a policy block event");
+        assert_eq!(
+            parsed.policy_id,
+            "runtime.approval.pending_request_not_found"
+        );
+        assert_eq!(parsed.command_fragment, "shell echo hi");
+        assert!(
+            parsed.reason.contains("was removed before a user decision"),
+            "pending-request block reason should explain request removal, got: {}",
+            parsed.reason
+        );
+
+        let mut progress_deltas = Vec::new();
+        while let Ok(delta) = delta_rx.try_recv() {
+            progress_deltas.push(delta);
+        }
+        assert!(
+            progress_deltas
+                .iter()
+                .any(|delta| delta.contains("policy=runtime.approval.pending_request_not_found")),
+            "pending-request block should be sent to progress stream, got deltas: {progress_deltas:?}"
         );
     }
 
@@ -4830,7 +5102,10 @@ mod tests {
         let verify_invocations = Arc::new(AtomicUsize::new(0));
         let tools_registry: Vec<Box<dyn Tool>> = vec![
             Box::new(CountingTool::new("shell", Arc::clone(&shell_invocations))),
-            Box::new(CountingTool::new("file_read", Arc::clone(&verify_invocations))),
+            Box::new(CountingTool::new(
+                "file_read",
+                Arc::clone(&verify_invocations),
+            )),
         ];
 
         let mut history = vec![
@@ -4866,6 +5141,69 @@ mod tests {
             verify_invocations.load(Ordering::SeqCst),
             1,
             "verification tool call should be required before final response"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_requires_post_action_verification_for_cron_mutation_before_final_answer(
+    ) {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"cron_add","arguments":{"schedule":"* * * * *","job_type":"agent","prompt":"status check"}}
+</tool_call>"#,
+            "done without verification",
+            r#"<tool_call>
+{"name":"cron_list","arguments":{}}
+</tool_call>"#,
+            "done after verification",
+        ]);
+
+        let cron_add_invocations = Arc::new(AtomicUsize::new(0));
+        let cron_list_invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(CountingTool::new(
+                "cron_add",
+                Arc::clone(&cron_add_invocations),
+            )),
+            Box::new(CountingTool::new(
+                "cron_list",
+                Arc::clone(&cron_list_invocations),
+            )),
+        ];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("create recurring task and finish"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            6,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("loop should enforce cron post-action verification before final answer");
+
+        assert_eq!(result, "done after verification");
+        assert_eq!(cron_add_invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cron_list_invocations.load(Ordering::SeqCst),
+            1,
+            "cron verification call should be required before final response"
         );
     }
 
