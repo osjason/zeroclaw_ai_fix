@@ -25,6 +25,19 @@ pub(crate) struct ExecutionEvent<'a> {
     pub signal: ExecutionSignal,
 }
 
+const LIFECYCLE_STATUSES: &[&str] = &[
+    "blocked_by_security_policy",
+    "triggered",
+    "running",
+    "completed",
+];
+const STRUCTURED_LIFECYCLE_TOKENS: &[&str] = &[
+    "triggered: id=",
+    "running: id=",
+    "blocked: id=",
+    "completed: id=",
+];
+
 /// Whether a progress payload should be treated as high priority and remain visible
 /// even when normal progress updates are throttled/filtered.
 pub(crate) fn is_high_priority_progress_update(text: &str) -> bool {
@@ -32,16 +45,23 @@ pub(crate) fn is_high_priority_progress_update(text: &str) -> bool {
     let status = extract_status_value(lower.as_str());
     let is_policy_block_summary =
         lower.contains("security blocked (policy=") && lower.contains("command=");
-    let is_structured_running = lower.contains(" running: id=") && status.is_some();
+    let is_structured_lifecycle = is_structured_lifecycle_progress(lower.as_str());
     let is_tool_result_progress = text.lines().any(is_tool_result_progress_line);
 
     is_policy_block_summary
-        || matches!(
-            status,
-            Some("blocked_by_security_policy" | "triggered" | "completed")
-        )
-        || is_structured_running
+        || status.is_some_and(is_lifecycle_status)
+        || is_structured_lifecycle
         || is_tool_result_progress
+}
+
+fn is_lifecycle_status(status: &str) -> bool {
+    LIFECYCLE_STATUSES.contains(&status)
+}
+
+fn is_structured_lifecycle_progress(text: &str) -> bool {
+    STRUCTURED_LIFECYCLE_TOKENS
+        .iter()
+        .any(|token| text.contains(token))
 }
 
 fn extract_status_value(text: &str) -> Option<&str> {
@@ -125,8 +145,21 @@ mod tests {
         let triggered = "⏱️ Cron triggered: id=job1 name=nightly type=shell\nschedule=every(1000ms)\ncommand=echo ok\nstatus=triggered";
         let running =
             "▶️ Cron running: id=job1 name=nightly type=shell\nstatus=shell command is now executing";
+        let blocked_without_status = "🚫 Cron blocked: id=job1 name=nightly type=shell\nschedule=every(1000ms)\npolicy=autonomy.allowed_commands; command=curl https://evil.example";
         assert!(is_high_priority_progress_update(triggered));
         assert!(is_high_priority_progress_update(running));
+        assert!(is_high_priority_progress_update(blocked_without_status));
+    }
+
+    #[test]
+    fn high_priority_progress_detects_structured_lifecycle_lines_without_source_prefix() {
+        let triggered = "triggered: id=job1 name=nightly type=shell\nstatus=triggered";
+        let running =
+            "running: id=job1 name=nightly type=shell\nstatus=shell command is now executing";
+        let blocked = "blocked: id=job1 name=nightly type=shell\npolicy=autonomy.allowed_commands; command=curl https://evil.example";
+        assert!(is_high_priority_progress_update(triggered));
+        assert!(is_high_priority_progress_update(running));
+        assert!(is_high_priority_progress_update(blocked));
     }
 
     #[test]
@@ -135,11 +168,20 @@ mod tests {
             "status=triggered\nreason=cron scheduling completed"
         ));
         assert!(is_high_priority_progress_update(
+            "status=running\nreason=cron execution in progress"
+        ));
+        assert!(is_high_priority_progress_update(
             "status=blocked_by_security_policy\nreason=command denied"
         ));
         assert!(!is_high_priority_progress_update(
             "status=ok\nreason=regular summary"
         ));
+    }
+
+    #[test]
+    fn high_priority_progress_detects_structured_completed_line() {
+        let completed = "✅ Cron completed: id=job1 name=nightly type=shell\nstatus=completed";
+        assert!(is_high_priority_progress_update(completed));
     }
 
     #[test]

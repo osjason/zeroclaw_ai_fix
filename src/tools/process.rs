@@ -510,9 +510,7 @@ mod tests {
     use super::*;
     use crate::config::{AuditConfig, SyscallAnomalyConfig};
     use crate::runtime::NativeRuntime;
-    use crate::security::policy::{
-        parse_security_policy_block_event, CommandPolicyViolation,
-    };
+    use crate::security::policy::{parse_security_policy_block_event, CommandPolicyViolation};
     use crate::security::{AutonomyLevel, SecurityPolicy, SyscallAnomalyDetector};
     use crate::tools::policy_blocked_result;
     use std::path::PathBuf;
@@ -713,6 +711,49 @@ mod tests {
             .expect("expected structured security policy block event");
         assert_eq!(event.policy_id, "autonomy.allowed_commands");
         assert_eq!(event.command_fragment, "rm -rf /");
+        assert!(event
+            .reason
+            .contains("Command not allowed by security policy"));
+    }
+
+    #[tokio::test]
+    async fn spawn_blocks_disallowed_command_matches_preflight_event_fields() {
+        let security = test_security();
+        let command = "rm -rf /";
+        let preflight = command_execution_preflight_result(security.as_ref(), command, false)
+            .expect("expected command preflight to block disallowed command");
+        assert!(!preflight.success);
+        let preflight_event = parse_security_policy_block_event(
+            preflight
+                .error
+                .as_deref()
+                .expect("preflight block should include structured error"),
+        )
+        .expect("preflight block should parse into structured policy event");
+
+        let tool = ProcessTool::new(security, test_runtime());
+        let spawn = tool
+            .execute(json!({
+                "action": "spawn",
+                "command": command
+            }))
+            .await
+            .unwrap();
+        assert!(!spawn.success);
+        let spawn_event = parse_security_policy_block_event(
+            spawn
+                .error
+                .as_deref()
+                .expect("spawn block should include structured error"),
+        )
+        .expect("spawn block should parse into structured policy event");
+
+        assert_eq!(spawn_event.policy_id, preflight_event.policy_id);
+        assert_eq!(
+            spawn_event.command_fragment,
+            preflight_event.command_fragment
+        );
+        assert_eq!(spawn_event.reason, preflight_event.reason);
     }
 
     #[tokio::test]

@@ -241,6 +241,28 @@ struct DraftEditState {
     edits_used: u32,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DraftUpdateAction {
+    SkipThrottled,
+    EditInPlace,
+    CreateContinuation(DraftContinuationReason),
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum DraftContinuationReason {
+    HighPriorityProgress,
+    EditCapReached,
+}
+
+impl DraftContinuationReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::HighPriorityProgress => "high_priority_progress",
+            Self::EditCapReached => "edit_cap_reached",
+        }
+    }
+}
+
 fn extract_lark_response_code(body: &serde_json::Value) -> Option<i64> {
     body.get("code").and_then(|c| c.as_i64())
 }
@@ -509,6 +531,22 @@ impl LarkChannel {
 
     fn draft_state_key(recipient: &str, message_id: &str) -> String {
         format!("{recipient}:{message_id}")
+    }
+
+    fn draft_update_action(&self, state: &DraftEditState, text: &str) -> DraftUpdateAction {
+        let elapsed_ms =
+            u64::try_from(state.last_edit_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if elapsed_ms < self.draft_update_interval_ms {
+            return if is_high_priority_progress_update(text) {
+                DraftUpdateAction::CreateContinuation(DraftContinuationReason::HighPriorityProgress)
+            } else {
+                DraftUpdateAction::SkipThrottled
+            };
+        }
+        if state.edits_used >= self.max_draft_edits {
+            return DraftUpdateAction::CreateContinuation(DraftContinuationReason::EditCapReached);
+        }
+        DraftUpdateAction::EditInPlace
     }
 
     async fn remove_draft_state(
@@ -1580,30 +1618,27 @@ impl Channel for LarkChannel {
 
         let draft_key = Self::draft_state_key(recipient, message_id);
         let mut active_message_id = message_id.to_string();
-        let mut should_create_continuation = false;
-        let force_visible_priority_message = is_high_priority_progress_update(text);
+        let mut continuation_reason: Option<DraftContinuationReason> = None;
         {
             let draft_state = self.draft_state.lock().await;
             if let Some(state) = draft_state.get(&draft_key) {
                 active_message_id = state.current_message_id.clone();
-                let elapsed_ms =
-                    u64::try_from(state.last_edit_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-                if elapsed_ms < self.draft_update_interval_ms {
-                    if force_visible_priority_message {
-                        should_create_continuation = true;
-                    } else {
+                match self.draft_update_action(state, text) {
+                    DraftUpdateAction::SkipThrottled => {
                         return Ok(None);
                     }
-                }
-                if state.edits_used >= self.max_draft_edits {
-                    should_create_continuation = true;
+                    DraftUpdateAction::CreateContinuation(reason) => {
+                        continuation_reason = Some(reason);
+                    }
+                    DraftUpdateAction::EditInPlace => {}
                 }
             }
         }
 
-        if should_create_continuation {
+        if let Some(reason) = continuation_reason {
             tracing::debug!(
-                "Lark draft edit cap reached for {active_message_id}; creating continuation progress message"
+                "Lark draft switching to continuation progress message for {active_message_id}; reason={}",
+                reason.as_str()
             );
             if let Some(new_message_id) = self.create_text_message(recipient, text).await? {
                 active_message_id = new_message_id;
@@ -3172,6 +3207,93 @@ mod tests {
             state.create_calls.load(Ordering::SeqCst),
             3,
             "expected one draft send + two immediate lifecycle continuation messages"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn lark_update_draft_triggered_running_and_blocked_progress_bypass_interval_throttle() {
+        let state = Arc::new(MockDraftApiState::default());
+        let app = Router::new()
+            .route(
+                "/open-apis/auth/v3/tenant_access_token/internal",
+                post(mock_tenant_token),
+            )
+            .route("/open-apis/im/v1/messages", post(mock_create_message))
+            .route(
+                "/open-apis/im/v1/messages/{message_id}",
+                patch(mock_patch_message_success),
+            )
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let base = format!("http://{addr}/open-apis");
+        let mut channel = LarkChannel::new(
+            "app_id".into(),
+            "app_secret".into(),
+            "verification_token".into(),
+            None,
+            vec!["*".into()],
+            false,
+        )
+        .with_api_base_override(base);
+        channel.draft_update_interval_ms = 60_000;
+
+        let recipient = "oc_test_chat";
+        let draft_id = channel
+            .send_draft(&SendMessage::new("initial", recipient))
+            .await
+            .unwrap()
+            .expect("draft id should exist");
+        assert_eq!(draft_id, "msg-root");
+
+        channel
+            .update_draft(
+                recipient,
+                &draft_id,
+                "⏱️ Cron triggered: id=job1 name=nightly type=shell\nschedule=every(1000ms)\ncommand=curl https://evil.example\nstatus=triggered",
+            )
+            .await
+            .unwrap();
+        channel
+            .update_draft(
+                recipient,
+                &draft_id,
+                "▶️ Cron running: id=job1 name=nightly type=shell\nstatus=shell command is now executing",
+            )
+            .await
+            .unwrap();
+        channel
+            .update_draft(
+                recipient,
+                &draft_id,
+                "🚫 Cron blocked: id=job1 name=nightly type=shell\nschedule=every(1000ms)\npolicy=autonomy.allowed_commands; command=curl https://evil.example\nstatus=blocked_by_security_policy\nreason=Command not allowed by security policy",
+            )
+            .await
+            .unwrap();
+        channel
+            .finalize_draft(recipient, &draft_id, "final answer")
+            .await
+            .unwrap();
+
+        let patched_message_ids = state.patched_message_ids.lock().await.clone();
+        assert!(
+            !patched_message_ids.iter().any(|id| id == "msg-root"),
+            "triggered/running/blocked progress should bypass throttled root edit and switch to continuation"
+        );
+        assert!(
+            patched_message_ids.iter().any(|id| id == "msg-fallback"),
+            "expected finalize to target continuation message after lifecycle progress"
+        );
+        assert_eq!(
+            state.create_calls.load(Ordering::SeqCst),
+            4,
+            "expected one draft send + three immediate lifecycle continuation messages"
         );
 
         server.abort();

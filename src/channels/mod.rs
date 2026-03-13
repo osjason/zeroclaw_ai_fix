@@ -792,21 +792,21 @@ fn default_progress_mode_for_channel(channel_name: &str) -> ProgressMode {
     }
 }
 
-fn is_verbose_only_progress_line(delta: &str) -> bool {
-    let trimmed = delta.trim_start();
-    trimmed.starts_with("\u{1f914} Thinking")
-        || trimmed.starts_with("\u{1f4ac} Got ")
-        || trimmed.starts_with("\u{21bb} Retrying")
-        || trimmed.starts_with("\u{26a0}\u{fe0f} Loop detected")
-}
-
 fn should_show_progress_update(mode: ProgressMode, delta: &str) -> bool {
     mode != ProgressMode::Off || is_high_priority_progress_update(delta)
 }
 
 fn should_skip_internal_progress_line(mode: ProgressMode, delta: &str) -> bool {
+    let is_high_priority = is_high_priority_progress_update(delta);
+    if is_high_priority {
+        return false;
+    }
+
+    if mode == ProgressMode::Compact {
+        return true;
+    }
+
     !should_show_progress_update(mode, delta)
-        || (mode == ProgressMode::Compact && is_verbose_only_progress_line(delta))
 }
 
 fn upsert_progress_section(accumulated: &mut String, block: &str) {
@@ -3759,7 +3759,8 @@ or tune thresholds in config.",
                 } else {
                     let (is_internal_progress, visible_delta) =
                         split_internal_progress_delta(&delta);
-                    if is_internal_progress && should_skip_internal_progress_line(mode, visible_delta)
+                    if is_internal_progress
+                        && should_skip_internal_progress_line(mode, visible_delta)
                     {
                         continue;
                     }
@@ -11862,6 +11863,66 @@ Done reminder set for 1:38 AM."#;
         let (is_internal_plain, plain) = split_internal_progress_delta("final answer");
         assert!(!is_internal_plain);
         assert_eq!(plain, "final answer");
+    }
+
+    #[test]
+    fn compact_mode_keeps_structured_lifecycle_progress_visible() {
+        let triggered = "⏱️ Cron triggered: id=job1 name=nightly type=shell\nschedule=every(1000ms)\ncommand=echo ok\nstatus=triggered";
+        let running = "▶️ Cron running: id=job1 name=nightly type=shell\nstatus=shell command is now executing";
+        let blocked = "🚫 Cron blocked: id=job1 name=nightly type=shell\nschedule=every(1000ms)\npolicy=autonomy.allowed_commands; command=curl https://evil.example\nstatus=blocked_by_security_policy\nreason=Command not allowed by security policy";
+
+        assert!(!should_skip_internal_progress_line(
+            ProgressMode::Compact,
+            triggered
+        ));
+        assert!(!should_skip_internal_progress_line(
+            ProgressMode::Compact,
+            running
+        ));
+        assert!(!should_skip_internal_progress_line(
+            ProgressMode::Compact,
+            blocked
+        ));
+        assert!(should_skip_internal_progress_line(
+            ProgressMode::Compact,
+            "🤔 Thinking about tool call..."
+        ));
+        assert!(should_skip_internal_progress_line(
+            ProgressMode::Compact,
+            "indexing workspace and preparing draft"
+        ));
+
+        assert!(!should_skip_internal_progress_line(
+            ProgressMode::Off,
+            triggered
+        ));
+        assert!(!should_skip_internal_progress_line(
+            ProgressMode::Off,
+            running
+        ));
+        assert!(!should_skip_internal_progress_line(
+            ProgressMode::Off,
+            blocked
+        ));
+        assert!(should_skip_internal_progress_line(
+            ProgressMode::Off,
+            "✅ tool finished"
+        ));
+        assert!(triggered.contains("status=triggered"));
+        assert!(running.contains("running: id=job1"));
+        assert!(blocked.contains("status=blocked_by_security_policy"));
+        assert!(blocked.contains("policy=autonomy.allowed_commands"));
+        assert!(blocked.contains("command=curl https://evil.example"));
+        assert!(blocked.contains("reason=Command not allowed by security policy"));
+    }
+
+    #[test]
+    fn compact_mode_prioritizes_structured_status_even_if_verbose_prefixed() {
+        let mixed = "↻ Retrying after malformed response\nstatus=triggered\nreason=cron scheduling completed";
+        assert!(!should_skip_internal_progress_line(
+            ProgressMode::Compact,
+            mixed
+        ));
     }
 
     #[test]

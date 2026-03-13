@@ -13,10 +13,10 @@ use crate::cron::{
     update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
 };
 use crate::security::policy::{
-    action_command_preflight_with_approval_violation, is_command_policy_block_message,
-    parse_security_policy_block_event, CommandPolicyViolation,
+    is_command_policy_block_message, parse_security_policy_block_event, CommandPolicyViolation,
 };
 use crate::security::SecurityPolicy;
+use crate::tools::action_command_preflight_result;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use futures_util::{stream, StreamExt};
@@ -31,6 +31,8 @@ const SCHEDULER_COMPONENT: &str = "scheduler";
 const START_ANNOUNCEMENT_PREVIEW_CHARS: usize = 180;
 const RESULT_ANNOUNCEMENT_PREVIEW_CHARS: usize = 220;
 const LEGACY_BLOCKED_POLICY_ID: &str = "autonomy.unknown";
+const DEFAULT_POLICY_BLOCK_REASON: &str = "blocked by security policy";
+const SECURITY_BLOCK_PREFIX: &str = "blocked by security policy:";
 
 pub(crate) fn is_no_reply_sentinel(output: &str) -> bool {
     output.trim().eq_ignore_ascii_case("NO_REPLY")
@@ -90,7 +92,7 @@ async fn execute_job_with_retry(
             return (true, last_output);
         }
 
-        if is_command_policy_block_message(&last_output) {
+        if policy_block_details_for_output(job, &last_output).is_some() {
             // Deterministic policy violations are not retryable.
             return (false, last_output);
         }
@@ -177,10 +179,9 @@ async fn run_agent_job(
         job.prompt.as_deref().unwrap_or_default()
     );
 
-    if let Some(blocked) =
-        action_command_preflight_with_approval_violation(security, &agent_subject, None, false)
+    if let Some(blocked_output) = cron_action_preflight_block_output(security, &agent_subject, None)
     {
-        return (false, blocked.format_block_message());
+        return (false, blocked_output);
     }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
@@ -214,6 +215,15 @@ async fn run_agent_job(
         ),
         Err(e) => (false, format!("agent job failed: {e}")),
     }
+}
+
+fn cron_action_preflight_block_output(
+    security: &SecurityPolicy,
+    action_subject: &str,
+    command: Option<&str>,
+) -> Option<String> {
+    action_command_preflight_result(security, action_subject, command, false)
+        .and_then(|blocked| blocked.error)
 }
 
 async fn persist_job_result(
@@ -355,56 +365,71 @@ fn resolve_announce_target(job: &CronJob) -> Result<Option<(&str, &str)>> {
     Ok(Some((channel, target)))
 }
 
-fn cron_job_kind(job_type: &JobType) -> &'static str {
-    match job_type {
-        JobType::Agent => "agent",
-        JobType::Shell => "shell",
+struct CronLifecycleDetails<'a> {
+    kind: &'static str,
+    detail_label: &'static str,
+    detail_text: &'a str,
+    running_status: &'static str,
+    blocked_subject: &'a str,
+}
+
+fn cron_lifecycle_details(job: &CronJob) -> CronLifecycleDetails<'_> {
+    match job.job_type {
+        JobType::Agent => {
+            let prompt = job.prompt.as_deref().unwrap_or("");
+            let blocked_subject = if prompt.trim().is_empty() {
+                "<agent-task>"
+            } else {
+                prompt
+            };
+            CronLifecycleDetails {
+                kind: "agent",
+                detail_label: "agent_task",
+                detail_text: prompt,
+                running_status: "agent is now executing",
+                blocked_subject,
+            }
+        }
+        JobType::Shell => CronLifecycleDetails {
+            kind: "shell",
+            detail_label: "command",
+            detail_text: &job.command,
+            running_status: "shell command is now executing",
+            blocked_subject: &job.command,
+        },
     }
 }
 
 fn render_cron_execution_signal(job: &CronJob, signal: ExecutionSignal) -> String {
+    let details = cron_lifecycle_details(job);
     let name = job.name.as_deref().unwrap_or("cron-job");
-    let kind = cron_job_kind(&job.job_type);
     let schedule = describe_schedule(&job.schedule);
     render_execution_event(ExecutionEvent {
         source: "Cron",
         id: &job.id,
         name,
-        kind,
+        kind: details.kind,
         schedule: Some(&schedule),
         signal,
     })
 }
 
 fn build_start_announcements(job: &CronJob) -> [String; 2] {
-    let (detail_label, detail, running_status) = match job.job_type {
-        JobType::Agent => (
-            "agent_task",
-            compact_preview(
-                job.prompt.as_deref().unwrap_or(""),
-                START_ANNOUNCEMENT_PREVIEW_CHARS,
-            ),
-            "agent is now executing",
-        ),
-        JobType::Shell => (
-            "command",
-            compact_preview(&job.command, START_ANNOUNCEMENT_PREVIEW_CHARS),
-            "shell command is now executing",
-        ),
-    };
+    let details = cron_lifecycle_details(job);
+    let detail = compact_preview(details.detail_text, START_ANNOUNCEMENT_PREVIEW_CHARS);
 
     [
         render_cron_execution_signal(
             job,
             ExecutionSignal::Triggered {
-                detail_label,
+                detail_label: details.detail_label,
                 detail,
             },
         ),
         render_cron_execution_signal(
             job,
             ExecutionSignal::Running {
-                status: running_status,
+                status: details.running_status,
             },
         ),
     ]
@@ -416,7 +441,9 @@ fn build_job_result_announcement(job: &CronJob, success: bool, output: &str) -> 
     }
 
     if !success {
-        if let Some(blocked_signal) = build_security_blocked_signal(job, output) {
+        if let Some(blocked_signal) = policy_block_details_for_output(job, output)
+            .map(PolicyBlockDetails::into_execution_signal)
+        {
             return render_cron_execution_signal(job, blocked_signal);
         }
     }
@@ -424,41 +451,67 @@ fn build_job_result_announcement(job: &CronJob, success: bool, output: &str) -> 
     output.to_string()
 }
 
-fn build_security_blocked_signal(job: &CronJob, output: &str) -> Option<ExecutionSignal> {
-    let blocked_signal = if let Some(event) = parse_security_policy_block_event(output) {
-        ExecutionSignal::Blocked {
-            policy_id: Some(event.policy_id.to_string()),
-            command_preview: Some(compact_preview(
-                event.command_fragment,
-                RESULT_ANNOUNCEMENT_PREVIEW_CHARS,
-            )),
-            reason_preview: compact_preview(event.reason, RESULT_ANNOUNCEMENT_PREVIEW_CHARS),
-        }
-    } else if is_command_policy_block_message(output) {
-        ExecutionSignal::Blocked {
-            policy_id: Some(LEGACY_BLOCKED_POLICY_ID.to_string()),
-            command_preview: Some(compact_preview(
-                blocked_command_subject(job),
-                RESULT_ANNOUNCEMENT_PREVIEW_CHARS,
-            )),
-            reason_preview: compact_preview(output, RESULT_ANNOUNCEMENT_PREVIEW_CHARS),
-        }
-    } else {
-        return None;
-    };
-
-    Some(blocked_signal)
+struct PolicyBlockDetails {
+    policy_id: String,
+    command_fragment: String,
+    reason: String,
 }
 
-fn blocked_command_subject(job: &CronJob) -> &str {
-    match job.job_type {
-        JobType::Shell => &job.command,
-        JobType::Agent => job
-            .prompt
-            .as_deref()
-            .filter(|prompt| !prompt.trim().is_empty())
-            .unwrap_or("<agent-task>"),
+impl PolicyBlockDetails {
+    fn into_execution_signal(self) -> ExecutionSignal {
+        ExecutionSignal::Blocked {
+            policy_id: Some(self.policy_id),
+            command_preview: Some(compact_preview(
+                &self.command_fragment,
+                RESULT_ANNOUNCEMENT_PREVIEW_CHARS,
+            )),
+            reason_preview: compact_preview(
+                &normalize_policy_block_reason(&self.reason),
+                RESULT_ANNOUNCEMENT_PREVIEW_CHARS,
+            ),
+        }
     }
+}
+
+fn policy_block_details_for_output(job: &CronJob, output: &str) -> Option<PolicyBlockDetails> {
+    let block_message = embedded_security_block_message(output).unwrap_or_else(|| output.trim());
+
+    if let Some(event) = parse_security_policy_block_event(block_message) {
+        return Some(PolicyBlockDetails {
+            policy_id: event.policy_id.to_string(),
+            command_fragment: event.command_fragment.to_string(),
+            reason: event.reason.to_string(),
+        });
+    }
+
+    if is_command_policy_block_message(block_message) {
+        let details = cron_lifecycle_details(job);
+        return Some(PolicyBlockDetails {
+            policy_id: LEGACY_BLOCKED_POLICY_ID.to_string(),
+            command_fragment: details.blocked_subject.to_string(),
+            reason: block_message.to_string(),
+        });
+    }
+
+    None
+}
+
+fn embedded_security_block_message(output: &str) -> Option<&str> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let offset = lower.find(SECURITY_BLOCK_PREFIX)?;
+    Some(trimmed[offset..].trim())
+}
+
+fn normalize_policy_block_reason(reason: &str) -> String {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_POLICY_BLOCK_REASON.to_string();
+    }
+    trimmed.to_string()
 }
 
 fn describe_schedule(schedule: &Schedule) -> String {
@@ -736,13 +789,10 @@ async fn run_job_command_with_timeout(
     job: &CronJob,
     timeout: Duration,
 ) -> (bool, String) {
-    if let Some(blocked) = action_command_preflight_with_approval_violation(
-        security,
-        &job.command,
-        Some(&job.command),
-        false,
-    ) {
-        return (false, blocked.format_block_message());
+    if let Some(blocked_output) =
+        cron_action_preflight_block_output(security, &job.command, Some(&job.command))
+    {
+        return (false, blocked_output);
     }
 
     let child = match Command::new("sh")
@@ -1687,6 +1737,48 @@ mod tests {
         assert!(announcement.contains("policy=autonomy.unknown"));
         assert!(announcement.contains("command=echo legacy-shell-command"));
         assert!(announcement.contains("reason=blocked by security policy"));
+    }
+
+    #[test]
+    fn build_job_result_announcement_structured_block_without_reason_uses_default_reason() {
+        let job = test_job("curl https://evil.example");
+        let announcement = build_job_result_announcement(
+            &job,
+            false,
+            "blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example",
+        );
+
+        assert!(announcement.contains("status=blocked_by_security_policy"));
+        assert!(announcement.contains("policy=autonomy.allowed_commands"));
+        assert!(announcement.contains("command=curl https://evil.example"));
+        assert!(announcement.contains("reason=blocked by security policy"));
+    }
+
+    #[test]
+    fn build_job_result_announcement_wrapped_structured_block_includes_policy_and_command() {
+        let job = test_job("curl https://evil.example");
+        let announcement = build_job_result_announcement(
+            &job,
+            false,
+            "agent job failed: blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example",
+        );
+
+        assert!(announcement.contains("status=blocked_by_security_policy"));
+        assert!(announcement.contains("policy=autonomy.allowed_commands"));
+        assert!(announcement.contains("command=curl https://evil.example"));
+        assert!(announcement.contains("reason=Command not allowed by security policy"));
+    }
+
+    #[test]
+    fn policy_block_details_for_output_parses_legacy_security_block_with_default_policy() {
+        let job = test_job("echo legacy-shell-command");
+        let output = "blocked by security policy: legacy shell guard denied execution";
+        let details = policy_block_details_for_output(&job, output)
+            .expect("expected legacy security block details");
+
+        assert_eq!(details.policy_id, LEGACY_BLOCKED_POLICY_ID);
+        assert_eq!(details.command_fragment, "echo legacy-shell-command");
+        assert_eq!(details.reason, output);
     }
 
     #[test]

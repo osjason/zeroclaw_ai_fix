@@ -1,4 +1,4 @@
-use super::cron_common::{ensure_cron_enabled, preflight_action_with_optional_command};
+use super::cron_common::{enforce_action_command_gate, ensure_cron_enabled};
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron::{self, DeliveryConfig, JobType, Schedule, SessionTarget};
@@ -13,6 +13,21 @@ pub struct CronAddTool {
 }
 
 const MIN_AGENT_EVERY_MS: u64 = 5 * 60 * 1000;
+const AGENT_RECURRING_CONFIRMATION_ERROR: &str =
+    "Agent jobs with recurring schedules require recurring_confirmed=true. \
+For one-time reminders, use schedule.kind='at' with an RFC3339 timestamp.";
+
+enum CronAddJob {
+    Shell {
+        command: String,
+    },
+    Agent {
+        prompt: String,
+        session_target: SessionTarget,
+        model: Option<String>,
+        delivery: Option<DeliveryConfig>,
+    },
+}
 
 impl CronAddTool {
     pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
@@ -135,7 +150,7 @@ impl Tool for CronAddTool {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        let result = match job_type {
+        let job = match job_type {
             JobType::Shell => {
                 let command = match args.get("command").and_then(serde_json::Value::as_str) {
                     Some(command) if !command.trim().is_empty() => command,
@@ -147,16 +162,9 @@ impl Tool for CronAddTool {
                         });
                     }
                 };
-                if let Some(blocked) = preflight_action_with_optional_command(
-                    &self.security,
-                    "cron_add",
-                    Some(command),
-                    approved,
-                ) {
-                    return Ok(blocked);
+                CronAddJob::Shell {
+                    command: command.to_string(),
                 }
-
-                cron::add_shell_job(&self.config, name, schedule, command)
             }
             JobType::Agent => {
                 let prompt = match args.get("prompt").and_then(serde_json::Value::as_str) {
@@ -199,11 +207,7 @@ impl Tool for CronAddTool {
                             return Ok(ToolResult {
                                 success: false,
                                 output: String::new(),
-                                error: Some(
-                                    "Agent jobs with recurring schedules require recurring_confirmed=true. \
-For one-time reminders, use schedule.kind='at' with an RFC3339 timestamp."
-                                        .to_string(),
-                                ),
+                                error: Some(AGENT_RECURRING_CONFIRMATION_ERROR.to_string()),
                             });
                         }
                         if *every_ms < MIN_AGENT_EVERY_MS {
@@ -221,11 +225,7 @@ For one-time reminders, use schedule.kind='at' with an RFC3339 timestamp."
                             return Ok(ToolResult {
                                 success: false,
                                 output: String::new(),
-                                error: Some(
-                                    "Agent jobs with recurring schedules require recurring_confirmed=true. \
-For one-time reminders, use schedule.kind='at' with an RFC3339 timestamp."
-                                        .to_string(),
-                                ),
+                                error: Some(AGENT_RECURRING_CONFIRMATION_ERROR.to_string()),
                             });
                         }
                     }
@@ -246,23 +246,44 @@ For one-time reminders, use schedule.kind='at' with an RFC3339 timestamp."
                     None => None,
                 };
 
-                if let Some(blocked) =
-                    preflight_action_with_optional_command(&self.security, "cron_add", None, approved)
-                {
-                    return Ok(blocked);
-                }
-
-                cron::add_agent_job(
-                    &self.config,
-                    name,
-                    schedule,
-                    prompt,
+                CronAddJob::Agent {
+                    prompt: prompt.to_string(),
                     session_target,
                     model,
                     delivery,
-                    delete_after_run,
-                )
+                }
             }
+        };
+
+        let command_for_preflight = match &job {
+            CronAddJob::Shell { command } => Some(command.as_str()),
+            CronAddJob::Agent { .. } => None,
+        };
+        if let Err(blocked) =
+            enforce_action_command_gate(&self.security, "cron_add", command_for_preflight, approved)
+        {
+            return Ok(blocked);
+        }
+
+        let result = match job {
+            CronAddJob::Shell { command } => {
+                cron::add_shell_job(&self.config, name, schedule, &command)
+            }
+            CronAddJob::Agent {
+                prompt,
+                session_target,
+                model,
+                delivery,
+            } => cron::add_agent_job(
+                &self.config,
+                name,
+                schedule,
+                &prompt,
+                session_target,
+                model,
+                delivery,
+                delete_after_run,
+            ),
         };
 
         match result {
@@ -293,6 +314,7 @@ mod tests {
     use crate::config::Config;
     use crate::security::policy::parse_security_policy_block_event;
     use crate::security::AutonomyLevel;
+    use crate::tools::action_command_preflight_result;
     use tempfile::TempDir;
 
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
@@ -364,6 +386,57 @@ mod tests {
         assert_eq!(event.policy_id, "autonomy.allowed_commands");
         assert_eq!(event.command_fragment, "curl https://example.com");
         assert!(event.reason.contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn blocks_disallowed_shell_command_matches_preflight_event_fields() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.autonomy.allowed_commands = vec!["echo".into()];
+        config.autonomy.level = AutonomyLevel::Supervised;
+        tokio::fs::create_dir_all(&config.workspace_dir)
+            .await
+            .unwrap();
+        let cfg = Arc::new(config);
+        let security = test_security(&cfg);
+        let command = "curl https://example.com";
+        let preflight =
+            action_command_preflight_result(security.as_ref(), "cron_add", Some(command), false)
+                .expect("expected cron_add preflight to block disallowed command");
+        assert!(!preflight.success);
+        let preflight_event = parse_security_policy_block_event(
+            preflight
+                .error
+                .as_deref()
+                .expect("preflight block should include structured error"),
+        )
+        .expect("preflight block should parse into structured policy event");
+
+        let tool = CronAddTool::new(cfg, security);
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": command
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let event = parse_security_policy_block_event(
+            result
+                .error
+                .as_deref()
+                .expect("cron_add block should include structured error"),
+        )
+        .expect("cron_add block should parse into structured policy event");
+
+        assert_eq!(event.policy_id, preflight_event.policy_id);
+        assert_eq!(event.command_fragment, preflight_event.command_fragment);
+        assert_eq!(event.reason, preflight_event.reason);
     }
 
     #[tokio::test]

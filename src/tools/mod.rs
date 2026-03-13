@@ -115,7 +115,7 @@ pub use web_search_tool::WebSearchTool;
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
-use crate::security::policy::command_policy_precheck_violation;
+use crate::security::policy::action_command_preflight_with_approval_violation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -131,36 +131,22 @@ pub(crate) fn policy_blocked_result(
     }
 }
 
+pub(crate) fn action_command_preflight_result(
+    security: &crate::security::SecurityPolicy,
+    action_subject: &str,
+    command: Option<&str>,
+    approved: bool,
+) -> Option<ToolResult> {
+    action_command_preflight_with_approval_violation(security, action_subject, command, approved)
+        .map(|reason| policy_blocked_result(&reason))
+}
+
 pub(crate) fn command_execution_preflight_result(
     security: &crate::security::SecurityPolicy,
     command: &str,
     approved: bool,
 ) -> Option<ToolResult> {
-    if security.is_rate_limited() {
-        return Some(ToolResult {
-            success: false,
-            output: String::new(),
-            error: Some(
-                crate::security::policy::rate_limit_precheck_policy_block_event(Some(command)),
-            ),
-        });
-    }
-
-    if let Some(reason) = command_policy_precheck_violation(security, command, approved) {
-        return Some(policy_blocked_result(&reason));
-    }
-
-    if !security.record_action() {
-        return Some(ToolResult {
-            success: false,
-            output: String::new(),
-            error: Some(
-                crate::security::policy::action_budget_exhausted_policy_block_event(Some(command)),
-            ),
-        });
-    }
-
-    None
+    action_command_preflight_result(security, command, Some(command), approved)
 }
 
 #[derive(Clone)]

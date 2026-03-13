@@ -2554,8 +2554,11 @@ pub(crate) async fn run_tool_call_loop(
                 loop_detector.record_call(&sig.0, &sig.1, &outcome.output, outcome.success);
             }
 
-            post_action_verification_turn
-                .observe_tool_call(&call.name, &call.arguments, outcome.success);
+            post_action_verification_turn.observe_tool_call(
+                &call.name,
+                &call.arguments,
+                outcome.success,
+            );
 
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }

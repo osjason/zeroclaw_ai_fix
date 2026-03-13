@@ -1,10 +1,7 @@
 use super::policy_blocked_result;
 use super::traits::ToolResult;
 use crate::config::Config;
-use crate::security::policy::{
-    action_budget_violation, action_command_preflight_with_approval_violation,
-    action_precheck_violation,
-};
+use crate::security::policy::{action_budget_violation, action_precheck_violation};
 use crate::security::SecurityPolicy;
 use serde_json::Value;
 
@@ -49,14 +46,13 @@ pub(crate) fn consume_action_budget(security: &SecurityPolicy, action: &str) -> 
     action_budget_violation(security, action).map(|blocked| policy_blocked_result(&blocked))
 }
 
-pub(crate) fn preflight_action_with_optional_command(
+pub(crate) fn enforce_action_command_gate(
     security: &SecurityPolicy,
     action: &str,
     command: Option<&str>,
     approved: bool,
-) -> Option<ToolResult> {
-    action_command_preflight_with_approval_violation(security, action, command, approved)
-        .map(|blocked| policy_blocked_result(&blocked))
+) -> Result<(), ToolResult> {
+    super::action_command_preflight_result(security, action, command, approved).map_or(Ok(()), Err)
 }
 
 fn missing_param(name: &str) -> ToolResult {
