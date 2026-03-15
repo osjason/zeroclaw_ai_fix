@@ -393,7 +393,7 @@ mod tests {
             .expect("cron_add should expose structured security block event");
         assert_eq!(event.policy_id, "autonomy.allowed_commands");
         assert_eq!(event.command_fragment, "curl https://example.com");
-        assert!(event.reason.contains("not allowed"));
+        assert!(event.reason.contains("Command blocked by allowed_commands"));
     }
 
     #[tokio::test]

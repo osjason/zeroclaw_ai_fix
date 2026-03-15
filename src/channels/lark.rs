@@ -1,6 +1,10 @@
 use super::ack_reaction::{select_ack_reaction, AckReactionContext, AckReactionContextChatType};
-use super::progress_event::should_force_draft_continuation;
+use super::progress_event::{
+    decide_draft_progress_update, DraftContinuationReason, DraftProgressState,
+    DraftProgressUpdateDecision,
+};
 use super::traits::{Channel, ChannelMessage, SendMessage};
+use crate::config::schema::{LarkChannelConfig, LarkChannelPlatform};
 use async_trait::async_trait;
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
@@ -11,11 +15,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
-
-const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
-const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
-const LARK_BASE_URL: &str = "https://open.larksuite.com/open-apis";
-const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
 
 const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &[
     "OK", "JIAYI", "APPLAUSE", "THUMBSUP", "MUSCLE", "SMILE", "DONE",
@@ -56,49 +55,6 @@ enum LarkAckLocale {
     ZhTw,
     En,
     Ja,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LarkPlatform {
-    Lark,
-    Feishu,
-}
-
-impl LarkPlatform {
-    fn api_base(self) -> &'static str {
-        match self {
-            Self::Lark => LARK_BASE_URL,
-            Self::Feishu => FEISHU_BASE_URL,
-        }
-    }
-
-    fn ws_base(self) -> &'static str {
-        match self {
-            Self::Lark => LARK_WS_BASE_URL,
-            Self::Feishu => FEISHU_WS_BASE_URL,
-        }
-    }
-
-    fn locale_header(self) -> &'static str {
-        match self {
-            Self::Lark => "en",
-            Self::Feishu => "zh",
-        }
-    }
-
-    fn proxy_service_key(self) -> &'static str {
-        match self {
-            Self::Lark => "channel.lark",
-            Self::Feishu => "channel.feishu",
-        }
-    }
-
-    fn channel_name(self) -> &'static str {
-        match self {
-            Self::Lark => "lark",
-            Self::Feishu => "feishu",
-        }
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -242,23 +198,53 @@ struct DraftEditState {
     last_rendered_text: String,
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum DraftUpdateAction {
-    SkipThrottled,
-    EditInPlace,
-    CreateContinuation(DraftContinuationReason),
+impl DraftEditState {
+    fn retained_message_id(&self) -> Option<&str> {
+        let current_message_id = self.current_message_id.trim();
+        (!current_message_id.is_empty()).then_some(current_message_id)
+    }
+
+    fn into_retained_message_id(self) -> Option<String> {
+        let current_message_id = self.current_message_id.trim().to_string();
+        (!current_message_id.is_empty()).then_some(current_message_id)
+    }
+}
+
+struct DraftMessageResolver;
+
+impl DraftMessageResolver {
+    fn resolve(current_message_id: Option<String>, fallback_message_id: &str) -> Option<String> {
+        current_message_id
+            .filter(|message_id| !message_id.trim().is_empty())
+            .or_else(|| {
+                (!fallback_message_id.trim().is_empty()).then(|| fallback_message_id.to_string())
+            })
+    }
+
+    fn from_state_ref(state: Option<&DraftEditState>, fallback_message_id: &str) -> Option<String> {
+        Self::resolve(
+            state
+                .and_then(DraftEditState::retained_message_id)
+                .map(str::to_string),
+            fallback_message_id,
+        )
+    }
+
+    fn from_state_owned(
+        state: Option<DraftEditState>,
+        fallback_message_id: &str,
+    ) -> Option<String> {
+        Self::resolve(
+            state.and_then(DraftEditState::into_retained_message_id),
+            fallback_message_id,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-struct DraftUpdatePlan {
+struct DraftUpdateTarget {
     active_message_id: String,
-    action: DraftUpdateAction,
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum DraftContinuationReason {
-    HighPriorityProgress,
-    EditCapReached,
+    decision: DraftProgressUpdateDecision,
 }
 
 impl DraftContinuationReason {
@@ -348,7 +334,7 @@ pub struct LarkChannel {
     /// Bot open_id resolved at runtime via `/bot/v3/info`.
     resolved_bot_open_id: Arc<StdRwLock<Option<String>>>,
     mention_only: bool,
-    platform: LarkPlatform,
+    platform: LarkChannelPlatform,
     api_base_override: Option<String>,
     /// How to receive events: WebSocket long-connection or HTTP webhook.
     receive_mode: crate::config::schema::LarkReceiveMode,
@@ -363,6 +349,22 @@ pub struct LarkChannel {
 }
 
 impl LarkChannel {
+    pub(crate) fn from_channel_config(config: &(impl LarkChannelConfig + ?Sized)) -> Self {
+        let mut ch = Self::new_with_platform(
+            config.app_id().to_string(),
+            config.app_secret().to_string(),
+            config.verification_token().unwrap_or_default().to_string(),
+            config.port(),
+            config.allowed_users().to_vec(),
+            config.requires_mention(),
+            config.platform(),
+        );
+        ch.receive_mode = config.receive_mode();
+        ch.draft_update_interval_ms = config.draft_update_interval_ms();
+        ch.max_draft_edits = config.max_draft_edits();
+        ch
+    }
+
     pub fn new(
         app_id: String,
         app_secret: String,
@@ -378,7 +380,7 @@ impl LarkChannel {
             port,
             allowed_users,
             mention_only,
-            LarkPlatform::Lark,
+            LarkChannelPlatform::Lark,
         )
     }
 
@@ -389,7 +391,7 @@ impl LarkChannel {
         port: Option<u16>,
         allowed_users: Vec<String>,
         mention_only: bool,
-        platform: LarkPlatform,
+        platform: LarkChannelPlatform,
     ) -> Self {
         Self {
             app_id,
@@ -412,59 +414,17 @@ impl LarkChannel {
         }
     }
 
-    /// Build from `LarkConfig` using legacy compatibility:
-    /// when `use_feishu=true`, this instance routes to Feishu endpoints.
+    /// Build from `LarkConfig`, preserving legacy `use_feishu=true` endpoint selection.
     pub fn from_config(config: &crate::config::schema::LarkConfig) -> Self {
-        let platform = if config.use_feishu {
-            LarkPlatform::Feishu
-        } else {
-            LarkPlatform::Lark
-        };
-        let mut ch = Self::new_with_platform(
-            config.app_id.clone(),
-            config.app_secret.clone(),
-            config.verification_token.clone().unwrap_or_default(),
-            config.port,
-            config.allowed_users.clone(),
-            config.effective_group_reply_mode().requires_mention(),
-            platform,
-        );
-        ch.receive_mode = config.receive_mode.clone();
-        ch.draft_update_interval_ms = config.draft_update_interval_ms;
-        ch.max_draft_edits = config.max_draft_edits;
-        ch
+        Self::from_channel_config(config)
     }
 
     pub fn from_lark_config(config: &crate::config::schema::LarkConfig) -> Self {
-        let mut ch = Self::new_with_platform(
-            config.app_id.clone(),
-            config.app_secret.clone(),
-            config.verification_token.clone().unwrap_or_default(),
-            config.port,
-            config.allowed_users.clone(),
-            config.effective_group_reply_mode().requires_mention(),
-            LarkPlatform::Lark,
-        );
-        ch.receive_mode = config.receive_mode.clone();
-        ch.draft_update_interval_ms = config.draft_update_interval_ms;
-        ch.max_draft_edits = config.max_draft_edits;
-        ch
+        Self::from_channel_config(config)
     }
 
     pub fn from_feishu_config(config: &crate::config::schema::FeishuConfig) -> Self {
-        let mut ch = Self::new_with_platform(
-            config.app_id.clone(),
-            config.app_secret.clone(),
-            config.verification_token.clone().unwrap_or_default(),
-            config.port,
-            config.allowed_users.clone(),
-            config.effective_group_reply_mode().requires_mention(),
-            LarkPlatform::Feishu,
-        );
-        ch.receive_mode = config.receive_mode.clone();
-        ch.draft_update_interval_ms = config.draft_update_interval_ms;
-        ch.max_draft_edits = config.max_draft_edits;
-        ch
+        Self::from_channel_config(config)
     }
 
     pub fn with_ack_reaction(
@@ -486,7 +446,7 @@ impl LarkChannel {
     }
 
     fn channel_name(&self) -> &'static str {
-        self.platform.channel_name()
+        self.platform.runtime_channel_name()
     }
 
     fn api_base(&self) -> &str {
@@ -560,58 +520,28 @@ impl LarkChannel {
         state.last_rendered_text = last_rendered_text.to_string();
     }
 
-    fn draft_update_action(&self, state: Option<&DraftEditState>, text: &str) -> DraftUpdateAction {
-        let Some(state) = state else {
-            return self
-                .draft_continuation_reason(None, text)
-                .map(DraftUpdateAction::CreateContinuation)
-                .unwrap_or(DraftUpdateAction::EditInPlace);
-        };
-
-        if state.last_rendered_text == text {
-            return DraftUpdateAction::SkipThrottled;
-        }
-
-        if let Some(reason) = self.draft_continuation_reason(Some(state), text) {
-            return DraftUpdateAction::CreateContinuation(reason);
-        }
-
-        let elapsed_ms =
-            u64::try_from(state.last_edit_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-        if elapsed_ms < self.draft_update_interval_ms {
-            return DraftUpdateAction::SkipThrottled;
-        }
-        DraftUpdateAction::EditInPlace
-    }
-
-    fn draft_continuation_reason(
-        &self,
-        state: Option<&DraftEditState>,
-        text: &str,
-    ) -> Option<DraftContinuationReason> {
-        if should_force_draft_continuation(text) {
-            return Some(DraftContinuationReason::HighPriorityProgress);
-        }
-
-        state
-            .filter(|state| state.edits_used >= self.max_draft_edits)
-            .map(|_| DraftContinuationReason::EditCapReached)
-    }
-
     fn plan_draft_update(
         &self,
         state: Option<&DraftEditState>,
         root_message_id: &str,
         text: &str,
-    ) -> DraftUpdatePlan {
-        let active_message_id = state
-            .map(|state| state.current_message_id.clone())
-            .unwrap_or_else(|| root_message_id.to_string());
-
-        DraftUpdatePlan {
+    ) -> Option<DraftUpdateTarget> {
+        let active_message_id = DraftMessageResolver::from_state_ref(state, root_message_id)
+            .expect("root draft message id should resolve during draft updates");
+        let decision = decide_draft_progress_update(
+            text,
+            state.map(|state| DraftProgressState {
+                last_rendered_text: Some(state.last_rendered_text.as_str()),
+                elapsed_since_last: Some(state.last_edit_at.elapsed()),
+                edits_used: state.edits_used,
+            }),
+            self.draft_update_interval_ms,
+            self.max_draft_edits,
+        );
+        (!matches!(decision, DraftProgressUpdateDecision::Skip)).then_some(DraftUpdateTarget {
             active_message_id,
-            action: self.draft_update_action(state, text),
-        }
+            decision,
+        })
     }
 
     async fn create_draft_continuation(
@@ -633,20 +563,61 @@ impl LarkChannel {
         Ok(next_message_id)
     }
 
-    async fn apply_draft_continuation(
+    async fn update_message_or_send_fallback(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        operation: &str,
+    ) -> anyhow::Result<String> {
+        match self.update_text_message(message_id, text).await {
+            Ok(()) => Ok(message_id.to_string()),
+            Err(error) => {
+                tracing::warn!(
+                    "Lark {operation} edit failed for {message_id}: {error}; sending fallback message"
+                );
+                Ok(self
+                    .create_text_message(recipient, text)
+                    .await?
+                    .unwrap_or_else(|| message_id.to_string()))
+            }
+        }
+    }
+
+    async fn apply_draft_update_plan(
         &self,
         draft_key: String,
         recipient: &str,
-        active_message_id: String,
         text: &str,
-        reason: DraftContinuationReason,
-    ) -> anyhow::Result<()> {
-        let active_message_id = self
-            .create_draft_continuation(recipient, active_message_id, text, reason)
-            .await?;
-        self.store_draft_state(draft_key, active_message_id, text, 0)
+        plan: Option<DraftUpdateTarget>,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(target) = plan else {
+            return Ok(None);
+        };
+        let previous_message_id = target.active_message_id.clone();
+        let (active_message_id, next_edits_used) = match target.decision {
+            DraftProgressUpdateDecision::CreateContinuation { reason } => (
+                self.create_draft_continuation(recipient, target.active_message_id, text, reason)
+                    .await?,
+                0,
+            ),
+            DraftProgressUpdateDecision::EditInPlace { next_edits_used } => (
+                self.update_message_or_send_fallback(
+                    recipient,
+                    &target.active_message_id,
+                    text,
+                    "update_draft",
+                )
+                .await?,
+                next_edits_used,
+            ),
+            DraftProgressUpdateDecision::Skip => return Ok(None),
+        };
+        let continuation_message_id =
+            (active_message_id != previous_message_id).then(|| active_message_id.clone());
+        self.store_draft_state(draft_key, active_message_id, text, next_edits_used)
             .await;
-        Ok(())
+        Ok(continuation_message_id)
     }
 
     async fn remove_draft_state(
@@ -658,6 +629,17 @@ impl LarkChannel {
             .lock()
             .await
             .remove(&Self::draft_state_key(recipient, root_message_id))
+    }
+
+    async fn take_draft_message_id(
+        &self,
+        recipient: &str,
+        root_message_id: &str,
+    ) -> Option<String> {
+        DraftMessageResolver::from_state_owned(
+            self.remove_draft_state(recipient, root_message_id).await,
+            root_message_id,
+        )
     }
 
     fn build_text_payload(recipient: &str, text: &str) -> serde_json::Value {
@@ -1721,45 +1703,8 @@ impl Channel for LarkChannel {
             let state = draft_state.get(&draft_key);
             self.plan_draft_update(state, message_id, text)
         };
-
-        match plan.action {
-            DraftUpdateAction::SkipThrottled => return Ok(None),
-            DraftUpdateAction::CreateContinuation(reason) => {
-                self.apply_draft_continuation(
-                    draft_key,
-                    recipient,
-                    plan.active_message_id,
-                    text,
-                    reason,
-                )
-                .await?;
-                return Ok(None);
-            }
-            DraftUpdateAction::EditInPlace => {}
-        }
-
-        let mut active_message_id = plan.active_message_id;
-        match self.update_text_message(&active_message_id, text).await {
-            Ok(()) => {}
-            Err(error) => {
-                tracing::warn!(
-                    "Lark update_draft edit failed for {active_message_id}: {error}; sending fallback progress message"
-                );
-                if let Some(new_message_id) = self.create_text_message(recipient, text).await? {
-                    active_message_id = new_message_id;
-                }
-            }
-        }
-        let next_edits_used = {
-            let draft_state = self.draft_state.lock().await;
-            draft_state
-                .get(&draft_key)
-                .map_or(0, |state| state.edits_used)
-                .saturating_add(1)
-        };
-        self.store_draft_state(draft_key, active_message_id, text, next_edits_used)
-            .await;
-        Ok(None)
+        self.apply_draft_update_plan(draft_key, recipient, text, plan)
+            .await
     }
 
     async fn finalize_draft(
@@ -1770,45 +1715,28 @@ impl Channel for LarkChannel {
     ) -> anyhow::Result<()> {
         let cleaned_text = super::strip_tool_call_tags(text);
         let resolved_message_id = self
-            .remove_draft_state(recipient, message_id)
+            .take_draft_message_id(recipient, message_id)
             .await
-            .map(|state| state.current_message_id)
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| message_id.to_string());
+            .unwrap_or_default();
 
         if resolved_message_id.trim().is_empty() {
             let _ = self.create_text_message(recipient, &cleaned_text).await?;
             return Ok(());
         }
 
-        match self
-            .update_text_message(&resolved_message_id, &cleaned_text)
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                tracing::warn!(
-                    "Lark finalize_draft edit failed for {resolved_message_id}: {error}; sending fallback message"
-                );
-                let _ = self.create_text_message(recipient, &cleaned_text).await?;
-                Ok(())
-            }
-        }
+        let _ = self
+            .update_message_or_send_fallback(
+                recipient,
+                &resolved_message_id,
+                &cleaned_text,
+                "finalize_draft",
+            )
+            .await?;
+        Ok(())
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
-        let resolved_message_id = self
-            .remove_draft_state(recipient, message_id)
-            .await
-            .map(|state| state.current_message_id)
-            .filter(|value| !value.trim().is_empty())
-            .or_else(|| {
-                if message_id.trim().is_empty() {
-                    None
-                } else {
-                    Some(message_id.to_string())
-                }
-            });
+        let resolved_message_id = self.take_draft_message_id(recipient, message_id).await;
         let Some(resolved_message_id) = resolved_message_id else {
             return Ok(());
         };
@@ -2340,7 +2268,8 @@ mod tests {
         render_cron_blocked_announcement_with_descriptor,
         render_cron_result_announcement_with_descriptor,
         render_cron_start_announcements_with_descriptor,
-        render_tool_policy_block_progress_summary_from_parts, CronLifecycleDescriptor,
+        render_tool_policy_block_progress_summary_from_parts, should_force_draft_continuation,
+        CronLifecycleDescriptor, CronLifecycleRenderLimits,
     };
     use axum::{extract::Path, extract::State, routing::patch, routing::post, Json, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2366,13 +2295,56 @@ mod tests {
         )
     }
 
+    #[test]
+    fn draft_message_resolver_prefers_retained_state_message_id() {
+        let state = DraftEditState {
+            current_message_id: "msg-fallback".into(),
+            last_edit_at: Instant::now(),
+            edits_used: 1,
+            last_rendered_text: "progress".into(),
+        };
+
+        let target = DraftMessageResolver::from_state_ref(Some(&state), "msg-root")
+            .expect("draft target should resolve");
+
+        assert_eq!(target, "msg-fallback");
+    }
+
+    #[test]
+    fn draft_message_resolver_falls_back_when_state_is_missing_or_blank() {
+        assert_eq!(
+            DraftMessageResolver::from_state_ref(None, "msg-root")
+                .expect("fallback target should resolve"),
+            "msg-root"
+        );
+
+        let state = DraftEditState {
+            current_message_id: "   ".into(),
+            last_edit_at: Instant::now(),
+            edits_used: 0,
+            last_rendered_text: String::new(),
+        };
+        assert_eq!(
+            DraftMessageResolver::from_state_owned(Some(state), "msg-root")
+                .expect("fallback target should resolve"),
+            "msg-root"
+        );
+    }
+
+    const CRON_TEST_RENDER_LIMITS: CronLifecycleRenderLimits = CronLifecycleRenderLimits {
+        detail_max_chars: 180,
+        output_preview_max_chars: 96,
+        command_max_chars: 96,
+        reason_max_chars: 120,
+    };
+
     fn cron_triggered_running(command: &str) -> [String; 2] {
         render_cron_start_announcements_with_descriptor(
             "job1",
             "nightly",
             "every(1000ms)",
             CronLifecycleDescriptor::Shell { command },
-            180,
+            CRON_TEST_RENDER_LIMITS,
         )
     }
 
@@ -2385,8 +2357,7 @@ mod tests {
             "autonomy.allowed_commands",
             reason,
             Some(command),
-            96,
-            120,
+            CRON_TEST_RENDER_LIMITS,
         )
         .expect("cron blocked lifecycle message should render")
     }
@@ -2399,9 +2370,7 @@ mod tests {
             CronLifecycleDescriptor::Shell { command: "echo ok" },
             true,
             output_preview,
-            96,
-            96,
-            120,
+            CRON_TEST_RENDER_LIMITS,
         )
         .expect("cron completed lifecycle message should render")
     }
@@ -2906,8 +2875,8 @@ mod tests {
 
         let ch = LarkChannel::from_config(&cfg);
 
-        assert_eq!(ch.api_base(), LARK_BASE_URL);
-        assert_eq!(ch.ws_base(), LARK_WS_BASE_URL);
+        assert_eq!(ch.api_base(), LarkChannelPlatform::Lark.api_base());
+        assert_eq!(ch.ws_base(), LarkChannelPlatform::Lark.ws_base());
         assert_eq!(ch.receive_mode, LarkReceiveMode::Webhook);
         assert_eq!(ch.port, Some(9898));
         assert_eq!(
@@ -2921,7 +2890,7 @@ mod tests {
     }
 
     #[test]
-    fn lark_from_lark_config_ignores_legacy_feishu_flag() {
+    fn lark_from_lark_config_preserves_legacy_feishu_flag() {
         use crate::config::schema::{LarkConfig, LarkReceiveMode};
 
         let cfg = LarkConfig {
@@ -2943,9 +2912,9 @@ mod tests {
 
         let ch = LarkChannel::from_lark_config(&cfg);
 
-        assert_eq!(ch.api_base(), LARK_BASE_URL);
-        assert_eq!(ch.ws_base(), LARK_WS_BASE_URL);
-        assert_eq!(ch.name(), "lark");
+        assert_eq!(ch.api_base(), LarkChannelPlatform::Feishu.api_base());
+        assert_eq!(ch.ws_base(), LarkChannelPlatform::Feishu.ws_base());
+        assert_eq!(ch.name(), "feishu");
     }
 
     #[test]
@@ -2969,8 +2938,8 @@ mod tests {
 
         let ch = LarkChannel::from_feishu_config(&cfg);
 
-        assert_eq!(ch.api_base(), FEISHU_BASE_URL);
-        assert_eq!(ch.ws_base(), FEISHU_WS_BASE_URL);
+        assert_eq!(ch.api_base(), LarkChannelPlatform::Feishu.api_base());
+        assert_eq!(ch.ws_base(), LarkChannelPlatform::Feishu.ws_base());
         assert_eq!(ch.name(), "feishu");
         assert!(ch.supports_draft_updates());
     }
@@ -3425,6 +3394,55 @@ mod tests {
             2,
             "expected one draft send + one continuation message for high-priority progress"
         );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn lark_update_draft_returns_new_message_id_for_continuation() {
+        let state = Arc::new(MockDraftApiState::default());
+        let app = Router::new()
+            .route(
+                "/open-apis/auth/v3/tenant_access_token/internal",
+                post(mock_tenant_token),
+            )
+            .route("/open-apis/im/v1/messages", post(mock_create_message))
+            .route(
+                "/open-apis/im/v1/messages/{message_id}",
+                patch(mock_patch_message_success),
+            )
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let base = format!("http://{addr}/open-apis");
+        let mut channel = LarkChannel::new(
+            "app_id".into(),
+            "app_secret".into(),
+            "verification_token".into(),
+            None,
+            vec!["*".into()],
+            false,
+        )
+        .with_api_base_override(base);
+        channel.draft_update_interval_ms = 60_000;
+
+        let recipient = "oc_test_chat";
+        let draft_id = channel
+            .send_draft(&SendMessage::new("initial", recipient))
+            .await
+            .unwrap()
+            .expect("draft id should exist");
+
+        let next_draft_id = channel
+            .update_draft(recipient, &draft_id, &cron_triggered_running("echo ok")[0])
+            .await
+            .unwrap();
+
+        assert_eq!(next_draft_id.as_deref(), Some("msg-fallback"));
 
         server.abort();
     }
@@ -4054,7 +4072,8 @@ mod tests {
             .expect("content JSON should include text field");
 
         assert!(rendered.contains("policy=autonomy.allowed_commands"));
-        assert!(rendered.contains("command=cat /etc/passwd"));
+        assert!(rendered.contains("cat /etc/passwd"));
+        assert!(rendered.contains("command=shell cat /etc/passwd"));
         assert_eq!(rendered, progress_line);
     }
 

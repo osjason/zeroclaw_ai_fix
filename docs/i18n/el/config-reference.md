@@ -32,7 +32,13 @@
     - `supervised`: Χρειάζεται την έγκρισή σας για σημαντικές ενέργειες (προεπιλογή).
     - `full`: Μπορεί να τρέχει εντολές ελεύθερα (προσοχή!).
 - `allowed_commands`: Λίστα με τις εντολές που επιτρέπεται να τρέχει η AI.
+- `unrestricted_commands`: Break-glass λευκή λίστα που παρακάμπτει όλα τα shell policy gates για τις εντολές που ταιριάζουν.
 - `forbidden_paths`: Φάκελοι που η AI **δεν** επιτρέπεται να αγγίξει (π.χ. `/etc`).
+
+Σημειώσεις:
+
+- Το `allowed_commands` ανοίγει μόνο το allowlist ονομάτων/μονοπατιών εντολών. Τα υπόλοιπα shell guardrails παραμένουν ενεργά.
+- Το `unrestricted_commands` είναι το πραγματικό hard whitelist: παρακάμπτει `allowed_commands`, `command_context_rules`, path guards, shell-structure guards, read-only/autonomy prechecks και approval/risk gates. Κρατήστε το πολύ στενό.
 
 ## 3. Μνήμη (Memory)
 

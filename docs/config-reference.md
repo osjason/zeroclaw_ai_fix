@@ -857,6 +857,7 @@ Environment overrides:
 | `level` | `supervised` | `read_only`, `supervised`, or `full` |
 | `workspace_only` | `true` | reject absolute path inputs unless explicitly disabled |
 | `allowed_commands` | _required for shell execution_ | allowlist of executable names, explicit executable paths, or `"*"` |
+| `unrestricted_commands` | `[]` | hard whitelist that bypasses shell policy gates for explicitly matched commands |
 | `forbidden_paths` | built-in protected list | explicit path denylist (system paths + sensitive dotdirs by default) |
 | `allowed_roots` | `[]` | additional roots allowed outside workspace after canonicalization |
 | `max_actions_per_hour` | `20` | per-policy action budget |
@@ -878,6 +879,8 @@ Notes:
 - Access outside the workspace requires `allowed_roots`, even when `workspace_only = false`.
 - `allowed_roots` supports absolute paths, `~/...`, and workspace-relative paths.
 - `allowed_commands` entries can be command names (for example, `"git"`), explicit executable paths (for example, `"/usr/bin/antigravity"`), or `"*"` to allow any command name/path (risk gates still apply).
+- `unrestricted_commands` is the true break-glass shell whitelist. Matching entries bypass `allowed_commands`, `command_context_rules`, path guards, shell-structure guards, read-only/autonomy prechecks, and approval/risk gates for that command. Keep this list narrowly scoped and prefer `allowed_commands` for normal operation.
+- `unrestricted_commands` uses the same matcher shapes as `allowed_commands`: command names, explicit executable paths, or `"*"` (which effectively disables shell command policy for all commands and should not be used in production).
 - `file_read` blocks sensitive secret-bearing files/directories by default. Set `allow_sensitive_file_reads = true` only for controlled debugging sessions.
 - `file_write` and `file_edit` block sensitive secret-bearing files/directories by default. Set `allow_sensitive_file_writes = true` only for controlled break-glass sessions.
 - `file_read`, `file_write`, and `file_edit` refuse multiply-linked files (hard-link guard) to reduce workspace path bypass risk via hard-link escapes.

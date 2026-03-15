@@ -3449,6 +3449,15 @@ pub struct AutonomyConfig {
     #[serde(default)]
     pub allow_unsafe_shell_structures: bool,
 
+    /// Executables that bypass shell command policy checks entirely.
+    ///
+    /// Matching commands skip `allowed_commands`, `command_context_rules`,
+    /// path guards, shell-structure guards, read-only/autonomy prechecks, and
+    /// risk/approval gates. Keep this list narrow because entries here are
+    /// intentionally outside the normal `[autonomy]` shell safety rails.
+    #[serde(default)]
+    pub unrestricted_commands: Vec<String>,
+
     /// Additional environment variables allowed for shell tool subprocesses.
     ///
     /// These names are explicitly allowlisted and merged with the built-in safe
@@ -3643,6 +3652,155 @@ fn validate_command_context_path_prefixes(
     Ok(())
 }
 
+fn validate_unique_entries<T, F>(
+    values: &[T],
+    duplicate_error_prefix: &str,
+    mut normalize: F,
+) -> Result<()>
+where
+    F: FnMut(usize, &T) -> Result<String>,
+{
+    let mut seen = std::collections::HashSet::new();
+    for (index, value) in values.iter().enumerate() {
+        let normalized = normalize(index, value)?;
+        if !seen.insert(normalized.clone()) {
+            anyhow::bail!("{duplicate_error_prefix} contains duplicate entry: {normalized}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_non_cli_excluded_tool(index: usize, tool_name: &str) -> Result<String> {
+    let normalized = tool_name.trim();
+    if normalized.is_empty() {
+        anyhow::bail!("autonomy.non_cli_excluded_tools[{index}] must not be empty");
+    }
+    if !normalized
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        anyhow::bail!(
+            "autonomy.non_cli_excluded_tools[{index}] contains invalid characters: {normalized}"
+        );
+    }
+    Ok(normalized.to_string())
+}
+
+struct AutonomyConfigValidator<'a> {
+    autonomy: &'a AutonomyConfig,
+}
+
+impl<'a> AutonomyConfigValidator<'a> {
+    fn new(autonomy: &'a AutonomyConfig) -> Self {
+        Self { autonomy }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.autonomy.max_actions_per_hour == 0 {
+            anyhow::bail!("autonomy.max_actions_per_hour must be greater than 0");
+        }
+
+        self.validate_allowed_commands()?;
+        self.validate_unrestricted_commands()?;
+        self.validate_shell_env_passthrough()?;
+        self.validate_command_context_rules()?;
+        self.validate_non_cli_excluded_tools()?;
+        Ok(())
+    }
+
+    fn validate_allowed_commands(&self) -> Result<()> {
+        self.validate_command_entries(
+            &self.autonomy.allowed_commands,
+            "autonomy.allowed_commands",
+            allowed_command_field,
+        )
+    }
+
+    fn validate_unrestricted_commands(&self) -> Result<()> {
+        self.validate_command_entries(
+            &self.autonomy.unrestricted_commands,
+            "autonomy.unrestricted_commands",
+            unrestricted_command_field,
+        )
+    }
+
+    fn validate_command_entries<F>(
+        &self,
+        commands: &[String],
+        field: &str,
+        entry_field: F,
+    ) -> Result<()>
+    where
+        F: Fn(usize) -> String,
+    {
+        validate_unique_entries(commands, field, |index, command| {
+            validate_command_matcher(command, &entry_field(index), true)?;
+            Ok(command.trim().to_ascii_lowercase())
+        })
+    }
+
+    fn validate_shell_env_passthrough(&self) -> Result<()> {
+        for (index, env_name) in self.autonomy.shell_env_passthrough.iter().enumerate() {
+            if !is_valid_env_var_name(env_name) {
+                anyhow::bail!(
+                    "autonomy.shell_env_passthrough[{index}] is invalid ({env_name}); expected [A-Za-z_][A-Za-z0-9_]*"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_command_context_rules(&self) -> Result<()> {
+        for (index, rule) in self.autonomy.command_context_rules.iter().enumerate() {
+            validate_autonomy_command_context_rule(index, rule)?;
+        }
+        Ok(())
+    }
+
+    fn validate_non_cli_excluded_tools(&self) -> Result<()> {
+        validate_unique_entries(
+            &self.autonomy.non_cli_excluded_tools,
+            "autonomy.non_cli_excluded_tools",
+            |index, tool_name| validate_non_cli_excluded_tool(index, tool_name),
+        )
+    }
+}
+
+fn allowed_command_field(index: usize) -> String {
+    format!("autonomy.allowed_commands[{index}]")
+}
+
+fn unrestricted_command_field(index: usize) -> String {
+    format!("autonomy.unrestricted_commands[{index}]")
+}
+
+fn command_context_rule_field(index: usize, field_name: &str) -> String {
+    format!("autonomy.command_context_rules[{index}].{field_name}")
+}
+
+fn validate_autonomy_command_context_rule(
+    index: usize,
+    rule: &CommandContextRuleConfig,
+) -> Result<()> {
+    validate_command_matcher(
+        &rule.command,
+        &command_context_rule_field(index, "command"),
+        false,
+    )?;
+    validate_command_context_domains(index, &rule.allowed_domains)?;
+    validate_command_context_path_prefixes(
+        index,
+        "allowed_path_prefixes",
+        &rule.allowed_path_prefixes,
+    )?;
+    validate_command_context_path_prefixes(
+        index,
+        "denied_path_prefixes",
+        &rule.denied_path_prefixes,
+    )?;
+    Ok(())
+}
+
 impl Default for AutonomyConfig {
     fn default() -> Self {
         Self {
@@ -3694,6 +3852,7 @@ impl Default for AutonomyConfig {
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             allow_unsafe_shell_structures: false,
+            unrestricted_commands: Vec::new(),
             shell_env_passthrough: vec![],
             allow_sensitive_file_reads: false,
             allow_sensitive_file_writes: false,
@@ -4916,6 +5075,16 @@ pub struct AckReactionChannelsConfig {
     pub feishu: Option<AckReactionConfig>,
 }
 
+impl AckReactionChannelsConfig {
+    #[must_use]
+    pub fn for_lark_platform(&self, platform: LarkChannelPlatform) -> Option<AckReactionConfig> {
+        match platform {
+            LarkChannelPlatform::Lark => self.lark.clone(),
+            LarkChannelPlatform::Feishu => self.feishu.clone(),
+        }
+    }
+}
+
 fn resolve_group_reply_mode(
     group_reply: Option<&GroupReplyConfig>,
     legacy_mention_only: Option<bool>,
@@ -5596,6 +5765,322 @@ pub fn default_lark_max_draft_edits() -> u32 {
     20
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LarkChannelPlatform {
+    Lark,
+    Feishu,
+}
+
+impl LarkChannelPlatform {
+    #[must_use]
+    pub fn api_base(self) -> &'static str {
+        match self {
+            Self::Lark => "https://open.larksuite.com/open-apis",
+            Self::Feishu => "https://open.feishu.cn/open-apis",
+        }
+    }
+
+    #[must_use]
+    pub fn ws_base(self) -> &'static str {
+        match self {
+            Self::Lark => "https://open.larksuite.com",
+            Self::Feishu => "https://open.feishu.cn",
+        }
+    }
+
+    #[must_use]
+    pub fn locale_header(self) -> &'static str {
+        match self {
+            Self::Lark => "en",
+            Self::Feishu => "zh",
+        }
+    }
+
+    #[must_use]
+    pub fn proxy_service_key(self) -> &'static str {
+        match self {
+            Self::Lark => "channel.lark",
+            Self::Feishu => "channel.feishu",
+        }
+    }
+
+    #[must_use]
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Lark => "Lark",
+            Self::Feishu => "Feishu",
+        }
+    }
+
+    #[must_use]
+    pub fn runtime_channel_name(self) -> &'static str {
+        match self {
+            Self::Lark => "lark",
+            Self::Feishu => "feishu",
+        }
+    }
+
+    #[must_use]
+    pub fn from_runtime_channel_name(channel_name: &str) -> Option<Self> {
+        [Self::Lark, Self::Feishu]
+            .into_iter()
+            .find(|platform| channel_name.eq_ignore_ascii_case(platform.runtime_channel_name()))
+    }
+
+    #[must_use]
+    pub fn canonical_runtime_platform(channel_name: &str) -> Option<Self> {
+        Self::from_runtime_channel_name(channel_name).map(|_| Self::Feishu)
+    }
+
+    #[must_use]
+    pub fn runtime_alias_channel_name(self) -> &'static str {
+        match self {
+            Self::Lark => Self::Feishu.runtime_channel_name(),
+            Self::Feishu => Self::Lark.runtime_channel_name(),
+        }
+    }
+
+    #[must_use]
+    pub fn default_progress_mode(self) -> ProgressMode {
+        match self {
+            Self::Lark | Self::Feishu => ProgressMode::Compact,
+        }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn test_api_base_env_var(self) -> &'static str {
+        match self {
+            Self::Lark => "ZEROCLAW_TEST_LARK_API_BASE",
+            Self::Feishu => "ZEROCLAW_TEST_FEISHU_API_BASE",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LarkRuntimeChannelIdentity {
+    pub canonical_platform: LarkChannelPlatform,
+    pub requested_platform: LarkChannelPlatform,
+}
+
+impl LarkRuntimeChannelIdentity {
+    #[must_use]
+    pub fn from_platform(requested_platform: LarkChannelPlatform) -> Self {
+        let canonical_platform = LarkChannelPlatform::canonical_runtime_platform(
+            requested_platform.runtime_channel_name(),
+        )
+        .expect("canonical platform should exist for known Lark runtime platform");
+        Self {
+            canonical_platform,
+            requested_platform,
+        }
+    }
+
+    #[must_use]
+    pub fn from_runtime_channel_name(channel_name: &str) -> Option<Self> {
+        LarkChannelPlatform::from_runtime_channel_name(channel_name).map(Self::from_platform)
+    }
+
+    #[must_use]
+    pub fn canonical_channel_name(self) -> &'static str {
+        self.canonical_platform.runtime_channel_name()
+    }
+
+    #[must_use]
+    pub fn requested_channel_name(self) -> &'static str {
+        self.requested_platform.runtime_channel_name()
+    }
+
+    #[must_use]
+    pub fn fallback_channel_name(self) -> &'static str {
+        if self.requested_platform == self.canonical_platform {
+            self.requested_platform.runtime_alias_channel_name()
+        } else {
+            self.canonical_platform.runtime_channel_name()
+        }
+    }
+
+    #[must_use]
+    pub fn default_progress_mode(self) -> ProgressMode {
+        self.canonical_platform.default_progress_mode()
+    }
+
+    #[must_use]
+    pub fn lookup_channel_names(self) -> [&'static str; 2] {
+        [self.requested_channel_name(), self.fallback_channel_name()]
+    }
+
+    pub fn resolve_runtime_channel_entry<'a, T>(
+        entries: &'a HashMap<String, T>,
+        channel_name: &str,
+    ) -> Option<&'a T> {
+        let identity = Self::from_runtime_channel_name(channel_name);
+        let lookup_names = identity
+            .map(LarkRuntimeChannelIdentity::lookup_channel_names)
+            .unwrap_or([channel_name, channel_name]);
+
+        lookup_names
+            .into_iter()
+            .find_map(|name| entries.get(&name.to_ascii_lowercase()))
+    }
+
+    #[must_use]
+    pub fn default_progress_mode_for_runtime_channel(channel_name: &str) -> Option<ProgressMode> {
+        Self::from_runtime_channel_name(channel_name).map(Self::default_progress_mode)
+    }
+}
+
+const DEFAULT_AUTO_CRON_DELIVERY_CHANNELS: &[&str] =
+    &["telegram", "discord", "slack", "mattermost"];
+
+#[must_use]
+pub fn supports_auto_cron_delivery_channel(channel_name: &str) -> bool {
+    DEFAULT_AUTO_CRON_DELIVERY_CHANNELS
+        .iter()
+        .any(|supported| supported.eq_ignore_ascii_case(channel_name))
+        || LarkRuntimeChannelIdentity::from_runtime_channel_name(channel_name).is_some()
+}
+
+#[must_use]
+pub fn lark_platform_from_legacy_flag(use_feishu: bool) -> LarkChannelPlatform {
+    if use_feishu {
+        LarkChannelPlatform::Feishu
+    } else {
+        LarkChannelPlatform::Lark
+    }
+}
+
+pub trait LarkChannelConfig {
+    fn platform(&self) -> LarkChannelPlatform;
+    fn app_id(&self) -> &str;
+    fn app_secret(&self) -> &str;
+    fn verification_token(&self) -> Option<&str>;
+    fn port(&self) -> Option<u16>;
+    fn allowed_users(&self) -> &[String];
+    fn receive_mode(&self) -> LarkReceiveMode;
+    fn draft_update_interval_ms(&self) -> u64;
+    fn max_draft_edits(&self) -> u32;
+    fn progress_mode(&self) -> ProgressMode;
+    fn requires_mention(&self) -> bool;
+
+    fn runtime_channel_identity(&self) -> LarkRuntimeChannelIdentity {
+        LarkRuntimeChannelIdentity::from_platform(self.platform())
+    }
+
+    fn runtime_channel_name(&self) -> &'static str {
+        self.runtime_channel_identity().requested_channel_name()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LarkChannelConfigSource {
+    Lark,
+    LegacyFeishuAlias,
+    Feishu,
+}
+
+impl LarkChannelConfigSource {
+    #[must_use]
+    pub fn from_lark_config(config: &LarkConfig) -> Self {
+        if config.platform() == LarkChannelPlatform::Feishu {
+            Self::LegacyFeishuAlias
+        } else {
+            Self::Lark
+        }
+    }
+
+    #[must_use]
+    pub fn prefers_over(self, existing: Self) -> bool {
+        matches!((existing, self), (Self::LegacyFeishuAlias, Self::Feishu))
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct LarkConfiguredChannel<'a> {
+    pub config: &'a dyn LarkChannelConfig,
+    pub identity: LarkRuntimeChannelIdentity,
+    pub source: LarkChannelConfigSource,
+}
+
+impl<'a> LarkConfiguredChannel<'a> {
+    fn new(config: &'a dyn LarkChannelConfig, source: LarkChannelConfigSource) -> Self {
+        Self {
+            config,
+            identity: config.runtime_channel_identity(),
+            source,
+        }
+    }
+}
+
+pub fn configured_lark_channels(channels: &ChannelsConfig) -> Vec<LarkConfiguredChannel<'_>> {
+    let mut candidates = Vec::with_capacity(2);
+
+    if let Some(lark) = channels.lark.as_ref() {
+        push_lark_configured_channel(
+            &mut candidates,
+            LarkConfiguredChannel::new(lark, LarkChannelConfigSource::from_lark_config(lark)),
+        );
+    }
+
+    if let Some(feishu) = channels.feishu.as_ref() {
+        push_lark_configured_channel(
+            &mut candidates,
+            LarkConfiguredChannel::new(feishu, LarkChannelConfigSource::Feishu),
+        );
+    }
+
+    candidates
+}
+
+#[must_use]
+pub fn configured_lark_channel<'a>(
+    channels: &'a ChannelsConfig,
+    channel_name: &str,
+) -> Option<LarkConfiguredChannel<'a>> {
+    let requested_identity = LarkRuntimeChannelIdentity::from_runtime_channel_name(channel_name)?;
+    configured_lark_channels(channels)
+        .into_iter()
+        .find(|candidate| candidate.identity == requested_identity)
+}
+
+fn push_lark_configured_channel<'a>(
+    candidates: &mut Vec<LarkConfiguredChannel<'a>>,
+    candidate: LarkConfiguredChannel<'a>,
+) {
+    if let Some(existing) = candidates
+        .iter_mut()
+        .find(|existing| existing.identity == candidate.identity)
+    {
+        if candidate.source.prefers_over(existing.source) {
+            tracing::warn!(
+                "Both [channels_config.feishu] and legacy [channels_config.lark].use_feishu=true are configured; ignoring legacy Feishu fallback in lark."
+            );
+            *existing = candidate;
+        }
+        return;
+    }
+
+    if candidate.source == LarkChannelConfigSource::LegacyFeishuAlias {
+        tracing::warn!(
+            "Using legacy [channels_config.lark].use_feishu=true compatibility path for runtime channel '{}'; prefer [channels_config.{}].",
+            candidate.identity.requested_channel_name(),
+            candidate.identity.canonical_channel_name(),
+        );
+    }
+
+    candidates.push(candidate);
+}
+
+pub fn insert_lark_channel_progress_mode(
+    channel_progress_modes: &mut HashMap<String, ProgressMode>,
+    config: &(impl LarkChannelConfig + ?Sized),
+) {
+    channel_progress_modes.insert(
+        config.runtime_channel_name().to_string(),
+        config.progress_mode(),
+    );
+}
+
 /// Lark/Feishu configuration for messaging integration.
 /// Lark is the international version; Feishu is the Chinese version.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -5662,6 +6147,52 @@ impl LarkConfig {
     }
 }
 
+impl LarkChannelConfig for LarkConfig {
+    fn platform(&self) -> LarkChannelPlatform {
+        lark_platform_from_legacy_flag(self.use_feishu)
+    }
+
+    fn app_id(&self) -> &str {
+        &self.app_id
+    }
+
+    fn app_secret(&self) -> &str {
+        &self.app_secret
+    }
+
+    fn verification_token(&self) -> Option<&str> {
+        self.verification_token.as_deref()
+    }
+
+    fn port(&self) -> Option<u16> {
+        self.port
+    }
+
+    fn allowed_users(&self) -> &[String] {
+        &self.allowed_users
+    }
+
+    fn receive_mode(&self) -> LarkReceiveMode {
+        self.receive_mode.clone()
+    }
+
+    fn draft_update_interval_ms(&self) -> u64 {
+        self.draft_update_interval_ms
+    }
+
+    fn max_draft_edits(&self) -> u32 {
+        self.max_draft_edits
+    }
+
+    fn progress_mode(&self) -> ProgressMode {
+        self.progress_mode
+    }
+
+    fn requires_mention(&self) -> bool {
+        self.effective_group_reply_mode().requires_mention()
+    }
+}
+
 /// Feishu configuration for messaging integration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FeishuConfig {
@@ -5717,6 +6248,52 @@ impl FeishuConfig {
     #[must_use]
     pub fn group_reply_allowed_sender_ids(&self) -> Vec<String> {
         clone_group_reply_allowed_sender_ids(self.group_reply.as_ref())
+    }
+}
+
+impl LarkChannelConfig for FeishuConfig {
+    fn platform(&self) -> LarkChannelPlatform {
+        LarkChannelPlatform::Feishu
+    }
+
+    fn app_id(&self) -> &str {
+        &self.app_id
+    }
+
+    fn app_secret(&self) -> &str {
+        &self.app_secret
+    }
+
+    fn verification_token(&self) -> Option<&str> {
+        self.verification_token.as_deref()
+    }
+
+    fn port(&self) -> Option<u16> {
+        self.port
+    }
+
+    fn allowed_users(&self) -> &[String] {
+        &self.allowed_users
+    }
+
+    fn receive_mode(&self) -> LarkReceiveMode {
+        self.receive_mode.clone()
+    }
+
+    fn draft_update_interval_ms(&self) -> u64 {
+        self.draft_update_interval_ms
+    }
+
+    fn max_draft_edits(&self) -> u32 {
+        self.max_draft_edits
+    }
+
+    fn progress_mode(&self) -> ProgressMode {
+        self.progress_mode
+    }
+
+    fn requires_mention(&self) -> bool {
+        self.effective_group_reply_mode().requires_mention()
     }
 }
 
@@ -7956,84 +8533,7 @@ impl Config {
     }
 
     fn validate_autonomy_config(&self) -> Result<()> {
-        if self.autonomy.max_actions_per_hour == 0 {
-            anyhow::bail!("autonomy.max_actions_per_hour must be greater than 0");
-        }
-
-        self.validate_allowed_commands()?;
-        self.validate_shell_env_passthrough()?;
-        self.validate_command_context_rules()?;
-        self.validate_non_cli_excluded_tools()?;
-        Ok(())
-    }
-
-    fn validate_allowed_commands(&self) -> Result<()> {
-        let mut seen_allowed_commands = std::collections::HashSet::new();
-        for (i, command) in self.autonomy.allowed_commands.iter().enumerate() {
-            validate_command_matcher(command, &format!("autonomy.allowed_commands[{i}]"), true)?;
-            let normalized = command.trim().to_ascii_lowercase();
-            if !seen_allowed_commands.insert(normalized.clone()) {
-                anyhow::bail!("autonomy.allowed_commands contains duplicate entry: {normalized}");
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_shell_env_passthrough(&self) -> Result<()> {
-        for (i, env_name) in self.autonomy.shell_env_passthrough.iter().enumerate() {
-            if !is_valid_env_var_name(env_name) {
-                anyhow::bail!(
-                    "autonomy.shell_env_passthrough[{i}] is invalid ({env_name}); expected [A-Za-z_][A-Za-z0-9_]*"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_command_context_rules(&self) -> Result<()> {
-        for (i, rule) in self.autonomy.command_context_rules.iter().enumerate() {
-            validate_command_matcher(
-                &rule.command,
-                &format!("autonomy.command_context_rules[{i}].command"),
-                false,
-            )?;
-            validate_command_context_domains(i, &rule.allowed_domains)?;
-            validate_command_context_path_prefixes(
-                i,
-                "allowed_path_prefixes",
-                &rule.allowed_path_prefixes,
-            )?;
-            validate_command_context_path_prefixes(
-                i,
-                "denied_path_prefixes",
-                &rule.denied_path_prefixes,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn validate_non_cli_excluded_tools(&self) -> Result<()> {
-        let mut seen_non_cli_excluded = std::collections::HashSet::new();
-        for (i, tool_name) in self.autonomy.non_cli_excluded_tools.iter().enumerate() {
-            let normalized = tool_name.trim();
-            if normalized.is_empty() {
-                anyhow::bail!("autonomy.non_cli_excluded_tools[{i}] must not be empty");
-            }
-            if !normalized
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-            {
-                anyhow::bail!(
-                    "autonomy.non_cli_excluded_tools[{i}] contains invalid characters: {normalized}"
-                );
-            }
-            if !seen_non_cli_excluded.insert(normalized.to_string()) {
-                anyhow::bail!(
-                    "autonomy.non_cli_excluded_tools contains duplicate entry: {normalized}"
-                );
-            }
-        }
-        Ok(())
+        AutonomyConfigValidator::new(&self.autonomy).validate()
     }
 
     /// Validate configuration values that would cause runtime failures.
@@ -9836,6 +10336,7 @@ mod tests {
         assert!(a.require_approval_for_medium_risk);
         assert!(a.block_high_risk_commands);
         assert!(!a.allow_unsafe_shell_structures);
+        assert!(a.unrestricted_commands.is_empty());
         assert!(a.shell_env_passthrough.is_empty());
         assert!(a.command_context_rules.is_empty());
         assert!(!a.allow_sensitive_file_reads);
@@ -9877,6 +10378,10 @@ allowed_roots = []
         assert!(
             !parsed.allow_unsafe_shell_structures,
             "Missing allow_unsafe_shell_structures must default to false"
+        );
+        assert!(
+            parsed.unrestricted_commands.is_empty(),
+            "Missing unrestricted_commands must default to empty"
         );
         assert!(parsed.non_cli_excluded_tools.contains(&"shell".to_string()));
         assert!(parsed
@@ -9930,6 +10435,24 @@ allowed_roots = []
         cfg.autonomy.allowed_commands = vec!["/usr/bin/git".into(), "*".into()];
         cfg.validate()
             .expect("path-like allowed_commands entries should validate");
+    }
+
+    #[test]
+    async fn config_validate_rejects_duplicate_unrestricted_commands() {
+        let mut cfg = Config::default();
+        cfg.autonomy.unrestricted_commands = vec!["curl".into(), " Curl ".into()];
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("autonomy.unrestricted_commands contains duplicate entry"));
+    }
+
+    #[test]
+    async fn config_validate_allows_path_like_unrestricted_command_matcher() {
+        let mut cfg = Config::default();
+        cfg.autonomy.unrestricted_commands = vec!["/usr/bin/curl".into(), "*".into()];
+        cfg.validate()
+            .expect("path-like unrestricted_commands entries should validate");
     }
 
     #[test]
@@ -10151,6 +10674,7 @@ ws_url = "ws://127.0.0.1:3002"
                 require_approval_for_medium_risk: false,
                 block_high_risk_commands: true,
                 allow_unsafe_shell_structures: false,
+                unrestricted_commands: vec!["curl".into()],
                 shell_env_passthrough: vec!["DATABASE_URL".into()],
                 allow_sensitive_file_reads: false,
                 allow_sensitive_file_writes: false,
@@ -13824,6 +14348,156 @@ default_model = "legacy-model"
     }
 
     #[test]
+    async fn legacy_lark_platform_helper_maps_channel_aliases() {
+        assert_eq!(
+            lark_platform_from_legacy_flag(false),
+            LarkChannelPlatform::Lark
+        );
+        assert_eq!(
+            lark_platform_from_legacy_flag(true),
+            LarkChannelPlatform::Feishu
+        );
+        assert_eq!(
+            LarkChannelPlatform::Lark.api_base(),
+            "https://open.larksuite.com/open-apis"
+        );
+        assert_eq!(
+            LarkChannelPlatform::Feishu.api_base(),
+            "https://open.feishu.cn/open-apis"
+        );
+        assert_eq!(
+            LarkChannelPlatform::Lark.ws_base(),
+            "https://open.larksuite.com"
+        );
+        assert_eq!(
+            LarkChannelPlatform::Feishu.ws_base(),
+            "https://open.feishu.cn"
+        );
+        assert_eq!(LarkChannelPlatform::Lark.locale_header(), "en");
+        assert_eq!(LarkChannelPlatform::Feishu.locale_header(), "zh");
+        assert_eq!(
+            LarkChannelPlatform::Lark.proxy_service_key(),
+            "channel.lark"
+        );
+        assert_eq!(
+            LarkChannelPlatform::Feishu.proxy_service_key(),
+            "channel.feishu"
+        );
+        assert_eq!(LarkChannelPlatform::Lark.runtime_channel_name(), "lark");
+        assert_eq!(LarkChannelPlatform::Feishu.runtime_channel_name(), "feishu");
+        assert_eq!(
+            LarkChannelPlatform::Lark.test_api_base_env_var(),
+            "ZEROCLAW_TEST_LARK_API_BASE"
+        );
+        assert_eq!(
+            LarkChannelPlatform::Feishu.test_api_base_env_var(),
+            "ZEROCLAW_TEST_FEISHU_API_BASE"
+        );
+        assert_eq!(
+            LarkChannelPlatform::from_runtime_channel_name("lark"),
+            Some(LarkChannelPlatform::Lark)
+        );
+        assert_eq!(
+            LarkChannelPlatform::from_runtime_channel_name("feishu"),
+            Some(LarkChannelPlatform::Feishu)
+        );
+        assert_eq!(
+            LarkChannelPlatform::from_runtime_channel_name("FEISHU"),
+            Some(LarkChannelPlatform::Feishu)
+        );
+        assert_eq!(
+            LarkChannelPlatform::canonical_runtime_platform("lark"),
+            Some(LarkChannelPlatform::Feishu)
+        );
+        assert_eq!(
+            LarkChannelPlatform::Lark.runtime_alias_channel_name(),
+            "feishu"
+        );
+        assert_eq!(
+            LarkChannelPlatform::Feishu.runtime_alias_channel_name(),
+            "lark"
+        );
+        assert_eq!(
+            LarkChannelPlatform::Feishu.default_progress_mode(),
+            ProgressMode::Compact
+        );
+        let identity = LarkRuntimeChannelIdentity::from_runtime_channel_name("lark")
+            .expect("lark runtime identity should resolve");
+        assert_eq!(identity.canonical_channel_name(), "feishu");
+        assert_eq!(identity.requested_channel_name(), "lark");
+        assert_eq!(identity.fallback_channel_name(), "feishu");
+        assert_eq!(identity.lookup_channel_names(), ["lark", "feishu"]);
+        assert_eq!(identity.default_progress_mode(), ProgressMode::Compact);
+        let identity = LarkRuntimeChannelIdentity::from_platform(LarkChannelPlatform::Feishu);
+        assert_eq!(identity.canonical_channel_name(), "feishu");
+        assert_eq!(identity.requested_channel_name(), "feishu");
+        assert_eq!(identity.fallback_channel_name(), "lark");
+        assert_eq!(identity.lookup_channel_names(), ["feishu", "lark"]);
+        let entries = HashMap::from([("feishu".to_string(), 3usize)]);
+        assert_eq!(
+            LarkRuntimeChannelIdentity::resolve_runtime_channel_entry(&entries, "lark").copied(),
+            Some(3)
+        );
+        assert_eq!(
+            LarkRuntimeChannelIdentity::default_progress_mode_for_runtime_channel("feishu"),
+            Some(ProgressMode::Compact)
+        );
+        assert_eq!(
+            LarkRuntimeChannelIdentity::default_progress_mode_for_runtime_channel("telegram"),
+            None
+        );
+        assert_eq!(
+            LarkChannelPlatform::from_runtime_channel_name("telegram"),
+            None
+        );
+        assert!(supports_auto_cron_delivery_channel("telegram"));
+        assert!(supports_auto_cron_delivery_channel("lark"));
+        assert!(supports_auto_cron_delivery_channel("feishu"));
+        assert!(!supports_auto_cron_delivery_channel("github"));
+    }
+
+    #[test]
+    async fn configured_lark_channel_prefers_explicit_feishu_over_legacy_alias() {
+        let mut channels = ChannelsConfig::default();
+        channels.lark = Some(LarkConfig {
+            app_id: "legacy-feishu-app".into(),
+            app_secret: "legacy-feishu-secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec!["*".into()],
+            mention_only: false,
+            group_reply: None,
+            use_feishu: true,
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
+            max_draft_edits: default_lark_max_draft_edits(),
+            progress_mode: ProgressMode::Compact,
+        });
+        channels.feishu = Some(FeishuConfig {
+            app_id: "explicit-feishu-app".into(),
+            app_secret: "explicit-feishu-secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec!["*".into()],
+            group_reply: None,
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
+            max_draft_edits: default_lark_max_draft_edits(),
+            progress_mode: ProgressMode::Verbose,
+        });
+
+        let resolved = configured_lark_channel(&channels, "feishu")
+            .expect("feishu channel should resolve");
+
+        assert_eq!(resolved.identity.requested_channel_name(), "feishu");
+        assert_eq!(resolved.source, LarkChannelConfigSource::Feishu);
+        assert_eq!(resolved.config.app_id(), "explicit-feishu-app");
+        assert_eq!(resolved.config.progress_mode(), ProgressMode::Verbose);
+    }
+
+    #[test]
     async fn lark_config_with_wildcard_allowed_users() {
         let json = r#"{"app_id":"cli_123","app_secret":"secret","allowed_users":["*"]}"#;
         let parsed: LarkConfig = serde_json::from_str(json).unwrap();
@@ -13891,6 +14565,98 @@ default_model = "legacy-model"
         assert_eq!(
             parsed.effective_group_reply_mode(),
             GroupReplyMode::AllMessages
+        );
+    }
+
+    #[test]
+    async fn shared_lark_channel_config_trait_exposes_common_fields() {
+        let lark = test_lark_config();
+        let feishu = test_feishu_config();
+
+        fn snapshot(
+            config: &dyn LarkChannelConfig,
+        ) -> (
+            LarkChannelPlatform,
+            &str,
+            &str,
+            Option<&str>,
+            Option<u16>,
+            ProgressMode,
+        ) {
+            (
+                config.platform(),
+                config.app_id(),
+                config.app_secret(),
+                config.verification_token(),
+                config.port(),
+                config.progress_mode(),
+            )
+        }
+
+        assert_eq!(
+            snapshot(&lark),
+            (
+                LarkChannelPlatform::Lark,
+                "cli_123456",
+                "secret_abc",
+                Some("verify_token"),
+                None,
+                ProgressMode::Compact,
+            )
+        );
+        assert_eq!(
+            snapshot(&feishu),
+            (
+                LarkChannelPlatform::Feishu,
+                "cli_feishu_123",
+                "secret_abc",
+                Some("verify_token"),
+                None,
+                ProgressMode::Compact,
+            )
+        );
+    }
+
+    #[test]
+    async fn shared_lark_helpers_insert_progress_and_ack_by_platform() {
+        let mut progress_modes = HashMap::new();
+        let mut lark = test_lark_config();
+        lark.progress_mode = ProgressMode::Verbose;
+        let mut feishu = test_feishu_config();
+        feishu.progress_mode = ProgressMode::Off;
+
+        insert_lark_channel_progress_mode(&mut progress_modes, &lark);
+        insert_lark_channel_progress_mode(&mut progress_modes, &feishu);
+
+        assert_eq!(progress_modes.get("lark"), Some(&ProgressMode::Verbose));
+        assert_eq!(progress_modes.get("feishu"), Some(&ProgressMode::Off));
+
+        let ack_reaction = AckReactionChannelsConfig {
+            lark: Some(AckReactionConfig {
+                enabled: false,
+                ..AckReactionConfig::default()
+            }),
+            feishu: Some(AckReactionConfig {
+                sample_rate: 0.25,
+                ..AckReactionConfig::default()
+            }),
+            ..AckReactionChannelsConfig::default()
+        };
+
+        let lark_ack = ack_reaction
+            .for_lark_platform(LarkChannelPlatform::Lark)
+            .expect("lark ack config");
+        assert!(!lark_ack.enabled);
+        assert_eq!(
+            lark_ack.sample_rate,
+            AckReactionConfig::default().sample_rate
+        );
+        assert_eq!(
+            ack_reaction
+                .for_lark_platform(LarkChannelPlatform::Feishu)
+                .expect("feishu ack config")
+                .sample_rate,
+            0.25
         );
     }
 

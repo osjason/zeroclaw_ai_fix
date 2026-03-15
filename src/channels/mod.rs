@@ -79,13 +79,18 @@ pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{
     build_shell_policy_instructions, build_tool_instructions_from_specs,
-    run_tool_call_loop_with_non_cli_approval_context, scrub_credentials,
-    summarize_runtime_constraint_reasons, NonCliApprovalContext, NonCliApprovalPrompt,
-    SafetyHeartbeatConfig,
+    run_tool_call_loop_with_non_cli_approval_context, scrub_credentials, NonCliApprovalContext,
+    NonCliApprovalPrompt, SafetyHeartbeatConfig,
 };
 use crate::agent::session::{resolve_session_id, shared_session_manager, Session, SessionManager};
 use crate::approval::{ApprovalManager, ApprovalResponse, PendingApprovalError};
-use crate::config::{Config, NonCliNaturalLanguageApprovalMode, ProgressMode};
+use crate::config::{
+    schema::{
+        configured_lark_channels, insert_lark_channel_progress_mode, LarkChannelConfig,
+        LarkRuntimeChannelIdentity,
+    },
+    Config, NonCliNaturalLanguageApprovalMode, ProgressMode,
+};
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::{self, runtime_trace, Observer};
@@ -96,8 +101,9 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use progress_event::{
-    is_high_priority_progress_update, is_structured_lifecycle_or_policy_line,
-    strip_progress_section_markers, upsert_progress_section,
+    strip_progress_section_markers, summarize_runtime_constraint_reasons_default,
+    truncate_progress_preserving_structured_lines, upsert_structured_progress_block,
+    ProgressModePolicy,
 };
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -195,25 +201,23 @@ fn set_runtime_channel_progress_modes(modes: HashMap<String, ProgressMode>) {
         .unwrap_or_else(|e| e.into_inner()) = normalized;
 }
 
-fn progress_mode_alias(channel_name: &str) -> Option<&'static str> {
-    if channel_name.eq_ignore_ascii_case("lark") {
-        Some("feishu")
-    } else if channel_name.eq_ignore_ascii_case("feishu") {
-        Some("lark")
-    } else {
-        None
-    }
+fn resolve_runtime_channel_entry<'a, T>(
+    entries: &'a HashMap<String, T>,
+    channel_name: &str,
+) -> Option<&'a T> {
+    LarkRuntimeChannelIdentity::resolve_runtime_channel_entry(entries, channel_name)
+}
+
+fn default_progress_mode_for_channel(channel_name: &str) -> ProgressMode {
+    LarkRuntimeChannelIdentity::default_progress_mode_for_runtime_channel(channel_name)
+        .unwrap_or(ProgressMode::Off)
 }
 
 fn runtime_channel_progress_mode(channel_name: &str) -> Option<ProgressMode> {
     let store = runtime_channel_progress_modes_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let normalized = channel_name.to_ascii_lowercase();
-    store
-        .get(&normalized)
-        .copied()
-        .or_else(|| progress_mode_alias(channel_name).and_then(|alias| store.get(alias).copied()))
+    resolve_runtime_channel_entry(&store, channel_name).copied()
 }
 
 fn configured_runtime_channel_progress_modes(config: &Config) -> HashMap<String, ProgressMode> {
@@ -222,27 +226,17 @@ fn configured_runtime_channel_progress_modes(config: &Config) -> HashMap<String,
         channel_progress_modes.insert("telegram".to_string(), tg.progress_mode);
     }
     #[cfg(feature = "channel-lark")]
-    if let Some(lk) = config.channels_config.lark.as_ref() {
-        let channel_name = if lk.use_feishu && config.channels_config.feishu.is_none() {
-            "feishu"
-        } else {
-            "lark"
-        };
-        channel_progress_modes.insert(channel_name.to_string(), lk.progress_mode);
-    }
-    #[cfg(feature = "channel-lark")]
-    if let Some(fs) = config.channels_config.feishu.as_ref() {
-        channel_progress_modes.insert("feishu".to_string(), fs.progress_mode);
+    for candidate in configured_lark_channels(&config.channels_config) {
+        insert_lark_channel_progress_mode(&mut channel_progress_modes, candidate.config);
     }
     channel_progress_modes
 }
 
 pub(crate) fn get_live_channel(name: &str) -> Option<Arc<dyn Channel>> {
-    live_channels_registry()
+    let guard = live_channels_registry()
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&name.to_ascii_lowercase())
-        .cloned()
+        .unwrap_or_else(|e| e.into_inner());
+    resolve_runtime_channel_entry(&guard, name).cloned()
 }
 
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
@@ -792,103 +786,172 @@ fn effective_progress_mode_for_message(
     channel_name: &str,
     expose_internal_tool_details: bool,
 ) -> ProgressMode {
-    if channel_name.eq_ignore_ascii_case("cli") || expose_internal_tool_details {
-        ProgressMode::Verbose
-    } else {
-        runtime_channel_progress_mode(channel_name)
-            .unwrap_or_else(|| default_progress_mode_for_channel(channel_name))
-    }
-}
-
-fn default_progress_mode_for_channel(channel_name: &str) -> ProgressMode {
-    if channel_name.eq_ignore_ascii_case("lark") || channel_name.eq_ignore_ascii_case("feishu") {
-        ProgressMode::Compact
-    } else {
-        ProgressMode::Off
-    }
+    ChannelProgressPolicy::for_message(channel_name, expose_internal_tool_details).mode()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DraftProgressVisibility {
-    Hidden,
-    Visible,
-    ForceVisible,
+struct ChannelProgressPolicy {
+    visibility: ProgressModePolicy,
 }
 
-fn draft_progress_visibility(mode: ProgressMode, delta: &str) -> DraftProgressVisibility {
-    if is_high_priority_progress_update(delta) {
-        DraftProgressVisibility::ForceVisible
-    } else if mode == ProgressMode::Off {
-        DraftProgressVisibility::Hidden
-    } else {
-        DraftProgressVisibility::Visible
+impl ChannelProgressPolicy {
+    fn for_message(channel_name: &str, expose_internal_tool_details: bool) -> Self {
+        let mode = if channel_name.eq_ignore_ascii_case("cli") || expose_internal_tool_details {
+            ProgressMode::Verbose
+        } else {
+            runtime_channel_progress_mode(channel_name)
+                .unwrap_or_else(|| Self::default_mode(channel_name))
+        };
+        Self::for_mode(mode)
+    }
+
+    fn for_mode(mode: ProgressMode) -> Self {
+        Self {
+            visibility: ProgressModePolicy::new(mode),
+        }
+    }
+
+    fn default_mode(channel_name: &str) -> ProgressMode {
+        default_progress_mode_for_channel(channel_name)
+    }
+
+    fn mode(self) -> ProgressMode {
+        self.visibility.mode()
+    }
+
+    fn routes_plain_progress_delta(self, delta: &str) -> bool {
+        match ChannelWireDelta::parse(delta) {
+            ChannelWireDelta::Clear => true,
+            delta => self.forwarded_delta(delta, true).is_some(),
+        }
+    }
+
+    fn classify_draft_delta(self, delta: &str) -> Option<DraftDelta<'_>> {
+        match ChannelWireDelta::parse(delta) {
+            ChannelWireDelta::Clear => Some(DraftDelta::Clear),
+            delta => self
+                .forwarded_delta(delta, false)
+                .map(DraftDelta::Forwarded),
+        }
+    }
+
+    fn apply_draft_delta(self, accumulated: &mut String, delta: &str) -> Option<String> {
+        self.classify_draft_delta(delta)?
+            .apply_to_draft(accumulated)
+    }
+
+    fn forwarded_delta(
+        self,
+        delta: ChannelWireDelta<'_>,
+        treat_plain_text_as_internal_progress: bool,
+    ) -> Option<ChannelForwardedDelta<'_>> {
+        match delta {
+            ChannelWireDelta::Clear => None,
+            ChannelWireDelta::ProgressBlock(block) => {
+                let visible = self.visibility.exposes_progress_block(block);
+                visible.then_some(ChannelForwardedDelta::ProgressBlock(block))
+            }
+            ChannelWireDelta::Text {
+                visible_delta,
+                is_internal_progress,
+            } => {
+                if (is_internal_progress || treat_plain_text_as_internal_progress)
+                    && !self.visibility.exposes_internal_text(visible_delta)
+                {
+                    return None;
+                }
+
+                Some(ChannelForwardedDelta::Append(visible_delta))
+            }
+        }
     }
 }
 
-fn should_show_progress_update(mode: ProgressMode, delta: &str) -> bool {
-    draft_progress_visibility(mode, delta) != DraftProgressVisibility::Hidden
-}
-
-fn should_skip_internal_progress_line(mode: ProgressMode, delta: &str) -> bool {
-    match draft_progress_visibility(mode, delta) {
-        DraftProgressVisibility::ForceVisible => false,
-        DraftProgressVisibility::Visible => mode == ProgressMode::Compact,
-        DraftProgressVisibility::Hidden => true,
-    }
-}
-
-enum DraftStreamDelta<'a> {
+enum ChannelWireDelta<'a> {
     Clear,
+    ProgressBlock(&'a str),
+    Text {
+        visible_delta: &'a str,
+        is_internal_progress: bool,
+    },
+}
+
+impl<'a> ChannelWireDelta<'a> {
+    fn parse(delta: &'a str) -> Self {
+        if delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL {
+            return Self::Clear;
+        }
+
+        if let Some(block) = delta.strip_prefix(crate::agent::loop_::DRAFT_PROGRESS_BLOCK_SENTINEL)
+        {
+            return Self::ProgressBlock(block);
+        }
+
+        let (is_internal_progress, visible_delta) = split_internal_progress_delta(delta);
+        Self::Text {
+            visible_delta,
+            is_internal_progress,
+        }
+    }
+}
+
+enum ChannelForwardedDelta<'a> {
     ProgressBlock(&'a str),
     Append(&'a str),
 }
 
-fn classify_draft_stream_delta(mode: ProgressMode, delta: &str) -> Option<DraftStreamDelta<'_>> {
-    if delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL {
-        return Some(DraftStreamDelta::Clear);
-    }
-
-    if let Some(block) = delta.strip_prefix(crate::agent::loop_::DRAFT_PROGRESS_BLOCK_SENTINEL) {
-        return should_show_progress_update(mode, block)
-            .then_some(DraftStreamDelta::ProgressBlock(block));
-    }
-
-    let (is_internal_progress, visible_delta) = split_internal_progress_delta(delta);
-    if is_internal_progress && should_skip_internal_progress_line(mode, visible_delta) {
-        return None;
-    }
-
-    Some(DraftStreamDelta::Append(visible_delta))
-}
-
-fn apply_draft_stream_delta(
-    accumulated: &mut String,
-    mode: ProgressMode,
-    delta: &str,
-) -> Option<String> {
-    match classify_draft_stream_delta(mode, delta)? {
-        DraftStreamDelta::Clear => {
-            accumulated.clear();
-            return None;
-        }
-        DraftStreamDelta::ProgressBlock(block) => {
-            upsert_progress_section(
+impl<'a> ChannelForwardedDelta<'a> {
+    fn apply_to_draft(self, accumulated: &mut String) {
+        match self {
+            Self::ProgressBlock(block) => upsert_structured_progress_block(
                 accumulated,
                 block,
                 crate::agent::loop_::DRAFT_PROGRESS_SECTION_START,
                 crate::agent::loop_::DRAFT_PROGRESS_SECTION_END,
-            );
-        }
-        DraftStreamDelta::Append(visible_delta) => {
-            accumulated.push_str(visible_delta);
+            ),
+            Self::Append(delta) => accumulated.push_str(delta),
         }
     }
+}
 
-    Some(strip_progress_section_markers(
-        accumulated,
-        crate::agent::loop_::DRAFT_PROGRESS_SECTION_START,
-        crate::agent::loop_::DRAFT_PROGRESS_SECTION_END,
-    ))
+fn should_skip_internal_progress_line(mode: ProgressMode, delta: &str) -> bool {
+    !ChannelProgressPolicy::for_mode(mode).routes_plain_progress_delta(delta)
+}
+
+enum DraftDelta<'a> {
+    Clear,
+    Forwarded(ChannelForwardedDelta<'a>),
+}
+
+impl<'a> DraftDelta<'a> {
+    fn apply_to_draft(self, accumulated: &mut String) -> Option<String> {
+        match self {
+            Self::Clear => {
+                accumulated.clear();
+                None
+            }
+            Self::Forwarded(forwarded_delta) => {
+                forwarded_delta.apply_to_draft(accumulated);
+                Some(strip_progress_section_markers(
+                    accumulated,
+                    crate::agent::loop_::DRAFT_PROGRESS_SECTION_START,
+                    crate::agent::loop_::DRAFT_PROGRESS_SECTION_END,
+                ))
+            }
+        }
+    }
+}
+
+fn classify_draft_stream_delta(mode: ProgressMode, delta: &str) -> Option<DraftDelta<'_>> {
+    ChannelProgressPolicy::for_mode(mode).classify_draft_delta(delta)
+}
+
+fn apply_draft_stream_delta(
+    accumulated: &mut String,
+    policy: ChannelProgressPolicy,
+    delta: &str,
+) -> Option<String> {
+    policy.apply_draft_delta(accumulated, delta)
 }
 
 struct DraftStreamingRuntime {
@@ -897,72 +960,778 @@ struct DraftStreamingRuntime {
     updater: Option<tokio::task::JoinHandle<()>>,
 }
 
+#[derive(Clone, Copy)]
+struct ChannelDeliveryPlan<'a> {
+    channel: Option<&'a Arc<dyn Channel>>,
+    supports_draft_updates: bool,
+}
+
+impl<'a> ChannelDeliveryPlan<'a> {
+    fn new(channel: Option<&'a Arc<dyn Channel>>) -> Self {
+        Self {
+            channel,
+            supports_draft_updates: channel.is_some_and(|channel| channel.supports_draft_updates()),
+        }
+    }
+
+    fn draft_channel(self) -> Option<&'a Arc<dyn Channel>> {
+        self.channel.filter(|_| self.supports_draft_updates)
+    }
+
+    fn reply_delivery(
+        self,
+        msg: &'a traits::ChannelMessage,
+        draft_message_id: Option<&'a str>,
+    ) -> ChannelReplyDelivery<'a> {
+        match (self.channel, draft_message_id) {
+            (Some(channel), Some(draft_message_id)) => ChannelReplyDelivery::Draft {
+                channel,
+                msg,
+                draft_message_id,
+            },
+            (Some(channel), None) => ChannelReplyDelivery::Fresh { channel, msg },
+            (None, _) => ChannelReplyDelivery::None,
+        }
+    }
+}
+
+struct ChannelReplyRuntime<'a> {
+    plan: ChannelDeliveryPlan<'a>,
+    msg: &'a traits::ChannelMessage,
+    draft_message_id: Option<&'a str>,
+}
+
+enum LlmExecutionResult {
+    Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
+    Cancelled,
+}
+
+#[derive(Clone, Copy)]
+enum ChannelReplyDispatch {
+    Successful,
+    Terminal,
+}
+
+impl ChannelReplyDispatch {
+    fn fallback_to_fresh_send_on_finalize_failure(self) -> bool {
+        matches!(self, Self::Successful)
+    }
+
+    fn action_label(self) -> &'static str {
+        match self {
+            Self::Successful => "reply",
+            Self::Terminal => "terminal reply",
+        }
+    }
+}
+
+enum ChannelReplyDelivery<'a> {
+    None,
+    Fresh {
+        channel: &'a Arc<dyn Channel>,
+        msg: &'a traits::ChannelMessage,
+    },
+    Draft {
+        channel: &'a Arc<dyn Channel>,
+        msg: &'a traits::ChannelMessage,
+        draft_message_id: &'a str,
+    },
+}
+
+impl<'a> ChannelReplyRuntime<'a> {
+    fn delivery(&self) -> ChannelReplyDelivery<'_> {
+        self.plan.reply_delivery(self.msg, self.draft_message_id)
+    }
+
+    async fn send_reply(&self, text: &str, dispatch: ChannelReplyDispatch) -> anyhow::Result<()> {
+        match self.delivery() {
+            ChannelReplyDelivery::None => Ok(()),
+            ChannelReplyDelivery::Fresh { channel, msg } => {
+                send_channel_reply_message(channel, msg, text).await
+            }
+            ChannelReplyDelivery::Draft {
+                channel,
+                msg,
+                draft_message_id,
+            } => finalize_channel_reply_draft(channel, msg, draft_message_id, text, dispatch).await,
+        }
+    }
+
+    async fn send_successful_reply(&self, text: &str) -> anyhow::Result<()> {
+        self.send_reply(text, ChannelReplyDispatch::Successful)
+            .await
+    }
+
+    async fn send_terminal_reply(&self, text: &str) -> anyhow::Result<()> {
+        self.send_reply(text, ChannelReplyDispatch::Terminal).await
+    }
+
+    async fn cancel_draft(&self) {
+        let ChannelReplyDelivery::Draft {
+            channel,
+            msg,
+            draft_message_id,
+        } = self.delivery()
+        else {
+            return;
+        };
+
+        if let Err(err) = channel
+            .cancel_draft(&msg.reply_target, draft_message_id)
+            .await
+        {
+            tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
+        }
+    }
+
+    async fn refresh_completion_reaction(&self, emoji: &str) {
+        let (ChannelReplyDelivery::Fresh { channel, msg }
+        | ChannelReplyDelivery::Draft { channel, msg, .. }) = self.delivery()
+        else {
+            return;
+        };
+
+        let _ = channel
+            .remove_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
+            .await;
+        let _ = channel
+            .add_reaction(&msg.reply_target, &msg.id, emoji)
+            .await;
+    }
+}
+
+async fn send_channel_reply_message(
+    channel: &Arc<dyn Channel>,
+    msg: &traits::ChannelMessage,
+    text: &str,
+) -> anyhow::Result<()> {
+    channel
+        .send(&SendMessage::new(text, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .await
+}
+
+async fn finalize_channel_reply_draft(
+    channel: &Arc<dyn Channel>,
+    msg: &traits::ChannelMessage,
+    draft_message_id: &str,
+    text: &str,
+    dispatch: ChannelReplyDispatch,
+) -> anyhow::Result<()> {
+    match channel
+        .finalize_draft(&msg.reply_target, draft_message_id, text)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(err) if dispatch.fallback_to_fresh_send_on_finalize_failure() => {
+            tracing::warn!(
+                "Failed to finalize draft on {}: {err}; sending as new message",
+                channel.name()
+            );
+            send_channel_reply_message(channel, msg, text).await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn log_failed_channel_reply(
+    reply_runtime: &ChannelReplyRuntime<'_>,
+    action_label: &str,
+    err: &anyhow::Error,
+) {
+    if let Some(channel) = reply_runtime.plan.channel {
+        eprintln!(
+            "  ❌ Failed to send {action_label} on {}: {err}",
+            channel.name()
+        );
+    }
+}
+
+async fn dispatch_successful_channel_reply(reply_runtime: &ChannelReplyRuntime<'_>, text: &str) {
+    if let Err(err) = reply_runtime.send_successful_reply(text).await {
+        log_failed_channel_reply(
+            reply_runtime,
+            ChannelReplyDispatch::Successful.action_label(),
+            &err,
+        );
+    }
+}
+
+async fn dispatch_terminal_channel_reply(reply_runtime: &ChannelReplyRuntime<'_>, text: &str) {
+    if let Err(err) = reply_runtime.send_terminal_reply(text).await {
+        log_failed_channel_reply(
+            reply_runtime,
+            ChannelReplyDispatch::Terminal.action_label(),
+            &err,
+        );
+    }
+}
+
+async fn finish_suppressed_channel_reply(
+    reply_runtime: &ChannelReplyRuntime<'_>,
+    reaction_done_emoji: &str,
+) {
+    reply_runtime.cancel_draft().await;
+    reply_runtime
+        .refresh_completion_reaction(reaction_done_emoji)
+        .await;
+}
+
+enum PreparedChannelReply {
+    Suppressed,
+    Deliver(String),
+}
+
+async fn prepare_outbound_channel_reply(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    provider: Option<&str>,
+    model: Option<&str>,
+    outbound_response: String,
+) -> PreparedChannelReply {
+    let original_response = outbound_response.clone();
+    let outbound_response = if let Some(hooks) = &ctx.hooks {
+        match hooks
+            .run_on_message_sending(
+                msg.channel.clone(),
+                msg.reply_target.clone(),
+                outbound_response,
+            )
+            .await
+        {
+            crate::hooks::HookResult::Cancel(reason) => {
+                tracing::info!(%reason, "outgoing message suppressed by hook");
+                return PreparedChannelReply::Suppressed;
+            }
+            crate::hooks::HookResult::Continue((
+                hook_channel,
+                hook_recipient,
+                mut modified_content,
+            )) => {
+                if hook_channel != msg.channel || hook_recipient != msg.reply_target {
+                    tracing::warn!(
+                        from_channel = %msg.channel,
+                        from_recipient = %msg.reply_target,
+                        to_channel = %hook_channel,
+                        to_recipient = %hook_recipient,
+                        "on_message_sending attempted to rewrite channel routing; only content mutation is applied"
+                    );
+                }
+
+                let modified_len = modified_content.chars().count();
+                if modified_len > CHANNEL_HOOK_MAX_OUTBOUND_CHARS {
+                    tracing::warn!(
+                        limit = CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
+                        attempted = modified_len,
+                        "hook-modified outbound content exceeded limit; truncating"
+                    );
+                    modified_content =
+                        truncate_with_ellipsis(&modified_content, CHANNEL_HOOK_MAX_OUTBOUND_CHARS);
+                }
+
+                if modified_content != original_response {
+                    tracing::info!(
+                        channel = %msg.channel,
+                        sender = %msg.sender,
+                        before_len = original_response.chars().count(),
+                        after_len = modified_content.chars().count(),
+                        "outgoing message content modified by hook"
+                    );
+                }
+
+                modified_content
+            }
+        }
+    } else {
+        outbound_response
+    };
+
+    let leak_guard_cfg = runtime_outbound_leak_guard_snapshot(ctx);
+    let delivered_response = match sanitize_channel_response(
+        &outbound_response,
+        ctx.tools_registry.as_ref(),
+        &leak_guard_cfg,
+    ) {
+        ChannelSanitizationResult::Sanitized(sanitized_response) => {
+            if sanitized_response.is_empty() && !outbound_response.trim().is_empty() {
+                "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
+            } else {
+                sanitized_response
+            }
+        }
+        ChannelSanitizationResult::Blocked { patterns, redacted } => {
+            runtime_trace::record_event(
+                "channel_message_outbound_blocked_leak_guard",
+                Some(msg.channel.as_str()),
+                provider,
+                model,
+                None,
+                Some(false),
+                Some("Outbound response blocked by security.outbound_leak_guard"),
+                serde_json::json!({
+                    "sender": msg.sender,
+                    "patterns": patterns,
+                    "redacted_preview": scrub_credentials(&truncate_with_ellipsis(&redacted, 256)),
+                }),
+            );
+            "I blocked part of my draft response because it appeared to contain credential material. Please ask me to provide a redacted summary.".to_string()
+        }
+    };
+
+    PreparedChannelReply::Deliver(delivered_response)
+}
+
+async fn record_and_send_successful_channel_reply(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    history_key: &str,
+    history: &[ChatMessage],
+    history_len_before_tools: usize,
+    delivered_response: &str,
+    reply_runtime: &ChannelReplyRuntime<'_>,
+    started_at: Instant,
+) {
+    let tool_summary = extract_tool_context_summary(history, history_len_before_tools);
+    let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
+        delivered_response.to_string()
+    } else {
+        format!("{tool_summary}\n{delivered_response}")
+    };
+
+    append_sender_turn(ctx, history_key, ChatMessage::assistant(&history_response));
+    if ctx.auto_save_memory && delivered_response.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
+        let assistant_key = assistant_memory_key(msg);
+        let _ = ctx
+            .memory
+            .store(
+                &assistant_key,
+                delivered_response,
+                crate::memory::MemoryCategory::Conversation,
+                None,
+            )
+            .await;
+    }
+
+    println!(
+        "  🤖 Reply ({}ms): {}",
+        started_at.elapsed().as_millis(),
+        truncate_with_ellipsis(delivered_response, 80)
+    );
+    dispatch_successful_channel_reply(reply_runtime, delivered_response).await;
+}
+
+async fn handle_terminal_llm_execution_result(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    route: &ChannelRouteSelection,
+    reply_runtime: &ChannelReplyRuntime<'_>,
+    history_key: &str,
+    persisted_user_content: &str,
+    runtime_constraint_summary: &[String],
+    timeout_budget_secs: u64,
+    started_at: Instant,
+    cancellation_token: &CancellationToken,
+    result: Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>,
+) {
+    match result {
+        Ok(Err(e)) => {
+            if crate::agent::loop_::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled()
+            {
+                tracing::info!(
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    "Cancelled in-flight channel request due to newer message"
+                );
+                runtime_trace::record_event(
+                    "channel_message_cancelled",
+                    Some(msg.channel.as_str()),
+                    Some(route.provider.as_str()),
+                    Some(route.model.as_str()),
+                    None,
+                    Some(false),
+                    Some("cancelled during tool-call loop"),
+                    serde_json::json!({
+                        "sender": msg.sender,
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                    }),
+                );
+                reply_runtime.cancel_draft().await;
+            } else if is_context_window_overflow_error(&e) {
+                let compacted = compact_sender_history(ctx, history_key);
+                let error_text = if compacted {
+                    "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
+                } else {
+                    "⚠️ Context window exceeded for this conversation. Please resend your last message."
+                };
+                eprintln!(
+                    "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
+                    started_at.elapsed().as_millis(),
+                    compacted
+                );
+                runtime_trace::record_event(
+                    "channel_message_error",
+                    Some(msg.channel.as_str()),
+                    Some(route.provider.as_str()),
+                    Some(route.model.as_str()),
+                    None,
+                    Some(false),
+                    Some("context window exceeded"),
+                    serde_json::json!({
+                        "sender": msg.sender,
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                        "history_compacted": compacted,
+                    }),
+                );
+                dispatch_terminal_channel_reply(reply_runtime, error_text).await;
+            } else if is_tool_iteration_limit_error(&e) {
+                let limit = ctx.max_tool_iterations.max(1);
+                let pause_text = append_runtime_constraint_summary(
+                    &format!(
+                        "⚠️ Reached tool-iteration limit ({limit}) for this turn. Context and progress were preserved. Reply \"continue\" to resume, or increase `agent.max_tool_iterations`."
+                    ),
+                    runtime_constraint_summary,
+                );
+                runtime_trace::record_event(
+                    "channel_message_error",
+                    Some(msg.channel.as_str()),
+                    Some(route.provider.as_str()),
+                    Some(route.model.as_str()),
+                    None,
+                    Some(false),
+                    Some("tool iteration limit reached"),
+                    serde_json::json!({
+                        "sender": msg.sender,
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                        "max_tool_iterations": limit,
+                    }),
+                );
+                append_sender_turn(ctx, history_key, ChatMessage::assistant(&pause_text));
+                dispatch_terminal_channel_reply(reply_runtime, &pause_text).await;
+            } else {
+                eprintln!(
+                    "  ❌ LLM error after {}ms: {e}",
+                    started_at.elapsed().as_millis()
+                );
+                let safe_error = providers::sanitize_api_error(&e.to_string());
+                runtime_trace::record_event(
+                    "channel_message_error",
+                    Some(msg.channel.as_str()),
+                    Some(route.provider.as_str()),
+                    Some(route.model.as_str()),
+                    None,
+                    Some(false),
+                    Some(&safe_error),
+                    serde_json::json!({
+                        "sender": msg.sender,
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                    }),
+                );
+                let should_rollback_user_turn = e
+                    .downcast_ref::<providers::ProviderCapabilityError>()
+                    .is_some_and(|capability| capability.capability.eq_ignore_ascii_case("vision"));
+                let rolled_back = should_rollback_user_turn
+                    && rollback_orphan_user_turn(ctx, history_key, persisted_user_content);
+
+                if !rolled_back {
+                    // Close the orphan user turn so subsequent messages don't
+                    // inherit this failed request as unfinished context.
+                    append_sender_turn(
+                        ctx,
+                        history_key,
+                        ChatMessage::assistant("[Task failed — not continuing this request]"),
+                    );
+                }
+                let error_text = format!("⚠️ Error: {e}");
+                dispatch_terminal_channel_reply(reply_runtime, &error_text).await;
+            }
+        }
+        Err(_) => {
+            let timeout_msg = format!(
+                "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
+                timeout_budget_secs, ctx.message_timeout_secs, ctx.max_tool_iterations
+            );
+            runtime_trace::record_event(
+                "channel_message_timeout",
+                Some(msg.channel.as_str()),
+                Some(route.provider.as_str()),
+                Some(route.model.as_str()),
+                None,
+                Some(false),
+                Some(&timeout_msg),
+                serde_json::json!({
+                    "sender": msg.sender,
+                    "elapsed_ms": started_at.elapsed().as_millis(),
+                }),
+            );
+            eprintln!(
+                "  ❌ {} (elapsed: {}ms)",
+                timeout_msg,
+                started_at.elapsed().as_millis()
+            );
+            // Close the orphan user turn so subsequent messages don't
+            // inherit this timed-out request as unfinished context.
+            append_sender_turn(
+                ctx,
+                history_key,
+                ChatMessage::assistant("[Task timed out — not continuing this request]"),
+            );
+            let error_text = "⚠️ Request timed out while waiting for the model. Please try again.";
+            dispatch_terminal_channel_reply(reply_runtime, error_text).await;
+        }
+        Ok(Ok(_)) => {}
+    }
+}
+
+async fn handle_channel_llm_execution_outcome(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    route: &ChannelRouteSelection,
+    reply_runtime: &ChannelReplyRuntime<'_>,
+    history_key: &str,
+    history: &[ChatMessage],
+    history_len_before_tools: usize,
+    persisted_user_content: &str,
+    runtime_constraint_summary: &[String],
+    timeout_budget_secs: u64,
+    started_at: Instant,
+    cancellation_token: &CancellationToken,
+    reaction_done_emoji: &str,
+    llm_result: LlmExecutionResult,
+) -> bool {
+    match llm_result {
+        LlmExecutionResult::Cancelled => {
+            tracing::info!(
+                channel = %msg.channel,
+                sender = %msg.sender,
+                "Cancelled in-flight channel request due to newer message"
+            );
+            runtime_trace::record_event(
+                "channel_message_cancelled",
+                Some(msg.channel.as_str()),
+                Some(route.provider.as_str()),
+                Some(route.model.as_str()),
+                None,
+                Some(false),
+                Some("cancelled due to newer inbound message"),
+                serde_json::json!({
+                    "sender": msg.sender,
+                    "elapsed_ms": started_at.elapsed().as_millis(),
+                }),
+            );
+            reply_runtime.cancel_draft().await;
+        }
+        LlmExecutionResult::Completed(Ok(Ok(response))) => {
+            return handle_successful_channel_llm_execution_outcome(
+                ctx,
+                msg,
+                route,
+                reply_runtime,
+                history_key,
+                history,
+                history_len_before_tools,
+                started_at,
+                reaction_done_emoji,
+                response,
+            )
+            .await
+        }
+        LlmExecutionResult::Completed(result) => {
+            handle_terminal_llm_execution_result(
+                ctx,
+                msg,
+                route,
+                reply_runtime,
+                history_key,
+                persisted_user_content,
+                runtime_constraint_summary,
+                timeout_budget_secs,
+                started_at,
+                cancellation_token,
+                result,
+            )
+            .await;
+        }
+    }
+
+    false
+}
+
+async fn finalize_channel_llm_execution(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    route: &ChannelRouteSelection,
+    target_channel: Option<&Arc<dyn Channel>>,
+    draft_message_id: Option<&str>,
+    draft_updater: Option<tokio::task::JoinHandle<()>>,
+    approval_prompt_dispatcher: Option<tokio::task::JoinHandle<()>>,
+    typing_cancellation: Option<&CancellationToken>,
+    typing_task: Option<tokio::task::JoinHandle<()>>,
+    history_key: &str,
+    history: &[ChatMessage],
+    history_len_before_tools: usize,
+    persisted_user_content: &str,
+    timeout_budget_secs: u64,
+    started_at: Instant,
+    cancellation_token: &CancellationToken,
+    llm_result: LlmExecutionResult,
+) -> bool {
+    if let Some(handle) = draft_updater {
+        let _ = handle.await;
+    }
+    if let Some(handle) = approval_prompt_dispatcher {
+        let _ = handle.await;
+    }
+
+    if let Some(token) = typing_cancellation {
+        token.cancel();
+    }
+    if let Some(handle) = typing_task {
+        log_worker_join_result(handle.await);
+    }
+
+    let runtime_constraint_summary =
+        extract_runtime_constraint_summary(history, history_len_before_tools);
+    let reply_runtime = ChannelReplyRuntime {
+        plan: ChannelDeliveryPlan::new(target_channel),
+        msg,
+        draft_message_id,
+    };
+
+    let reaction_done_emoji = match &llm_result {
+        LlmExecutionResult::Completed(Ok(Ok(_))) => "\u{2705}", // ✅
+        _ => "\u{26A0}\u{FE0F}",                                // ⚠️
+    };
+
+    if handle_channel_llm_execution_outcome(
+        ctx,
+        msg,
+        route,
+        &reply_runtime,
+        history_key,
+        history,
+        history_len_before_tools,
+        persisted_user_content,
+        &runtime_constraint_summary,
+        timeout_budget_secs,
+        started_at,
+        cancellation_token,
+        reaction_done_emoji,
+        llm_result,
+    )
+    .await
+    {
+        return true;
+    }
+
+    // Swap 👀 → ✅ (or ⚠️ on error) to signal processing is complete.
+    reply_runtime
+        .refresh_completion_reaction(reaction_done_emoji)
+        .await;
+    false
+}
+
+async fn handle_successful_channel_llm_execution_outcome(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    route: &ChannelRouteSelection,
+    reply_runtime: &ChannelReplyRuntime<'_>,
+    history_key: &str,
+    history: &[ChatMessage],
+    history_len_before_tools: usize,
+    started_at: Instant,
+    reaction_done_emoji: &str,
+    response: String,
+) -> bool {
+    let Some(delivered_response) = prepare_successful_channel_reply_delivery(
+        ctx,
+        msg,
+        Some(route.provider.as_str()),
+        Some(route.model.as_str()),
+        reply_runtime,
+        reaction_done_emoji,
+        response,
+    )
+    .await
+    else {
+        return true;
+    };
+
+    runtime_trace::record_event(
+        "channel_message_outbound",
+        Some(msg.channel.as_str()),
+        Some(route.provider.as_str()),
+        Some(route.model.as_str()),
+        None,
+        Some(true),
+        None,
+        serde_json::json!({
+            "sender": msg.sender,
+            "elapsed_ms": started_at.elapsed().as_millis(),
+            "response": scrub_credentials(&delivered_response),
+        }),
+    );
+    record_and_send_successful_channel_reply(
+        ctx,
+        msg,
+        history_key,
+        history,
+        history_len_before_tools,
+        &delivered_response,
+        reply_runtime,
+        started_at,
+    )
+    .await;
+
+    false
+}
+
+async fn prepare_successful_channel_reply_delivery(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    provider: Option<&str>,
+    model: Option<&str>,
+    reply_runtime: &ChannelReplyRuntime<'_>,
+    reaction_done_emoji: &str,
+    response: String,
+) -> Option<String> {
+    match prepare_outbound_channel_reply(ctx, msg, provider, model, response).await {
+        PreparedChannelReply::Suppressed => {
+            finish_suppressed_channel_reply(reply_runtime, reaction_done_emoji).await;
+            None
+        }
+        PreparedChannelReply::Deliver(delivered_response) => Some(delivered_response),
+    }
+}
+
 async fn setup_draft_streaming_runtime(
     target_channel: Option<&Arc<dyn Channel>>,
     reply_target: &str,
     thread_ts: Option<String>,
-    progress_mode: ProgressMode,
+    progress_policy: ChannelProgressPolicy,
 ) -> DraftStreamingRuntime {
-    let use_streaming = target_channel
-        .as_ref()
-        .is_some_and(|channel| channel.supports_draft_updates());
+    let plan = ChannelDeliveryPlan::new(target_channel);
 
     tracing::debug!(
-        has_target_channel = target_channel.is_some(),
-        use_streaming,
-        supports_draft = target_channel
-            .as_ref()
-            .map_or(false, |channel| channel.supports_draft_updates()),
+        has_target_channel = plan.channel.is_some(),
+        use_streaming = plan.supports_draft_updates,
+        supports_draft = plan.supports_draft_updates,
         "Draft streaming decision"
     );
 
-    let (delta_tx, delta_rx) = if use_streaming {
+    let (delta_tx, delta_rx) = if plan.supports_draft_updates {
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
         (Some(tx), Some(rx))
     } else {
         (None, None)
     };
 
-    let draft_message_id = if let Some(channel) = target_channel.filter(|_| use_streaming) {
-        match channel
-            .send_draft(&SendMessage::new("...", reply_target).in_thread(thread_ts.clone()))
-            .await
-        {
-            Ok(id) => id,
-            Err(error) => {
-                tracing::debug!("Failed to send draft on {}: {error}", channel.name());
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let updater = if let (Some(mut rx), Some(draft_id_ref), Some(channel_ref)) =
-        (delta_rx, draft_message_id.as_deref(), target_channel)
-    {
-        let channel = Arc::clone(channel_ref);
-        let reply_target = reply_target.to_string();
-        let draft_id = draft_id_ref.to_string();
-        Some(tokio::spawn(async move {
-            let mut accumulated = String::new();
-            while let Some(delta) = rx.recv().await {
-                let Some(display_text) =
-                    apply_draft_stream_delta(&mut accumulated, progress_mode, &delta)
-                else {
-                    continue;
-                };
-                if let Err(error) = channel
-                    .update_draft(&reply_target, &draft_id, &display_text)
-                    .await
-                {
-                    tracing::debug!("Draft update failed: {error}");
-                }
-            }
-        }))
-    } else {
-        None
-    };
+    let draft_message_id = send_initial_streaming_draft(plan, reply_target, thread_ts).await;
+    let updater = spawn_draft_streaming_updater(
+        plan,
+        delta_rx,
+        draft_message_id.as_deref(),
+        reply_target,
+        progress_policy,
+    );
 
     DraftStreamingRuntime {
         delta_tx,
@@ -971,51 +1740,62 @@ async fn setup_draft_streaming_runtime(
     }
 }
 
-async fn send_or_finalize_channel_reply(
-    channel: &Arc<dyn Channel>,
-    msg: &traits::ChannelMessage,
-    draft_message_id: Option<&str>,
-    text: &str,
-    fallback_to_fresh_send_on_finalize_failure: bool,
-) -> anyhow::Result<()> {
-    if let Some(draft_id) = draft_message_id {
-        match channel
-            .finalize_draft(&msg.reply_target, draft_id, text)
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(err) if fallback_to_fresh_send_on_finalize_failure => {
-                tracing::warn!(
-                    "Failed to finalize draft on {}: {err}; sending as new message",
-                    channel.name()
-                );
-                channel
-                    .send(
-                        &SendMessage::new(text, &msg.reply_target).in_thread(msg.thread_ts.clone()),
-                    )
-                    .await
-            }
-            Err(err) => Err(err),
+async fn send_initial_streaming_draft(
+    plan: ChannelDeliveryPlan<'_>,
+    reply_target: &str,
+    thread_ts: Option<String>,
+) -> Option<String> {
+    let Some(channel) = plan.draft_channel() else {
+        return None;
+    };
+
+    match channel
+        .send_draft(&SendMessage::new("...", reply_target).in_thread(thread_ts))
+        .await
+    {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::debug!("Failed to send draft on {}: {error}", channel.name());
+            None
         }
-    } else {
-        channel
-            .send(&SendMessage::new(text, &msg.reply_target).in_thread(msg.thread_ts.clone()))
-            .await
     }
 }
 
-async fn cancel_channel_draft(
-    channel: &Arc<dyn Channel>,
-    reply_target: &str,
+fn spawn_draft_streaming_updater(
+    plan: ChannelDeliveryPlan<'_>,
+    delta_rx: Option<tokio::sync::mpsc::Receiver<String>>,
     draft_message_id: Option<&str>,
-) {
-    let Some(draft_id) = draft_message_id else {
-        return;
+    reply_target: &str,
+    progress_policy: ChannelProgressPolicy,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let (Some(mut rx), Some(draft_id_ref), Some(channel_ref)) =
+        (delta_rx, draft_message_id, plan.draft_channel())
+    else {
+        return None;
     };
 
-    if let Err(err) = channel.cancel_draft(reply_target, draft_id).await {
-        tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
-    }
+    let channel = Arc::clone(channel_ref);
+    let reply_target = reply_target.to_string();
+    let draft_id = draft_id_ref.to_string();
+    Some(tokio::spawn(async move {
+        let mut accumulated = String::new();
+        let mut active_draft_id = draft_id;
+        while let Some(delta) = rx.recv().await {
+            let Some(display_text) =
+                apply_draft_stream_delta(&mut accumulated, progress_policy, &delta)
+            else {
+                continue;
+            };
+            match channel
+                .update_draft(&reply_target, &active_draft_id, &display_text)
+                .await
+            {
+                Ok(Some(next_draft_id)) => active_draft_id = next_draft_id,
+                Ok(None) => {}
+                Err(error) => tracing::debug!("Draft update failed: {error}"),
+            }
+        }
+    }))
 }
 
 fn build_channel_system_prompt(
@@ -2076,42 +2856,7 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 }
 
 fn truncate_compacted_turn_content_preserving_lifecycle(content: &str, max_chars: usize) -> String {
-    if content.chars().count() <= max_chars {
-        return content.to_string();
-    }
-
-    if !is_high_priority_progress_update(content) {
-        return truncate_with_ellipsis(content, max_chars);
-    }
-
-    let pinned_lifecycle = collect_structured_lifecycle_lines(content);
-    if pinned_lifecycle.is_empty() {
-        return truncate_with_ellipsis(content, max_chars);
-    }
-
-    let pinned_prefix = pinned_lifecycle.join("\n");
-    let budget_for_body = max_chars.saturating_sub(pinned_prefix.chars().count());
-    let body = truncate_with_ellipsis(content, budget_for_body.saturating_sub(2));
-    let merged = format!("{pinned_prefix}\n\n{body}");
-    truncate_with_ellipsis(&merged, max_chars)
-}
-
-fn collect_structured_lifecycle_lines(content: &str) -> Vec<String> {
-    let mut lines = Vec::new();
-
-    for line in content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
-        if is_structured_lifecycle_or_policy_line(line) {
-            if lines.last().map_or(true, |last| last != line) {
-                lines.push(line.to_string());
-            }
-        }
-    }
-
-    lines
+    truncate_progress_preserving_structured_lines(content, max_chars)
 }
 
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
@@ -3310,7 +4055,7 @@ fn extract_runtime_constraint_summary(history: &[ChatMessage], start_index: usiz
         }
     }
 
-    summarize_runtime_constraint_reasons(reasons.iter().map(String::as_str), 3)
+    summarize_runtime_constraint_reasons_default(reasons.iter().map(String::as_str), 3)
 }
 
 fn append_runtime_constraint_summary(base: &str, reasons: &[String]) -> String {
@@ -3691,7 +4436,8 @@ async fn process_channel_message(
         msg
     };
 
-    let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
+    let target_channel =
+        resolve_runtime_channel_entry(&ctx.channels_by_name, &msg.channel).cloned();
     if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
         tracing::warn!("Failed to apply runtime config update: {err}");
     }
@@ -3899,8 +4645,9 @@ or tune thresholds in config.",
 
     let expose_internal_tool_details =
         msg.channel == "cli" || should_expose_internal_tool_details(&msg.content);
-    let progress_mode =
-        effective_progress_mode_for_message(msg.channel.as_str(), expose_internal_tool_details);
+    let progress_policy =
+        ChannelProgressPolicy::for_message(msg.channel.as_str(), expose_internal_tool_details);
+    let progress_mode = progress_policy.mode();
     let excluded_tools_snapshot = if msg.channel == "cli" {
         Vec::new()
     } else {
@@ -3928,7 +4675,7 @@ or tune thresholds in config.",
         target_channel.as_ref(),
         &msg.reply_target,
         msg.thread_ts.clone(),
-        progress_mode,
+        progress_policy,
     )
     .await;
 
@@ -3954,11 +4701,6 @@ or tune thresholds in config.",
 
     // Record history length before tool loop so we can extract tool context after.
     let history_len_before_tools = history.len();
-
-    enum LlmExecutionResult {
-        Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
-        Cancelled,
-    }
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
@@ -4038,407 +4780,28 @@ or tune thresholds in config.",
         ) => LlmExecutionResult::Completed(result),
     };
 
-    if let Some(handle) = draft_updater {
-        let _ = handle.await;
-    }
-    if let Some(handle) = approval_prompt_dispatcher {
-        let _ = handle.await;
-    }
-
-    if let Some(token) = typing_cancellation.as_ref() {
-        token.cancel();
-    }
-    if let Some(handle) = typing_task {
-        log_worker_join_result(handle.await);
-    }
-
-    let runtime_constraint_summary =
-        extract_runtime_constraint_summary(&history, history_len_before_tools);
-
-    let reaction_done_emoji = match &llm_result {
-        LlmExecutionResult::Completed(Ok(Ok(_))) => "\u{2705}", // ✅
-        _ => "\u{26A0}\u{FE0F}",                                // ⚠️
-    };
-
-    match llm_result {
-        LlmExecutionResult::Cancelled => {
-            tracing::info!(
-                channel = %msg.channel,
-                sender = %msg.sender,
-                "Cancelled in-flight channel request due to newer message"
-            );
-            runtime_trace::record_event(
-                "channel_message_cancelled",
-                Some(msg.channel.as_str()),
-                Some(route.provider.as_str()),
-                Some(route.model.as_str()),
-                None,
-                Some(false),
-                Some("cancelled due to newer inbound message"),
-                serde_json::json!({
-                    "sender": msg.sender,
-                    "elapsed_ms": started_at.elapsed().as_millis(),
-                }),
-            );
-            if let Some(channel) = target_channel.as_ref() {
-                cancel_channel_draft(channel, &msg.reply_target, draft_message_id.as_deref()).await;
-            }
-        }
-        LlmExecutionResult::Completed(Ok(Ok(response))) => {
-            // ── Hook: on_message_sending (modifying) ─────────
-            let mut outbound_response = response;
-            if let Some(hooks) = &ctx.hooks {
-                match hooks
-                    .run_on_message_sending(
-                        msg.channel.clone(),
-                        msg.reply_target.clone(),
-                        outbound_response.clone(),
-                    )
-                    .await
-                {
-                    crate::hooks::HookResult::Cancel(reason) => {
-                        tracing::info!(%reason, "outgoing message suppressed by hook");
-                        return;
-                    }
-                    crate::hooks::HookResult::Continue((
-                        hook_channel,
-                        hook_recipient,
-                        mut modified_content,
-                    )) => {
-                        if hook_channel != msg.channel || hook_recipient != msg.reply_target {
-                            tracing::warn!(
-                                from_channel = %msg.channel,
-                                from_recipient = %msg.reply_target,
-                                to_channel = %hook_channel,
-                                to_recipient = %hook_recipient,
-                                "on_message_sending attempted to rewrite channel routing; only content mutation is applied"
-                            );
-                        }
-
-                        let modified_len = modified_content.chars().count();
-                        if modified_len > CHANNEL_HOOK_MAX_OUTBOUND_CHARS {
-                            tracing::warn!(
-                                limit = CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
-                                attempted = modified_len,
-                                "hook-modified outbound content exceeded limit; truncating"
-                            );
-                            modified_content = truncate_with_ellipsis(
-                                &modified_content,
-                                CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
-                            );
-                        }
-
-                        if modified_content != outbound_response {
-                            tracing::info!(
-                                channel = %msg.channel,
-                                sender = %msg.sender,
-                                before_len = outbound_response.chars().count(),
-                                after_len = modified_content.chars().count(),
-                                "outgoing message content modified by hook"
-                            );
-                        }
-
-                        outbound_response = modified_content;
-                    }
-                }
-            }
-
-            let leak_guard_cfg = runtime_outbound_leak_guard_snapshot(ctx.as_ref());
-            let delivered_response = match sanitize_channel_response(
-                &outbound_response,
-                ctx.tools_registry.as_ref(),
-                &leak_guard_cfg,
-            ) {
-                ChannelSanitizationResult::Sanitized(sanitized_response) => {
-                    if sanitized_response.is_empty() && !outbound_response.trim().is_empty() {
-                        "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
-                    } else {
-                        sanitized_response
-                    }
-                }
-                ChannelSanitizationResult::Blocked { patterns, redacted } => {
-                    runtime_trace::record_event(
-                        "channel_message_outbound_blocked_leak_guard",
-                        Some(msg.channel.as_str()),
-                        Some(route.provider.as_str()),
-                        Some(route.model.as_str()),
-                        None,
-                        Some(false),
-                        Some("Outbound response blocked by security.outbound_leak_guard"),
-                        serde_json::json!({
-                            "sender": msg.sender,
-                            "patterns": patterns,
-                            "redacted_preview": scrub_credentials(&truncate_with_ellipsis(&redacted, 256)),
-                        }),
-                    );
-                    "I blocked part of my draft response because it appeared to contain credential material. Please ask me to provide a redacted summary.".to_string()
-                }
-            };
-            runtime_trace::record_event(
-                "channel_message_outbound",
-                Some(msg.channel.as_str()),
-                Some(route.provider.as_str()),
-                Some(route.model.as_str()),
-                None,
-                Some(true),
-                None,
-                serde_json::json!({
-                    "sender": msg.sender,
-                    "elapsed_ms": started_at.elapsed().as_millis(),
-                    "response": scrub_credentials(&delivered_response),
-                }),
-            );
-
-            // Extract condensed tool-use context from the history messages
-            // added during run_tool_call_loop, so the LLM retains awareness
-            // of what it did on subsequent turns.
-            let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
-            let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
-                delivered_response.clone()
-            } else {
-                format!("{tool_summary}\n{delivered_response}")
-            };
-
-            append_sender_turn(
-                ctx.as_ref(),
-                &history_key,
-                ChatMessage::assistant(&history_response),
-            );
-            if ctx.auto_save_memory
-                && delivered_response.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-            {
-                let assistant_key = assistant_memory_key(&msg);
-                let _ = ctx
-                    .memory
-                    .store(
-                        &assistant_key,
-                        &delivered_response,
-                        crate::memory::MemoryCategory::Conversation,
-                        None,
-                    )
-                    .await;
-            }
-            println!(
-                "  🤖 Reply ({}ms): {}",
-                started_at.elapsed().as_millis(),
-                truncate_with_ellipsis(&delivered_response, 80)
-            );
-            if let Some(channel) = target_channel.as_ref() {
-                if let Err(e) = send_or_finalize_channel_reply(
-                    channel,
-                    &msg,
-                    draft_message_id.as_deref(),
-                    &delivered_response,
-                    true,
-                )
-                .await
-                {
-                    eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
-                }
-            }
-        }
-        LlmExecutionResult::Completed(Ok(Err(e))) => {
-            if crate::agent::loop_::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled()
-            {
-                tracing::info!(
-                    channel = %msg.channel,
-                    sender = %msg.sender,
-                    "Cancelled in-flight channel request due to newer message"
-                );
-                runtime_trace::record_event(
-                    "channel_message_cancelled",
-                    Some(msg.channel.as_str()),
-                    Some(route.provider.as_str()),
-                    Some(route.model.as_str()),
-                    None,
-                    Some(false),
-                    Some("cancelled during tool-call loop"),
-                    serde_json::json!({
-                        "sender": msg.sender,
-                        "elapsed_ms": started_at.elapsed().as_millis(),
-                    }),
-                );
-                if let Some(channel) = target_channel.as_ref() {
-                    cancel_channel_draft(channel, &msg.reply_target, draft_message_id.as_deref())
-                        .await;
-                }
-            } else if is_context_window_overflow_error(&e) {
-                let compacted = compact_sender_history(ctx.as_ref(), &history_key);
-                let error_text = if compacted {
-                    "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
-                } else {
-                    "⚠️ Context window exceeded for this conversation. Please resend your last message."
-                };
-                eprintln!(
-                    "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
-                    started_at.elapsed().as_millis(),
-                    compacted
-                );
-                runtime_trace::record_event(
-                    "channel_message_error",
-                    Some(msg.channel.as_str()),
-                    Some(route.provider.as_str()),
-                    Some(route.model.as_str()),
-                    None,
-                    Some(false),
-                    Some("context window exceeded"),
-                    serde_json::json!({
-                        "sender": msg.sender,
-                        "elapsed_ms": started_at.elapsed().as_millis(),
-                        "history_compacted": compacted,
-                    }),
-                );
-                if let Some(channel) = target_channel.as_ref() {
-                    let _ = send_or_finalize_channel_reply(
-                        channel,
-                        &msg,
-                        draft_message_id.as_deref(),
-                        error_text,
-                        false,
-                    )
-                    .await;
-                }
-            } else if is_tool_iteration_limit_error(&e) {
-                let limit = ctx.max_tool_iterations.max(1);
-                let pause_text = append_runtime_constraint_summary(
-                    &format!(
-                    "⚠️ Reached tool-iteration limit ({limit}) for this turn. Context and progress were preserved. Reply \"continue\" to resume, or increase `agent.max_tool_iterations`."
-                    ),
-                    &runtime_constraint_summary,
-                );
-                runtime_trace::record_event(
-                    "channel_message_error",
-                    Some(msg.channel.as_str()),
-                    Some(route.provider.as_str()),
-                    Some(route.model.as_str()),
-                    None,
-                    Some(false),
-                    Some("tool iteration limit reached"),
-                    serde_json::json!({
-                        "sender": msg.sender,
-                        "elapsed_ms": started_at.elapsed().as_millis(),
-                        "max_tool_iterations": limit,
-                    }),
-                );
-                append_sender_turn(
-                    ctx.as_ref(),
-                    &history_key,
-                    ChatMessage::assistant(&pause_text),
-                );
-                if let Some(channel) = target_channel.as_ref() {
-                    let _ = send_or_finalize_channel_reply(
-                        channel,
-                        &msg,
-                        draft_message_id.as_deref(),
-                        &pause_text,
-                        false,
-                    )
-                    .await;
-                }
-            } else {
-                eprintln!(
-                    "  ❌ LLM error after {}ms: {e}",
-                    started_at.elapsed().as_millis()
-                );
-                let safe_error = providers::sanitize_api_error(&e.to_string());
-                runtime_trace::record_event(
-                    "channel_message_error",
-                    Some(msg.channel.as_str()),
-                    Some(route.provider.as_str()),
-                    Some(route.model.as_str()),
-                    None,
-                    Some(false),
-                    Some(&safe_error),
-                    serde_json::json!({
-                        "sender": msg.sender,
-                        "elapsed_ms": started_at.elapsed().as_millis(),
-                    }),
-                );
-                let should_rollback_user_turn = e
-                    .downcast_ref::<providers::ProviderCapabilityError>()
-                    .is_some_and(|capability| capability.capability.eq_ignore_ascii_case("vision"));
-                let rolled_back = should_rollback_user_turn
-                    && rollback_orphan_user_turn(
-                        ctx.as_ref(),
-                        &history_key,
-                        &persisted_user_content,
-                    );
-
-                if !rolled_back {
-                    // Close the orphan user turn so subsequent messages don't
-                    // inherit this failed request as unfinished context.
-                    append_sender_turn(
-                        ctx.as_ref(),
-                        &history_key,
-                        ChatMessage::assistant("[Task failed — not continuing this request]"),
-                    );
-                }
-                if let Some(channel) = target_channel.as_ref() {
-                    let error_text = format!("⚠️ Error: {e}");
-                    let _ = send_or_finalize_channel_reply(
-                        channel,
-                        &msg,
-                        draft_message_id.as_deref(),
-                        &error_text,
-                        false,
-                    )
-                    .await;
-                }
-            }
-        }
-        LlmExecutionResult::Completed(Err(_)) => {
-            let timeout_msg = format!(
-                "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
-                timeout_budget_secs, ctx.message_timeout_secs, ctx.max_tool_iterations
-            );
-            runtime_trace::record_event(
-                "channel_message_timeout",
-                Some(msg.channel.as_str()),
-                Some(route.provider.as_str()),
-                Some(route.model.as_str()),
-                None,
-                Some(false),
-                Some(&timeout_msg),
-                serde_json::json!({
-                    "sender": msg.sender,
-                    "elapsed_ms": started_at.elapsed().as_millis(),
-                }),
-            );
-            eprintln!(
-                "  ❌ {} (elapsed: {}ms)",
-                timeout_msg,
-                started_at.elapsed().as_millis()
-            );
-            // Close the orphan user turn so subsequent messages don't
-            // inherit this timed-out request as unfinished context.
-            append_sender_turn(
-                ctx.as_ref(),
-                &history_key,
-                ChatMessage::assistant("[Task timed out — not continuing this request]"),
-            );
-            if let Some(channel) = target_channel.as_ref() {
-                let error_text =
-                    "⚠️ Request timed out while waiting for the model. Please try again.";
-                let _ = send_or_finalize_channel_reply(
-                    channel,
-                    &msg,
-                    draft_message_id.as_deref(),
-                    error_text,
-                    false,
-                )
-                .await;
-            }
-        }
-    }
-
-    // Swap 👀 → ✅ (or ⚠️ on error) to signal processing is complete
-    if let Some(channel) = target_channel.as_ref() {
-        let _ = channel
-            .remove_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
-            .await;
-        let _ = channel
-            .add_reaction(&msg.reply_target, &msg.id, reaction_done_emoji)
-            .await;
+    if finalize_channel_llm_execution(
+        ctx.as_ref(),
+        &msg,
+        &route,
+        target_channel.as_ref(),
+        draft_message_id.as_deref(),
+        draft_updater,
+        approval_prompt_dispatcher,
+        typing_cancellation.as_ref(),
+        typing_task,
+        &history_key,
+        &history,
+        history_len_before_tools,
+        &persisted_user_content,
+        timeout_budget_secs,
+        started_at,
+        &cancellation_token,
+        llm_result,
+    )
+    .await
+    {
+        return;
     }
 }
 
@@ -5081,6 +5444,21 @@ struct ConfiguredChannel {
     channel: Arc<dyn Channel>,
 }
 
+#[cfg(feature = "channel-lark")]
+fn configured_lark_channel(
+    config: &(impl LarkChannelConfig + ?Sized),
+    ack_reactions: &crate::config::schema::AckReactionChannelsConfig,
+) -> ConfiguredChannel {
+    let platform = config.platform();
+    ConfiguredChannel {
+        display_name: platform.display_name(),
+        channel: Arc::new(
+            LarkChannel::from_channel_config(config)
+                .with_ack_reaction(ack_reactions.for_lark_platform(platform)),
+        ),
+    }
+}
+
 fn collect_configured_channels(
     config: &Config,
     matrix_skip_context: &str,
@@ -5340,44 +5718,13 @@ fn collect_configured_channels(
     }
 
     #[cfg(feature = "channel-lark")]
-    if let Some(ref lk) = config.channels_config.lark {
-        if lk.use_feishu {
-            if config.channels_config.feishu.is_some() {
-                tracing::warn!(
-                    "Both [channels_config.feishu] and legacy [channels_config.lark].use_feishu=true are configured; ignoring legacy Feishu fallback in lark."
-                );
-            } else {
-                tracing::warn!(
-                    "Using legacy [channels_config.lark].use_feishu=true compatibility path; prefer [channels_config.feishu]."
-                );
-                channels.push(ConfiguredChannel {
-                    display_name: "Feishu",
-                    channel: Arc::new(
-                        LarkChannel::from_config(lk)
-                            .with_ack_reaction(config.channels_config.ack_reaction.feishu.clone()),
-                    ),
-                });
-            }
-        } else {
-            channels.push(ConfiguredChannel {
-                display_name: "Lark",
-                channel: Arc::new(
-                    LarkChannel::from_lark_config(lk)
-                        .with_ack_reaction(config.channels_config.ack_reaction.lark.clone()),
-                ),
-            });
+    {
+        for candidate in configured_lark_channels(&config.channels_config) {
+            channels.push(configured_lark_channel(
+                candidate.config,
+                &config.channels_config.ack_reaction,
+            ));
         }
-    }
-
-    #[cfg(feature = "channel-lark")]
-    if let Some(ref fs) = config.channels_config.feishu {
-        channels.push(ConfiguredChannel {
-            display_name: "Feishu",
-            channel: Arc::new(
-                LarkChannel::from_feishu_config(fs)
-                    .with_ack_reaction(config.channels_config.ack_reaction.feishu.clone()),
-            ),
-        });
     }
 
     #[cfg(not(feature = "channel-lark"))]
@@ -5972,8 +6319,16 @@ mod tests {
     use crate::tools::{Tool, ToolResult};
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
     use tempfile::TempDir;
+
+    fn runtime_channel_progress_mode_test_guard() -> MutexGuard<'static, ()> {
+        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        let mutex = GUARD.get_or_init(|| Mutex::new(()));
+        let guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+        set_runtime_channel_progress_modes(HashMap::new());
+        guard
+    }
 
     fn make_workspace() -> TempDir {
         let tmp = TempDir::new().unwrap();
@@ -7186,13 +7541,6 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let autonomy_cfg = crate::config::AutonomyConfig {
-            level: AutonomyLevel::Full,
-            auto_approve: vec!["mock_price".to_string()],
-            ..crate::config::AutonomyConfig::default()
-        };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
-
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(ToolCallingProvider),
@@ -7259,13 +7607,6 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
-
-        let autonomy_cfg = crate::config::AutonomyConfig {
-            level: AutonomyLevel::Full,
-            auto_approve: vec!["mock_price".to_string()],
-            ..crate::config::AutonomyConfig::default()
-        };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -7348,13 +7689,6 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let autonomy_cfg = crate::config::AutonomyConfig {
-            level: AutonomyLevel::Full,
-            auto_approve: vec!["mock_price".to_string()],
-            ..crate::config::AutonomyConfig::default()
-        };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
-
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(ToolCallingProvider),
@@ -7435,13 +7769,6 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
 
-        let autonomy_cfg = crate::config::AutonomyConfig {
-            level: AutonomyLevel::Full,
-            auto_approve: vec!["mock_price".to_string()],
-            ..crate::config::AutonomyConfig::default()
-        };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
-
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(ToolCallingProvider),
@@ -7520,7 +7847,6 @@ BTC is currently around $65,000 based on latest tool output."#
             ..crate::config::AutonomyConfig::default()
         };
         let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
-
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(PolicyBlockedToolProvider),
@@ -7668,6 +7994,18 @@ BTC is currently around $65,000 based on latest tool output."#
             "command fragment should remain visible even when progress mode is off, got updates: {updates:?}"
         );
         assert!(
+            updates
+                .iter()
+                .any(|entry| entry.contains("config_key=autonomy.allowed_commands")),
+            "config key should remain visible even when progress mode is off, got updates: {updates:?}"
+        );
+        assert!(
+            updates
+                .iter()
+                .any(|entry| entry.contains("status=blocked_by_security_policy")),
+            "blocked status should remain visible even when progress mode is off, got updates: {updates:?}"
+        );
+        assert!(
             !updates.iter().any(|entry| entry.contains("Thinking")),
             "verbose thinking lines should stay hidden when progress mode is off, got updates: {updates:?}"
         );
@@ -7747,13 +8085,6 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
-
-        let autonomy_cfg = crate::config::AutonomyConfig {
-            level: AutonomyLevel::Full,
-            auto_approve: vec!["mock_price".to_string()],
-            ..crate::config::AutonomyConfig::default()
-        };
-        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -12068,7 +12399,9 @@ Done reminder set for 1:38 AM."#;
 
         assert!(matches!(
             classify_draft_stream_delta(ProgressMode::Off, &blocked),
-            Some(DraftStreamDelta::ProgressBlock(_))
+            Some(DraftDelta::Forwarded(ChannelForwardedDelta::ProgressBlock(
+                _
+            )))
         ));
         assert!(classify_draft_stream_delta(ProgressMode::Off, &verbose).is_none());
     }
@@ -12084,6 +12417,7 @@ Done reminder set for 1:38 AM."#;
 
     #[test]
     fn effective_progress_mode_defaults_non_telegram_to_off() {
+        let _guard = runtime_channel_progress_mode_test_guard();
         set_runtime_channel_progress_modes(HashMap::new());
         assert_eq!(
             effective_progress_mode_for_message("draft-streaming-channel", false),
@@ -12105,6 +12439,8 @@ Done reminder set for 1:38 AM."#;
 
     #[test]
     fn effective_progress_mode_uses_telegram_runtime_setting() {
+        let _guard = runtime_channel_progress_mode_test_guard();
+        set_runtime_channel_progress_modes(HashMap::new());
         set_runtime_channel_progress_mode("telegram", ProgressMode::Compact);
         assert_eq!(
             effective_progress_mode_for_message("telegram", false),
@@ -12119,6 +12455,8 @@ Done reminder set for 1:38 AM."#;
 
     #[test]
     fn effective_progress_mode_uses_lark_runtime_setting() {
+        let _guard = runtime_channel_progress_mode_test_guard();
+        set_runtime_channel_progress_modes(HashMap::new());
         set_runtime_channel_progress_mode("lark", ProgressMode::Verbose);
         assert_eq!(
             effective_progress_mode_for_message("lark", false),
@@ -12129,6 +12467,8 @@ Done reminder set for 1:38 AM."#;
 
     #[test]
     fn effective_progress_mode_treats_lark_and_feishu_as_runtime_aliases() {
+        let _guard = runtime_channel_progress_mode_test_guard();
+        set_runtime_channel_progress_modes(HashMap::new());
         set_runtime_channel_progress_modes(HashMap::from([(
             "feishu".to_string(),
             ProgressMode::Verbose,
@@ -12145,6 +12485,36 @@ Done reminder set for 1:38 AM."#;
         assert_eq!(
             effective_progress_mode_for_message("feishu", false),
             ProgressMode::Off
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_channel_entry_treats_lark_and_feishu_as_aliases() {
+        let _guard = runtime_channel_progress_mode_test_guard();
+        let entries = HashMap::from([("feishu".to_string(), 7usize)]);
+        assert_eq!(
+            resolve_runtime_channel_entry(&entries, "lark").copied(),
+            Some(7)
+        );
+
+        let entries = HashMap::from([("lark".to_string(), 9usize)]);
+        assert_eq!(
+            resolve_runtime_channel_entry(&entries, "feishu").copied(),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_channel_entry_prefers_exact_match_over_alias() {
+        let _guard = runtime_channel_progress_mode_test_guard();
+        let entries = HashMap::from([("lark".to_string(), 1usize), ("feishu".to_string(), 2usize)]);
+        assert_eq!(
+            resolve_runtime_channel_entry(&entries, "lark").copied(),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_runtime_channel_entry(&entries, "feishu").copied(),
+            Some(2)
         );
     }
 
@@ -12173,6 +12543,137 @@ Done reminder set for 1:38 AM."#;
         let progress_modes = configured_runtime_channel_progress_modes(&config);
         assert_eq!(progress_modes.get("feishu"), Some(&ProgressMode::Compact));
         assert!(!progress_modes.contains_key("lark"));
+    }
+
+    #[cfg(feature = "channel-lark")]
+    #[test]
+    fn configured_runtime_channel_progress_modes_keeps_distinct_lark_and_feishu_entries() {
+        let mut config = Config::default();
+        config.channels_config.lark = Some(crate::config::LarkConfig {
+            app_id: "lark-app-id".to_string(),
+            app_secret: "lark-app-secret".to_string(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            mention_only: false,
+            group_reply: None,
+            use_feishu: false,
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            progress_mode: ProgressMode::Verbose,
+        });
+        config.channels_config.feishu = Some(crate::config::FeishuConfig {
+            app_id: "feishu-app-id".to_string(),
+            app_secret: "feishu-app-secret".to_string(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            group_reply: None,
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            progress_mode: ProgressMode::Off,
+        });
+
+        let progress_modes = configured_runtime_channel_progress_modes(&config);
+        assert_eq!(progress_modes.get("lark"), Some(&ProgressMode::Verbose));
+        assert_eq!(progress_modes.get("feishu"), Some(&ProgressMode::Off));
+    }
+
+    #[cfg(feature = "channel-lark")]
+    #[test]
+    fn collect_configured_channels_keeps_distinct_lark_and_feishu_configs() {
+        let mut config = Config::default();
+        config.channels_config.lark = Some(crate::config::LarkConfig {
+            app_id: "lark-app-id".to_string(),
+            app_secret: "lark-app-secret".to_string(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            mention_only: false,
+            group_reply: None,
+            use_feishu: false,
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            progress_mode: ProgressMode::Compact,
+        });
+        config.channels_config.feishu = Some(crate::config::FeishuConfig {
+            app_id: "feishu-app-id".to_string(),
+            app_secret: "feishu-app-secret".to_string(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            group_reply: None,
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            progress_mode: ProgressMode::Compact,
+        });
+
+        let channels = collect_configured_channels(&config, "test");
+        let channel_names: Vec<&str> = channels.iter().map(|entry| entry.channel.name()).collect();
+
+        assert!(channel_names.contains(&"lark"));
+        assert!(channel_names.contains(&"feishu"));
+    }
+
+    #[cfg(feature = "channel-lark")]
+    #[test]
+    fn collect_configured_channels_prefers_explicit_feishu_over_legacy_alias() {
+        let mut config = Config::default();
+        config.channels_config.lark = Some(crate::config::LarkConfig {
+            app_id: "legacy-feishu-app-id".to_string(),
+            app_secret: "legacy-feishu-app-secret".to_string(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            mention_only: false,
+            group_reply: None,
+            use_feishu: true,
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            progress_mode: ProgressMode::Compact,
+        });
+        config.channels_config.feishu = Some(crate::config::FeishuConfig {
+            app_id: "explicit-feishu-app-id".to_string(),
+            app_secret: "explicit-feishu-app-secret".to_string(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            group_reply: None,
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            progress_mode: ProgressMode::Compact,
+        });
+
+        let channels = collect_configured_channels(&config, "test");
+        let feishu_count = channels
+            .iter()
+            .filter(|entry| entry.channel.name() == "feishu")
+            .count();
+        let lark_count = channels
+            .iter()
+            .filter(|entry| entry.channel.name() == "lark")
+            .count();
+
+        assert_eq!(feishu_count, 1);
+        assert_eq!(lark_count, 0);
     }
 
     #[test]

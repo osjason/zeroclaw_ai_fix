@@ -1,4 +1,5 @@
-use crate::providers::{ChatMessage, Provider};
+use super::parsing::ParsedToolCall;
+use crate::providers::{ChatMessage, Provider, ToolCall};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::fmt::Write;
@@ -11,6 +12,209 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 
 /// Max characters retained in stored compaction summary.
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
+
+pub(super) struct HistoryToolResult {
+    pub(super) tool_name: String,
+    pub(super) tool_call_id: Option<String>,
+    pub(super) output: String,
+}
+
+fn render_tool_results_text(results: &[HistoryToolResult]) -> String {
+    let mut tool_results_text = String::new();
+    for result in results {
+        let _ = writeln!(
+            tool_results_text,
+            "<tool_result name=\"{}\">\n{}\n</tool_result>",
+            result.tool_name, result.output
+        );
+    }
+    tool_results_text
+}
+
+pub(super) fn push_tool_results_into_history<I, T>(
+    history: &mut Vec<ChatMessage>,
+    native_tool_calls: &[ToolCall],
+    use_native_tools: bool,
+    results: I,
+) where
+    I: IntoIterator<Item = T>,
+    T: Into<HistoryToolResult>,
+{
+    let history_results: Vec<HistoryToolResult> = results.into_iter().map(Into::into).collect();
+
+    if native_tool_calls.is_empty() {
+        let all_results_have_ids = use_native_tools
+            && !history_results.is_empty()
+            && history_results
+                .iter()
+                .all(|result| result.tool_call_id.is_some());
+        if all_results_have_ids {
+            for result in &history_results {
+                let tool_msg = serde_json::json!({
+                    "tool_call_id": result.tool_call_id,
+                    "content": result.output,
+                });
+                history.push(ChatMessage::tool(tool_msg.to_string()));
+            }
+        } else {
+            history.push(ChatMessage::user(format!(
+                "[Tool results]\n{}",
+                render_tool_results_text(&history_results)
+            )));
+        }
+        return;
+    }
+
+    for (native_call, result) in native_tool_calls.iter().zip(history_results.iter()) {
+        let tool_msg = serde_json::json!({
+            "tool_call_id": native_call.id,
+            "content": result.output,
+        });
+        history.push(ChatMessage::tool(tool_msg.to_string()));
+    }
+}
+
+fn assistant_history_content_value(text: &str) -> serde_json::Value {
+    if text.trim().is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(text.trim().to_string())
+    }
+}
+
+fn build_native_assistant_history_with_calls(
+    text: &str,
+    tool_calls: Vec<serde_json::Value>,
+    reasoning_content: Option<&str>,
+) -> String {
+    let mut obj = serde_json::json!({
+        "content": assistant_history_content_value(text),
+        "tool_calls": tool_calls,
+    });
+
+    if let Some(rc) = reasoning_content {
+        obj.as_object_mut().unwrap().insert(
+            "reasoning_content".to_string(),
+            serde_json::Value::String(rc.to_string()),
+        );
+    }
+
+    obj.to_string()
+}
+
+pub(super) fn build_native_assistant_history(
+    text: &str,
+    tool_calls: &[ToolCall],
+    reasoning_content: Option<&str>,
+) -> String {
+    let calls_json: Vec<serde_json::Value> = tool_calls
+        .iter()
+        .map(|tc| {
+            serde_json::json!({
+                "id": tc.id,
+                "name": tc.name,
+                "arguments": tc.arguments,
+            })
+        })
+        .collect();
+
+    build_native_assistant_history_with_calls(text, calls_json, reasoning_content)
+}
+
+pub(super) fn build_native_assistant_history_from_parsed_calls(
+    text: &str,
+    tool_calls: &[ParsedToolCall],
+    reasoning_content: Option<&str>,
+) -> Option<String> {
+    let calls_json = tool_calls
+        .iter()
+        .map(|tc| {
+            Some(serde_json::json!({
+                "id": tc.tool_call_id.clone()?,
+                "name": tc.name,
+                "arguments": serde_json::to_string(&tc.arguments).unwrap_or_else(|_| "{}".to_string()),
+            }))
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    Some(build_native_assistant_history_with_calls(
+        text,
+        calls_json,
+        reasoning_content,
+    ))
+}
+
+pub(super) fn build_assistant_history_content(
+    text: &str,
+    parsed_tool_calls: &[ParsedToolCall],
+    native_tool_calls: &[ToolCall],
+    reasoning_content: Option<&str>,
+    use_native_tools: bool,
+) -> String {
+    if native_tool_calls.is_empty() {
+        if use_native_tools {
+            build_native_assistant_history_from_parsed_calls(
+                text,
+                parsed_tool_calls,
+                reasoning_content,
+            )
+            .unwrap_or_else(|| text.to_string())
+        } else {
+            text.to_string()
+        }
+    } else {
+        build_native_assistant_history(text, native_tool_calls, reasoning_content)
+    }
+}
+
+fn render_tool_call_tag(payload: serde_json::Value) -> String {
+    format!("<tool_call>\n{payload}\n</tool_call>")
+}
+
+fn build_assistant_history_from_parsed_calls(tool_calls: &[ParsedToolCall]) -> String {
+    tool_calls
+        .iter()
+        .map(|call| {
+            let payload = if let Some(id) = &call.tool_call_id {
+                serde_json::json!({
+                    "id": id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                })
+            } else {
+                serde_json::json!({
+                    "name": call.name,
+                    "arguments": call.arguments,
+                })
+            };
+            render_tool_call_tag(payload)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(super) fn suppress_assistant_text_in_history_when_verification_pending(
+    assistant_history_content: &str,
+    tool_calls: &[ParsedToolCall],
+    use_native_tools: bool,
+) -> String {
+    if use_native_tools {
+        if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(assistant_history_content)
+        {
+            if let Some(obj) = parsed.as_object_mut() {
+                obj.insert("content".to_string(), serde_json::Value::Null);
+                return parsed.to_string();
+            }
+        }
+
+        if let Some(native) = build_native_assistant_history_from_parsed_calls("", tool_calls, None)
+        {
+            return native;
+        }
+    }
+
+    build_assistant_history_from_parsed_calls(tool_calls)
+}
 
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
@@ -140,6 +344,7 @@ pub(super) async fn auto_compact_history(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::loop_::parsing::ParsedToolCall;
     use crate::providers::{ChatRequest, ChatResponse, Provider};
     use async_trait::async_trait;
 
@@ -181,6 +386,23 @@ mod tests {
 
     fn tool_result(id: &str) -> ChatMessage {
         ChatMessage::tool(format!("{{\"tool_call_id\":\"{id}\",\"content\":\"ok\"}}"))
+    }
+
+    #[test]
+    fn tool_result_history_batch_preserves_tool_call_id_for_native_fallback() {
+        let mut history = Vec::new();
+        let batch = [HistoryToolResult {
+            tool_name: "shell".into(),
+            tool_call_id: Some("call_1".into()),
+            output: "ok".into(),
+        }];
+
+        push_tool_results_into_history(&mut history, &[], true, batch);
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, "tool");
+        assert!(history[0].content.contains("\"tool_call_id\":\"call_1\""));
+        assert!(history[0].content.contains("\"content\":\"ok\""));
     }
 
     #[test]
@@ -228,5 +450,155 @@ mod tests {
             history[1].role, "tool",
             "first retained message must not be an orphan tool result"
         );
+    }
+
+    #[test]
+    fn build_native_assistant_history_includes_reasoning_content() {
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        }];
+        let result = build_native_assistant_history("answer", &calls, Some("thinking step"));
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert_eq!(parsed["reasoning_content"].as_str(), Some("thinking step"));
+        assert!(parsed["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn build_native_assistant_history_omits_reasoning_content_when_none() {
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        }];
+        let result = build_native_assistant_history("answer", &calls, None);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert!(parsed.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn build_native_assistant_history_from_parsed_calls_includes_reasoning_content() {
+        let calls = vec![ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "pwd"}),
+            tool_call_id: Some("call_2".into()),
+        }];
+        let result = build_native_assistant_history_from_parsed_calls(
+            "answer",
+            &calls,
+            Some("deep thought"),
+        );
+        assert!(result.is_some());
+        let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert_eq!(parsed["reasoning_content"].as_str(), Some("deep thought"));
+        assert!(parsed["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn build_native_assistant_history_from_parsed_calls_omits_reasoning_content_when_none() {
+        let calls = vec![ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "pwd"}),
+            tool_call_id: Some("call_2".into()),
+        }];
+        let result = build_native_assistant_history_from_parsed_calls("answer", &calls, None);
+        assert!(result.is_some());
+        let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
+        assert_eq!(parsed["content"].as_str(), Some("answer"));
+        assert!(parsed.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn build_assistant_history_content_prefers_native_calls_when_present() {
+        let parsed_calls = vec![ParsedToolCall {
+            name: "file_read".into(),
+            arguments: serde_json::json!({"path": "src/lib.rs"}),
+            tool_call_id: Some("parsed_1".into()),
+        }];
+        let native_calls = vec![ToolCall {
+            id: "native_1".into(),
+            name: "shell".into(),
+            arguments: "{\"command\":\"pwd\"}".into(),
+        }];
+
+        let result = build_assistant_history_content(
+            "answer",
+            &parsed_calls,
+            &native_calls,
+            Some("thinking step"),
+            true,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+
+        assert_eq!(parsed["tool_calls"][0]["id"].as_str(), Some("native_1"));
+        assert_eq!(parsed["tool_calls"][0]["name"].as_str(), Some("shell"));
+        assert_eq!(parsed["reasoning_content"].as_str(), Some("thinking step"));
+    }
+
+    #[test]
+    fn build_assistant_history_content_falls_back_to_response_text_without_native_mode() {
+        let parsed_calls = vec![ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "pwd"}),
+            tool_call_id: Some("call_2".into()),
+        }];
+
+        let result =
+            build_assistant_history_content("answer", &parsed_calls, &[], Some("thinking"), false);
+
+        assert_eq!(result, "answer");
+    }
+
+    #[test]
+    fn build_native_assistant_history_uses_null_content_for_blank_text() {
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        }];
+        let result = build_native_assistant_history("   ", &calls, None);
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(parsed["content"].is_null());
+        assert!(parsed["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn suppress_verification_pending_native_history_nulls_content() {
+        let original = serde_json::json!({
+            "content": "draft answer",
+            "tool_calls": [{"id": "call_1", "name": "shell", "arguments": "{}"}],
+            "reasoning_content": "thinking step",
+        })
+        .to_string();
+
+        let suppressed =
+            suppress_assistant_text_in_history_when_verification_pending(&original, &[], true);
+        let parsed: serde_json::Value = serde_json::from_str(&suppressed).unwrap();
+        assert!(parsed["content"].is_null());
+        assert_eq!(parsed["reasoning_content"].as_str(), Some("thinking step"));
+        assert_eq!(parsed["tool_calls"][0]["id"].as_str(), Some("call_1"));
+    }
+
+    #[test]
+    fn suppress_verification_pending_xml_history_keeps_only_tool_calls() {
+        let calls = vec![ParsedToolCall {
+            name: "shell".into(),
+            arguments: serde_json::json!({"command": "pwd"}),
+            tool_call_id: Some("call_2".into()),
+        }];
+
+        let suppressed = suppress_assistant_text_in_history_when_verification_pending(
+            "draft answer",
+            &calls,
+            false,
+        );
+
+        assert!(!suppressed.contains("draft answer"));
+        assert!(suppressed.contains("<tool_call>"));
+        assert!(suppressed.contains("\"id\":\"call_2\""));
     }
 }

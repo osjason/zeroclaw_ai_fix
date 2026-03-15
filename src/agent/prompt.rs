@@ -9,7 +9,7 @@ use std::path::Path;
 
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 pub(crate) const POST_ACTION_VERIFICATION_RULE: &str =
-    "After any file modification or command execution, you must emit at least one verification <tool_call>...</tool_call>, wait for its result, and only then provide a final answer with cited verification evidence.";
+    "After any mutating shell, file, or cron action, you must emit at least one separate read-only verification <tool_call>...</tool_call>, wait for its result, and only then provide a final answer with cited verification evidence. Do not treat the mutating tool itself as verification.";
 pub(crate) const SECURITY_BLOCK_REPORTING_RULE: &str =
     "If any tool, shell command, or runtime action is blocked by policy, explicitly report the exact blocked command or tool, the policy_id, and the config key or approval gate when provided; do not silently retry the same blocked action unchanged.";
 
@@ -20,14 +20,15 @@ pub(crate) fn build_post_action_verification_retry_prompt(
     if attempt <= 1 {
         return format!(
             "Internal correction: you already executed mutating actions ({requirement}) but did not verify their effects. \
-             Before giving a final answer, emit one verification <tool_call>...</tool_call> now (e.g. file_read, cron_list/cron_runs, or a read-only shell inspection command), then wait for the tool result. \
+             Before giving a final answer, emit one separate read-only verification <tool_call>...</tool_call> now (e.g. file_read, cron_list/cron_runs, or a read-only shell inspection command), then wait for the tool result. \
+             Do not reuse the mutating action as proof that it worked. \
              Do not output any final answer, completion claim, or summary yet."
         );
     }
 
     format!(
         "Internal correction attempt #{attempt}: post-action verification is still missing for ({requirement}). \
-         Emit exactly one valid verification <tool_call>...</tool_call> now and output no other final text. \
+         Emit exactly one separate read-only verification <tool_call>...</tool_call> now and output no other final text. \
          Wait for tool results before answering."
     )
 }
@@ -663,6 +664,8 @@ mod tests {
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains(POST_ACTION_VERIFICATION_RULE));
+        assert!(prompt.contains("mutating shell, file, or cron action"));
+        assert!(prompt.contains("Do not treat the mutating tool itself as verification."));
         assert!(prompt.contains(SECURITY_BLOCK_REPORTING_RULE));
         assert!(prompt.contains("policy_id"));
         assert!(prompt.contains("config key or approval gate"));
@@ -676,7 +679,10 @@ mod tests {
         let retry = build_post_action_verification_retry_prompt(requirement, 2);
 
         assert!(first.contains("<tool_call>...</tool_call>"));
+        assert!(first.contains("separate read-only verification"));
+        assert!(first.contains("Do not reuse the mutating action as proof that it worked."));
         assert!(first.contains("Do not output any final answer"));
+        assert!(retry.contains("separate read-only verification"));
         assert!(retry.contains("output no other final text"));
     }
 }

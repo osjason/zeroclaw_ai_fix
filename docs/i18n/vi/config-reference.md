@@ -297,6 +297,7 @@ Lưu ý:
 | `level` | `supervised` | `read_only`, `supervised` hoặc `full` |
 | `workspace_only` | `true` | Giới hạn ghi/lệnh trong phạm vi workspace |
 | `allowed_commands` | _bắt buộc để chạy shell_ | Danh sách lệnh được phép |
+| `unrestricted_commands` | `[]` | danh sách trắng break-glass bỏ qua toàn bộ shell policy cho lệnh khớp |
 | `forbidden_paths` | `[]` | Danh sách đường dẫn bị cấm |
 | `max_actions_per_hour` | `100` | Ngân sách hành động mỗi giờ |
 | `max_cost_per_day_cents` | `1000` | Giới hạn chi tiêu mỗi ngày (cent) |
@@ -308,6 +309,8 @@ Lưu ý:
 Lưu ý:
 
 - `level = "full"` bỏ qua phê duyệt rủi ro trung bình cho shell execution, nhưng vẫn áp dụng guardrail đã cấu hình.
+- `allowed_commands` chỉ mở allowlist tên/đường dẫn lệnh; các guardrail khác vẫn còn hiệu lực.
+- `unrestricted_commands` là danh sách trắng shell mạnh nhất: mục khớp sẽ bỏ qua `allowed_commands`, `command_context_rules`, path guard, shell-structure guard, kiểm tra read-only/autonomy và approval/risk gate. Chỉ nên dùng rất hẹp cho tình huống break-glass.
 - Phân tích toán tử/dấu phân cách shell nhận biết dấu ngoặc kép. Ký tự như `;` trong đối số được trích dẫn được xử lý là ký tự, không phải dấu phân cách lệnh.
 - Toán tử chuỗi shell không trích dẫn vẫn được kiểm tra bởi policy (`;`, `|`, `&&`, `||`, chạy nền và chuyển hướng).
 

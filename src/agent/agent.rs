@@ -4,12 +4,14 @@ use crate::agent::dispatcher::{
 use crate::agent::loop_::detection::{DetectionVerdict, LoopDetectionConfig, LoopDetector};
 use crate::agent::loop_::parsing::tool_call_signature;
 use crate::agent::loop_::{
-    build_missing_tool_call_retry_prompt, build_runtime_constraint_retry_prompt,
-    looks_like_deferred_action_without_tool_call, summarize_runtime_constraint_reasons,
+    build_missing_tool_call_retry_prompt, looks_like_deferred_action_without_tool_call,
 };
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::agent::research;
+use crate::channels::progress_event::{
+    build_runtime_constraint_retry_prompt, summarize_runtime_constraint_reasons_default,
+};
 use crate::config::{Config, ResearchPhaseConfig};
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::observability::{self, Observer, ObserverEvent};
@@ -703,7 +705,7 @@ impl Agent {
                 let (tool_name, args_sig) = tool_call_signature(&call.name, &call.arguments);
                 loop_detector.record_call(&tool_name, &args_sig, &result.output, result.success);
             }
-            let runtime_constraint_reasons = summarize_runtime_constraint_reasons(
+            let runtime_constraint_reasons = summarize_runtime_constraint_reasons_default(
                 results
                     .iter()
                     .filter(|result| !result.success)

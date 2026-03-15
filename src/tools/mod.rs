@@ -174,26 +174,6 @@ pub(crate) fn action_command_preflight_for(
         .map(|reason| policy_blocked_result(&reason))
 }
 
-pub(crate) fn action_command_preflight_result(
-    security: &crate::security::SecurityPolicy,
-    action_subject: &str,
-    command: Option<&str>,
-    approved: bool,
-) -> Option<ToolResult> {
-    action_command_preflight_for(
-        security,
-        ActionCommandPreflight::new(action_subject, command, approved),
-    )
-}
-
-pub(crate) fn command_execution_preflight_result(
-    security: &crate::security::SecurityPolicy,
-    command: &str,
-    approved: bool,
-) -> Option<ToolResult> {
-    action_command_preflight_result(security, command, Some(command), approved)
-}
-
 #[derive(Clone)]
 struct ArcDelegatingTool {
     inner: Arc<dyn Tool>,

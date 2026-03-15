@@ -1,4 +1,5 @@
 use super::cron_common::{consume_action_budget, ensure_cron_enabled, precheck_action_allowed};
+use super::policy_blocked_result;
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron;
@@ -241,12 +242,11 @@ impl ScheduleTool {
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("Missing or empty 'command' parameter"))?;
 
-        if let Err(reason) = self.security.validate_command_execution(command, approved) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(reason),
-            });
+        if let Err(reason) = self
+            .security
+            .validate_command_execution_with_reason(command, approved)
+        {
+            return Ok(policy_blocked_result(&reason));
         }
 
         let expression = args.get("expression").and_then(|value| value.as_str());
@@ -388,6 +388,7 @@ impl ScheduleTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::policy::parse_security_policy_block_event;
     use crate::security::AutonomyLevel;
     use tempfile::TempDir;
 
@@ -703,11 +704,11 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("not allowed"));
+        let event = parse_security_policy_block_event(result.error.as_deref().unwrap_or_default())
+            .expect("schedule create should expose structured policy block event");
+        assert_eq!(event.policy_id, "autonomy.allowed_commands");
+        assert_eq!(event.command_fragment, "curl https://example.com");
+        assert!(event.reason.contains("allowed_commands"));
     }
 
     #[tokio::test]

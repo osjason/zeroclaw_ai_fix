@@ -1,5 +1,5 @@
-use super::command_execution_preflight_result;
 use super::traits::{Tool, ToolResult};
+use super::{action_command_preflight_for, ActionCommandPreflight};
 use crate::runtime::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use crate::security::SyscallAnomalyDetector;
@@ -155,9 +155,10 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        if let Some(result) =
-            command_execution_preflight_result(self.security.as_ref(), &command, approved)
-        {
+        if let Some(result) = action_command_preflight_for(
+            self.security.as_ref(),
+            ActionCommandPreflight::new(&command, Some(&command), approved),
+        ) {
             return Ok(result);
         }
 
@@ -248,9 +249,16 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_security(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
+        test_security_with_workspace(autonomy, std::env::temp_dir())
+    }
+
+    fn test_security_with_workspace(
+        autonomy: AutonomyLevel,
+        workspace_dir: std::path::PathBuf,
+    ) -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
             autonomy,
-            workspace_dir: std::env::temp_dir(),
+            workspace_dir,
             ..SecurityPolicy::default()
         })
     }
@@ -365,7 +373,7 @@ mod tests {
             &result,
             "autonomy.allowed_commands",
             "rm -rf /",
-            Some("not allowed"),
+            Some("allowed_commands"),
         );
     }
 
@@ -482,6 +490,39 @@ mod tests {
             "cat </etc/passwd",
             Some("redirection"),
         );
+    }
+
+    #[tokio::test]
+    async fn shell_unrestricted_command_bypasses_allowlist_context_and_shell_structure_gates() {
+        let workspace = TempDir::new().expect("temp dir should be created");
+        let marker = workspace.path().join("unrestricted-shell.txt");
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: Vec::new(),
+            unrestricted_commands: vec!["echo".into()],
+            command_context_rules: vec![crate::config::CommandContextRuleConfig {
+                command: "echo".into(),
+                action: crate::config::CommandContextRuleAction::Deny,
+                allowed_domains: Vec::new(),
+                allowed_path_prefixes: Vec::new(),
+                denied_path_prefixes: Vec::new(),
+                allow_high_risk: false,
+            }],
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime());
+        let command = "echo unrestricted > unrestricted-shell.txt";
+
+        let result = tool
+            .execute(json!({"command": command}))
+            .await
+            .expect("unrestricted command should execute successfully");
+
+        assert!(result.success);
+        let written = std::fs::read_to_string(&marker)
+            .expect("unrestricted shell command should create the redirected file");
+        assert!(written.contains("unrestricted"));
     }
 
     fn test_security_with_env_cmd() -> Arc<SecurityPolicy> {
