@@ -8,6 +8,27 @@ use std::fmt::Write;
 use std::path::Path;
 
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
+pub(crate) const POST_ACTION_VERIFICATION_RULE: &str =
+    "After any file modification or command execution, you must emit at least one verification <tool_call>...</tool_call>, wait for its result, and only then provide a final answer with cited verification evidence.";
+
+pub(crate) fn build_post_action_verification_retry_prompt(
+    requirement: &str,
+    attempt: usize,
+) -> String {
+    if attempt <= 1 {
+        return format!(
+            "Internal correction: you already executed mutating actions ({requirement}) but did not verify their effects. \
+             Before giving a final answer, emit one verification <tool_call>...</tool_call> now (e.g. file_read, cron_list/cron_runs, or a read-only shell inspection command), then wait for the tool result. \
+             Do not output any final answer, completion claim, or summary yet."
+        );
+    }
+
+    format!(
+        "Internal correction attempt #{attempt}: post-action verification is still missing for ({requirement}). \
+         Emit exactly one valid verification <tool_call>...</tool_call> now and output no other final text. \
+         Wait for tool results before answering."
+    )
+}
 
 pub struct PromptContext<'a> {
     pub workspace_dir: &'a Path,
@@ -158,7 +179,9 @@ impl PromptSection for SafetySection {
     }
 
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
-        Ok("## Safety\n\n- Do not exfiltrate private data.\n- Do not run destructive commands without asking.\n- Do not bypass oversight or approval mechanisms.\n- Prefer `trash` over `rm`.\n- When in doubt, ask before acting externally.".into())
+        Ok(format!(
+            "## Safety\n\n- Do not exfiltrate private data.\n- Do not run destructive commands without asking.\n- Do not bypass oversight or approval mechanisms.\n- Prefer `trash` over `rm`.\n- {POST_ACTION_VERIFICATION_RULE}\n- Do not claim success without verification evidence.\n- When in doubt, ask before acting externally."
+        ))
     }
 }
 
@@ -621,5 +644,34 @@ mod tests {
         assert!(prompt.contains(
             "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
         ));
+    }
+
+    #[test]
+    fn build_system_prompt_enforces_post_action_verification() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+        };
+
+        let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
+        assert!(prompt.contains(POST_ACTION_VERIFICATION_RULE));
+        assert!(prompt.contains("Do not claim success without verification evidence."));
+    }
+
+    #[test]
+    fn post_action_verification_retry_prompt_requires_tool_call_and_no_final_answer() {
+        let requirement = "shell(command='echo')";
+        let first = build_post_action_verification_retry_prompt(requirement, 1);
+        let retry = build_post_action_verification_retry_prompt(requirement, 2);
+
+        assert!(first.contains("<tool_call>...</tool_call>"));
+        assert!(first.contains("Do not output any final answer"));
+        assert!(retry.contains("output no other final text"));
     }
 }

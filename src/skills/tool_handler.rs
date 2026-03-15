@@ -36,6 +36,7 @@
 
 use crate::security::SecurityPolicy;
 use crate::skills::SkillTool;
+use crate::tools::{action_command_preflight_for, ActionCommandPreflight};
 use crate::tools::traits::{Tool, ToolResult};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -352,24 +353,15 @@ impl Tool for SkillToolHandler {
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                output: "Rate limit exceeded — try again later.".into(),
-                success: false,
-                error: None,
-            });
-        }
-
         let command = self
             .render_command(&args)
             .context("Failed to render skill tool command")?;
 
-        if let Err(e) = self.security.validate_command_execution(&command, false) {
-            return Ok(ToolResult {
-                output: format!("Blocked by security policy: {e}"),
-                success: false,
-                error: None,
-            });
+        if let Some(blocked) = action_command_preflight_for(
+            self.security.as_ref(),
+            ActionCommandPreflight::new(&command, Some(&command), false),
+        ) {
+            return Ok(blocked);
         }
 
         if !self.security.record_action() {
@@ -425,6 +417,8 @@ impl Tool for SkillToolHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AutonomyConfig, CommandContextRuleAction, CommandContextRuleConfig};
+    use crate::security::policy::parse_command_policy_block_event;
 
     #[test]
     fn extract_placeholders_from_command() {
@@ -658,5 +652,51 @@ mod tests {
         // limit should NOT be quoted (it's an Integer type)
         assert!(command.contains("--limit 100"));
         assert!(!command.contains("--limit '100'"));
+    }
+
+    #[tokio::test]
+    async fn execute_blocks_with_structured_command_context_rule_violation() {
+        let tool_def = SkillTool {
+            name: "fetch".to_string(),
+            description: "Fetch data".to_string(),
+            kind: "shell".to_string(),
+            command: "curl {url}".to_string(),
+            args: [("url".to_string(), "Target URL".to_string())]
+                .iter()
+                .cloned()
+                .collect(),
+        };
+
+        let workspace =
+            std::env::temp_dir().join("zeroclaw_test_skill_tool_command_context_rules_block");
+        let mut autonomy = AutonomyConfig::default();
+        autonomy.level = crate::security::AutonomyLevel::Full;
+        autonomy.block_high_risk_commands = false;
+        autonomy.allowed_commands = vec!["curl".into()];
+        autonomy.command_context_rules = vec![CommandContextRuleConfig {
+            command: "curl".into(),
+            action: CommandContextRuleAction::Allow,
+            allowed_domains: vec!["api.example.com".into()],
+            allowed_path_prefixes: vec![],
+            denied_path_prefixes: vec![],
+            allow_high_risk: false,
+        }];
+        let security = Arc::new(SecurityPolicy::from_config(&autonomy, &workspace));
+        let handler = SkillToolHandler::new("net".to_string(), tool_def, security)
+            .expect("skill handler should initialize");
+
+        let result = handler
+            .execute(serde_json::json!({"url":"https://evil.example/data"}))
+            .await
+            .expect("blocked command should return ToolResult");
+        assert!(!result.success);
+        let blocked = result
+            .error
+            .as_deref()
+            .expect("policy block should be emitted as structured error");
+        let parsed = parse_command_policy_block_event(blocked)
+            .expect("policy block should be parseable");
+        assert_eq!(parsed.policy_id, "autonomy.command_context_rules");
+        assert_eq!(parsed.command_fragment, "curl https://evil.example/data");
     }
 }

@@ -1,6 +1,9 @@
+use super::cron_common::{
+    command_for_job_preflight, guard_cron_run_request, preflight_command_allowed,
+};
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
-use crate::cron::{self, JobType};
+use crate::cron::{self};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use chrono::Utc;
@@ -44,44 +47,12 @@ impl Tool for CronRunTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.config.cron.enabled {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
-            });
-        }
-
-        let job_id = match args.get("job_id").and_then(serde_json::Value::as_str) {
-            Some(v) if !v.trim().is_empty() => v,
-            _ => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some("Missing 'job_id' parameter".to_string()),
-                });
-            }
+        let request = match guard_cron_run_request(&self.config, &args) {
+            Ok(request) => request,
+            Err(blocked) => return Ok(blocked),
         };
-        let approved = args
-            .get("approved")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-
-        if !self.security.can_act() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Security policy: read-only mode, cannot perform 'cron_run'".into()),
-            });
-        }
-
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
+        let job_id = request.job_id;
+        let approved = request.approved;
 
         let job = match cron::get_job(&self.config, job_id) {
             Ok(job) => job,
@@ -94,25 +65,14 @@ impl Tool for CronRunTool {
             }
         };
 
-        if matches!(job.job_type, JobType::Shell) {
-            if let Err(reason) = self
-                .security
-                .validate_command_execution(&job.command, approved)
-            {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(reason),
-                });
-            }
-        }
-
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
+        let command_for_preflight = command_for_job_preflight(job.job_type.clone(), &job.command);
+        if let Some(blocked) = preflight_command_allowed(
+            self.security.as_ref(),
+            "cron_run",
+            command_for_preflight,
+            approved,
+        ) {
+            return Ok(blocked);
         }
 
         let started_at = Utc::now();

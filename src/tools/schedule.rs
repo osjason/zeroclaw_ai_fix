@@ -1,3 +1,4 @@
+use super::cron_common::{consume_action_budget, ensure_cron_enabled, precheck_action_allowed};
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron;
@@ -140,35 +141,22 @@ impl Tool for ScheduleTool {
 
 impl ScheduleTool {
     fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
-        if !self.config.cron.enabled {
+        if let Err(blocked) = ensure_cron_enabled(&self.config, action) {
             return Some(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "cron is disabled by config (cron.enabled=false); cannot perform '{action}'"
+                    "{}; cannot perform '{action}'",
+                    blocked
+                        .error
+                        .unwrap_or_else(|| "cron is disabled by config".to_string())
                 )),
             });
         }
-
-        if !self.security.can_act() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Security policy: read-only mode, cannot perform '{action}'"
-                )),
-            });
+        if let Some(blocked) = precheck_action_allowed(&self.security, action) {
+            return Some(blocked);
         }
-
-        if !self.security.record_action() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".to_string()),
-            });
-        }
-
-        None
+        consume_action_budget(&self.security, action)
     }
 
     fn handle_list(&self) -> Result<ToolResult> {

@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::security::policy::command_policy_precheck_violation;
 use crate::security::SecurityPolicy;
 use anyhow::{bail, Result};
 
@@ -131,8 +132,8 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
 
             if let Some(ref cmd) = command {
                 let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-                if !security.is_command_allowed(cmd) {
-                    bail!("Command blocked by security policy: {cmd}");
+                if let Some(blocked) = command_policy_precheck_violation(&security, cmd, false) {
+                    bail!(blocked.format_block_message());
                 }
             }
 
@@ -225,6 +226,7 @@ fn parse_delay(input: &str) -> Result<chrono::Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::policy::parse_security_policy_block_event;
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
@@ -413,5 +415,29 @@ mod tests {
 
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
         assert!(security.is_command_allowed("echo safe"));
+    }
+
+    #[test]
+    fn update_security_blocks_unsafe_command_with_structured_policy_event() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["echo".into()];
+        let job = make_job(&config, "*/5 * * * *", None, "echo ok");
+
+        let result = run_update(
+            &config,
+            &job.id,
+            None,
+            None,
+            Some("curl https://example.com"),
+            None,
+        );
+        assert!(result.is_err());
+        let blocked = result.unwrap_err().to_string();
+        let event = parse_security_policy_block_event(&blocked)
+            .expect("cron update should expose structured security policy block event");
+        assert_eq!(event.policy_id, "autonomy.allowed_commands");
+        assert_eq!(event.command_fragment, "curl https://example.com");
+        assert!(event.reason.contains("not allowed"));
     }
 }

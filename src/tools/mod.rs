@@ -22,6 +22,7 @@ pub mod cli_discovery;
 pub mod composio;
 pub mod content_search;
 pub mod cron_add;
+mod cron_common;
 pub mod cron_list;
 pub mod cron_remove;
 pub mod cron_run;
@@ -49,6 +50,7 @@ pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
 pub mod model_routing_config;
+mod mutation_guard;
 pub mod pdf_read;
 pub mod process;
 pub mod proxy_config;
@@ -113,10 +115,84 @@ pub use web_search_tool::WebSearchTool;
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
+use crate::security::policy::{
+    action_command_preflight_with_approval_violation, CommandPolicyViolation,
+};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ActionCommandPreflight<'a> {
+    pub(crate) action_subject: &'a str,
+    pub(crate) command: Option<&'a str>,
+    pub(crate) approved: bool,
+}
+
+impl<'a> ActionCommandPreflight<'a> {
+    pub(crate) const fn new(
+        action_subject: &'a str,
+        command: Option<&'a str>,
+        approved: bool,
+    ) -> Self {
+        Self {
+            action_subject,
+            command,
+            approved,
+        }
+    }
+}
+
+pub(crate) fn policy_blocked_result(
+    reason: &crate::security::policy::CommandPolicyViolation,
+) -> ToolResult {
+    ToolResult {
+        success: false,
+        output: String::new(),
+        error: Some(reason.format_block_message()),
+    }
+}
+
+pub(crate) fn action_command_preflight_violation_for(
+    security: &crate::security::SecurityPolicy,
+    preflight: ActionCommandPreflight<'_>,
+) -> Option<CommandPolicyViolation> {
+    action_command_preflight_with_approval_violation(
+        security,
+        preflight.action_subject,
+        preflight.command,
+        preflight.approved,
+    )
+}
+
+pub(crate) fn action_command_preflight_for(
+    security: &crate::security::SecurityPolicy,
+    preflight: ActionCommandPreflight<'_>,
+) -> Option<ToolResult> {
+    action_command_preflight_violation_for(security, preflight)
+        .map(|reason| policy_blocked_result(&reason))
+}
+
+pub(crate) fn action_command_preflight_result(
+    security: &crate::security::SecurityPolicy,
+    action_subject: &str,
+    command: Option<&str>,
+    approved: bool,
+) -> Option<ToolResult> {
+    action_command_preflight_for(
+        security,
+        ActionCommandPreflight::new(action_subject, command, approved),
+    )
+}
+
+pub(crate) fn command_execution_preflight_result(
+    security: &crate::security::SecurityPolicy,
+    command: &str,
+    approved: bool,
+) -> Option<ToolResult> {
+    action_command_preflight_result(security, command, Some(command), approved)
+}
 
 #[derive(Clone)]
 struct ArcDelegatingTool {

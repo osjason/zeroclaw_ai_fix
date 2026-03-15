@@ -34,6 +34,7 @@ pub mod mattermost;
 pub mod napcat;
 pub mod nextcloud_talk;
 pub mod nostr;
+pub(crate) mod progress_event;
 pub mod qq;
 pub mod signal;
 pub mod slack;
@@ -94,6 +95,7 @@ use crate::security::{LeakDetector, LeakResult, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
+use progress_event::{is_high_priority_progress_update, is_structured_lifecycle_or_policy_line};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -168,21 +170,55 @@ fn clear_live_channels() {
         .clear();
 }
 
-fn runtime_telegram_progress_mode_store() -> &'static Mutex<ProgressMode> {
-    static STORE: OnceLock<Mutex<ProgressMode>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(ProgressMode::default()))
+fn runtime_channel_progress_modes_store() -> &'static Mutex<HashMap<String, ProgressMode>> {
+    static STORE: OnceLock<Mutex<HashMap<String, ProgressMode>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn set_runtime_telegram_progress_mode(mode: ProgressMode) {
-    *runtime_telegram_progress_mode_store()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = mode;
-}
-
-fn runtime_telegram_progress_mode() -> ProgressMode {
-    *runtime_telegram_progress_mode_store()
+fn set_runtime_channel_progress_mode(channel_name: &str, mode: ProgressMode) {
+    runtime_channel_progress_modes_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
+        .insert(channel_name.to_ascii_lowercase(), mode);
+}
+
+fn set_runtime_channel_progress_modes(modes: HashMap<String, ProgressMode>) {
+    let normalized = modes
+        .into_iter()
+        .map(|(name, mode)| (name.to_ascii_lowercase(), mode))
+        .collect();
+    *runtime_channel_progress_modes_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = normalized;
+}
+
+fn runtime_channel_progress_mode(channel_name: &str) -> Option<ProgressMode> {
+    runtime_channel_progress_modes_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&channel_name.to_ascii_lowercase())
+        .copied()
+}
+
+fn configured_runtime_channel_progress_modes(config: &Config) -> HashMap<String, ProgressMode> {
+    let mut channel_progress_modes = HashMap::new();
+    if let Some(tg) = config.channels_config.telegram.as_ref() {
+        channel_progress_modes.insert("telegram".to_string(), tg.progress_mode);
+    }
+    #[cfg(feature = "channel-lark")]
+    if let Some(lk) = config.channels_config.lark.as_ref() {
+        let channel_name = if lk.use_feishu && config.channels_config.feishu.is_none() {
+            "feishu"
+        } else {
+            "lark"
+        };
+        channel_progress_modes.insert(channel_name.to_string(), lk.progress_mode);
+    }
+    #[cfg(feature = "channel-lark")]
+    if let Some(fs) = config.channels_config.feishu.as_ref() {
+        channel_progress_modes.insert("feishu".to_string(), fs.progress_mode);
+    }
+    channel_progress_modes
 }
 
 pub(crate) fn get_live_channel(name: &str) -> Option<Arc<dyn Channel>> {
@@ -742,19 +778,35 @@ fn effective_progress_mode_for_message(
 ) -> ProgressMode {
     if channel_name.eq_ignore_ascii_case("cli") || expose_internal_tool_details {
         ProgressMode::Verbose
-    } else if channel_name.eq_ignore_ascii_case("telegram") {
-        runtime_telegram_progress_mode()
+    } else {
+        runtime_channel_progress_mode(channel_name)
+            .unwrap_or_else(|| default_progress_mode_for_channel(channel_name))
+    }
+}
+
+fn default_progress_mode_for_channel(channel_name: &str) -> ProgressMode {
+    if channel_name.eq_ignore_ascii_case("lark") || channel_name.eq_ignore_ascii_case("feishu") {
+        ProgressMode::Compact
     } else {
         ProgressMode::Off
     }
 }
 
-fn is_verbose_only_progress_line(delta: &str) -> bool {
-    let trimmed = delta.trim_start();
-    trimmed.starts_with("\u{1f914} Thinking")
-        || trimmed.starts_with("\u{1f4ac} Got ")
-        || trimmed.starts_with("\u{21bb} Retrying")
-        || trimmed.starts_with("\u{26a0}\u{fe0f} Loop detected")
+fn should_show_progress_update(mode: ProgressMode, delta: &str) -> bool {
+    mode != ProgressMode::Off || is_high_priority_progress_update(delta)
+}
+
+fn should_skip_internal_progress_line(mode: ProgressMode, delta: &str) -> bool {
+    let is_high_priority = is_high_priority_progress_update(delta);
+    if is_high_priority {
+        return false;
+    }
+
+    if mode == ProgressMode::Compact {
+        return true;
+    }
+
+    !should_show_progress_update(mode, delta)
 }
 
 fn upsert_progress_section(accumulated: &mut String, block: &str) {
@@ -1821,8 +1873,10 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 
     for turn in &mut compacted {
         if turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS {
-            turn.content =
-                truncate_with_ellipsis(&turn.content, CHANNEL_HISTORY_COMPACT_CONTENT_CHARS);
+            turn.content = truncate_compacted_turn_content_preserving_lifecycle(
+                &turn.content,
+                CHANNEL_HISTORY_COMPACT_CONTENT_CHARS,
+            );
         }
     }
 
@@ -1833,6 +1887,45 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
 
     *turns = compacted;
     true
+}
+
+fn truncate_compacted_turn_content_preserving_lifecycle(content: &str, max_chars: usize) -> String {
+    if content.chars().count() <= max_chars {
+        return content.to_string();
+    }
+
+    if !is_high_priority_progress_update(content) {
+        return truncate_with_ellipsis(content, max_chars);
+    }
+
+    let pinned_lifecycle = collect_structured_lifecycle_lines(content);
+    if pinned_lifecycle.is_empty() {
+        return truncate_with_ellipsis(content, max_chars);
+    }
+
+    let pinned_prefix = pinned_lifecycle.join("\n");
+    let budget_for_body = max_chars.saturating_sub(pinned_prefix.chars().count());
+    let body = truncate_with_ellipsis(content, budget_for_body.saturating_sub(2));
+    let merged = format!("{pinned_prefix}\n\n{body}");
+    truncate_with_ellipsis(&merged, max_chars)
+}
+
+fn collect_structured_lifecycle_lines(content: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    for line in content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if is_structured_lifecycle_or_policy_line(line) {
+            if lines.last().map_or(true, |last| last != line) {
+                lines.push(line.to_string());
+            }
+        }
+    }
+
+    lines
 }
 
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
@@ -3700,22 +3793,17 @@ or tune thresholds in config.",
                 if let Some(block) =
                     delta.strip_prefix(crate::agent::loop_::DRAFT_PROGRESS_BLOCK_SENTINEL)
                 {
-                    if mode == ProgressMode::Off {
+                    if !should_show_progress_update(mode, block) {
                         continue;
                     }
                     upsert_progress_section(&mut accumulated, block);
                 } else {
                     let (is_internal_progress, visible_delta) =
                         split_internal_progress_delta(&delta);
-                    if is_internal_progress {
-                        if mode == ProgressMode::Off {
-                            continue;
-                        }
-                        if mode == ProgressMode::Compact
-                            && is_verbose_only_progress_line(visible_delta)
-                        {
-                            continue;
-                        }
+                    if is_internal_progress
+                        && should_skip_internal_progress_line(mode, visible_delta)
+                    {
+                        continue;
                     }
 
                     accumulated.push_str(visible_delta);
@@ -5719,13 +5807,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .telegram
         .as_ref()
         .is_some_and(|tg| tg.interrupt_on_new_message);
-    let telegram_progress_mode = config
-        .channels_config
-        .telegram
-        .as_ref()
-        .map(|tg| tg.progress_mode)
-        .unwrap_or_default();
-    set_runtime_telegram_progress_mode(telegram_progress_mode);
+    set_runtime_channel_progress_modes(configured_runtime_channel_progress_modes(&config));
 
     let session_manager = shared_session_manager(&config.agent.session, &config.workspace_dir)?
         .map(|mgr| mgr as Arc<dyn SessionManager + Send + Sync>);
@@ -6153,6 +6235,26 @@ mod tests {
     }
 
     #[test]
+    fn compact_truncation_preserves_structured_lifecycle_markers() {
+        let noise = "x".repeat(CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 300);
+        let content = format!(
+            "{noise}\n⏱️ Cron triggered: id=job1 name=nightly type=shell\nstatus=triggered\n▶️ Cron running: id=job1 name=nightly type=shell\nstatus=running\n🚫 Cron blocked: id=job1 name=nightly type=shell\npolicy=autonomy.allowed_commands; command=curl https://evil.example\nstatus=blocked_by_security_policy\nreason=Command not allowed by security policy"
+        );
+
+        let truncated = truncate_compacted_turn_content_preserving_lifecycle(
+            &content,
+            CHANNEL_HISTORY_COMPACT_CONTENT_CHARS,
+        );
+
+        assert!(truncated.contains("triggered: id=job1"));
+        assert!(truncated.contains("running: id=job1"));
+        assert!(truncated.contains("status=blocked_by_security_policy"));
+        assert!(truncated.contains("policy=autonomy.allowed_commands; command="));
+        assert!(truncated.contains("reason=Command not allowed by security policy"));
+        assert!(truncated.chars().count() <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3);
+    }
+
+    #[test]
     fn append_sender_turn_stores_single_turn_per_call() {
         let sender = "telegram_u2".to_string();
         let ctx = ChannelRuntimeContext {
@@ -6514,6 +6616,13 @@ mod tests {
             .to_string()
     }
 
+    fn policy_block_tool_call_payload() -> String {
+        r#"<tool_call>
+{"name":"mock_policy_block","arguments":{"command":"cat /etc/passwd"}}
+</tool_call>"#
+            .to_string()
+    }
+
     #[async_trait::async_trait]
     impl Provider for ToolCallingProvider {
         async fn chat_with_system(
@@ -6570,6 +6679,37 @@ mod tests {
                 Ok("BTC alias-tag flow resolved to final text output.".to_string())
             } else {
                 Ok(tool_call_payload_with_alias_tag())
+            }
+        }
+    }
+
+    struct PolicyBlockedToolProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for PolicyBlockedToolProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(policy_block_tool_call_payload())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let has_tool_results = messages
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
+            if has_tool_results {
+                Ok("Command execution was blocked by security policy.".to_string())
+            } else {
+                Ok(policy_block_tool_call_payload())
             }
         }
     }
@@ -6714,6 +6854,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     struct MockPriceTool;
+    struct MockPolicyBlockedTool;
 
     #[derive(Default)]
     struct ModelCaptureProvider {
@@ -6782,6 +6923,42 @@ BTC is currently around $65,000 based on latest tool output."#
                 success: true,
                 output: r#"{"symbol":"BTC","price_usd":65000}"#.to_string(),
                 error: None,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for MockPolicyBlockedTool {
+        fn name(&self) -> &str {
+            "mock_policy_block"
+        }
+
+        fn description(&self) -> &str {
+            "Return a deterministic security-policy block response"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                },
+                "required": ["command"]
+            })
+        }
+
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            let command = args
+                .get("command")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let reason = format!(
+                "blocked by security policy: policy=autonomy.allowed_commands; command={command}; reason=Command not allowed by security policy: {command}"
+            );
+            Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(reason),
             })
         }
     }
@@ -7248,6 +7425,173 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             updates.iter().any(|entry| entry.contains("Thinking")),
             "explicit requests should expose internal thinking/progress text, got updates: {updates:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_streaming_surfaces_policy_and_command_on_blocked_tool() {
+        let channel_impl = Arc::new(DraftStreamingRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let autonomy_cfg = crate::config::AutonomyConfig {
+            level: AutonomyLevel::Full,
+            auto_approve: vec!["mock_policy_block".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(PolicyBlockedToolProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPolicyBlockedTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_locks: Default::default(),
+            session_config: crate::config::AgentSessionConfig::default(),
+            session_manager: None,
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            approval_manager,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            safety_heartbeat: None,
+            startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-stream-policy-block".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-stream".to_string(),
+                content: "Please show commands and tool calls you used.".to_string(),
+                channel: "draft-streaming-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let updates = channel_impl.draft_updates.lock().await;
+        assert!(
+            updates
+                .iter()
+                .any(|entry| entry.contains("policy=autonomy.allowed_commands")),
+            "policy id should be included in draft progress updates, got updates: {updates:?}"
+        );
+        assert!(
+            updates
+                .iter()
+                .any(|entry| entry.contains("command=cat /etc/passwd")),
+            "command fragment should be included in draft progress updates, got updates: {updates:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_streaming_still_surfaces_policy_block_when_progress_mode_off()
+    {
+        let channel_impl = Arc::new(DraftStreamingRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let autonomy_cfg = crate::config::AutonomyConfig {
+            level: AutonomyLevel::Full,
+            auto_approve: vec!["mock_policy_block".to_string()],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let approval_manager = Arc::new(ApprovalManager::from_config(&autonomy_cfg));
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(PolicyBlockedToolProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPolicyBlockedTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_locks: Default::default(),
+            session_config: crate::config::AgentSessionConfig::default(),
+            session_manager: None,
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            non_cli_excluded_tools: Arc::new(Mutex::new(Vec::new())),
+            approval_manager,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            model_routes: Vec::new(),
+            safety_heartbeat: None,
+            startup_perplexity_filter: crate::config::PerplexityFilterConfig::default(),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-stream-policy-block-off".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-stream".to_string(),
+                content: "Try this command now.".to_string(),
+                channel: "draft-streaming-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let updates = channel_impl.draft_updates.lock().await;
+        assert!(
+            updates
+                .iter()
+                .any(|entry| entry.contains("policy=autonomy.allowed_commands")),
+            "policy block summary should remain visible even when progress mode is off, got updates: {updates:?}"
+        );
+        assert!(
+            updates
+                .iter()
+                .any(|entry| entry.contains("command=cat /etc/passwd")),
+            "command fragment should remain visible even when progress mode is off, got updates: {updates:?}"
+        );
+        assert!(
+            !updates.iter().any(|entry| entry.contains("Thinking")),
+            "verbose thinking lines should stay hidden when progress mode is off, got updates: {updates:?}"
         );
     }
 
@@ -11583,10 +11927,79 @@ Done reminder set for 1:38 AM."#;
     }
 
     #[test]
+    fn compact_mode_keeps_structured_lifecycle_progress_visible() {
+        let triggered = "⏱️ Cron triggered: id=job1 name=nightly type=shell\nschedule=every(1000ms)\ncommand=echo ok\nstatus=triggered";
+        let running = "▶️ Cron running: id=job1 name=nightly type=shell\nstatus=shell command is now executing";
+        let blocked = "🚫 Cron blocked: id=job1 name=nightly type=shell\nschedule=every(1000ms)\npolicy=autonomy.allowed_commands; command=curl https://evil.example\nstatus=blocked_by_security_policy\nreason=Command not allowed by security policy";
+
+        assert!(!should_skip_internal_progress_line(
+            ProgressMode::Compact,
+            triggered
+        ));
+        assert!(!should_skip_internal_progress_line(
+            ProgressMode::Compact,
+            running
+        ));
+        assert!(!should_skip_internal_progress_line(
+            ProgressMode::Compact,
+            blocked
+        ));
+        assert!(should_skip_internal_progress_line(
+            ProgressMode::Compact,
+            "🤔 Thinking about tool call..."
+        ));
+        assert!(should_skip_internal_progress_line(
+            ProgressMode::Compact,
+            "indexing workspace and preparing draft"
+        ));
+
+        assert!(!should_skip_internal_progress_line(
+            ProgressMode::Off,
+            triggered
+        ));
+        assert!(!should_skip_internal_progress_line(
+            ProgressMode::Off,
+            running
+        ));
+        assert!(!should_skip_internal_progress_line(
+            ProgressMode::Off,
+            blocked
+        ));
+        assert!(should_skip_internal_progress_line(
+            ProgressMode::Off,
+            "✅ tool finished"
+        ));
+        assert!(triggered.contains("status=triggered"));
+        assert!(running.contains("running: id=job1"));
+        assert!(blocked.contains("status=blocked_by_security_policy"));
+        assert!(blocked.contains("policy=autonomy.allowed_commands"));
+        assert!(blocked.contains("command=curl https://evil.example"));
+        assert!(blocked.contains("reason=Command not allowed by security policy"));
+    }
+
+    #[test]
+    fn compact_mode_prioritizes_structured_status_even_if_verbose_prefixed() {
+        let mixed = "↻ Retrying after malformed response\nstatus=triggered\nreason=cron scheduling completed";
+        assert!(!should_skip_internal_progress_line(
+            ProgressMode::Compact,
+            mixed
+        ));
+    }
+
+    #[test]
     fn effective_progress_mode_defaults_non_telegram_to_off() {
+        set_runtime_channel_progress_modes(HashMap::new());
         assert_eq!(
             effective_progress_mode_for_message("draft-streaming-channel", false),
             ProgressMode::Off
+        );
+        assert_eq!(
+            effective_progress_mode_for_message("lark", false),
+            ProgressMode::Compact
+        );
+        assert_eq!(
+            effective_progress_mode_for_message("feishu", false),
+            ProgressMode::Compact
         );
         assert_eq!(
             effective_progress_mode_for_message("draft-streaming-channel", true),
@@ -11596,16 +12009,53 @@ Done reminder set for 1:38 AM."#;
 
     #[test]
     fn effective_progress_mode_uses_telegram_runtime_setting() {
-        set_runtime_telegram_progress_mode(ProgressMode::Compact);
+        set_runtime_channel_progress_mode("telegram", ProgressMode::Compact);
         assert_eq!(
             effective_progress_mode_for_message("telegram", false),
             ProgressMode::Compact
         );
-        set_runtime_telegram_progress_mode(ProgressMode::Off);
+        set_runtime_channel_progress_mode("telegram", ProgressMode::Off);
         assert_eq!(
             effective_progress_mode_for_message("telegram", false),
             ProgressMode::Off
         );
+    }
+
+    #[test]
+    fn effective_progress_mode_uses_lark_runtime_setting() {
+        set_runtime_channel_progress_mode("lark", ProgressMode::Verbose);
+        assert_eq!(
+            effective_progress_mode_for_message("lark", false),
+            ProgressMode::Verbose
+        );
+        set_runtime_channel_progress_mode("lark", ProgressMode::Off);
+    }
+
+    #[cfg(feature = "channel-lark")]
+    #[test]
+    fn configured_runtime_channel_progress_modes_maps_legacy_lark_feishu_to_feishu() {
+        let mut config = Config::default();
+        config.channels_config.lark = Some(crate::config::LarkConfig {
+            app_id: "app-id".to_string(),
+            app_secret: "app-secret".to_string(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            mention_only: false,
+            group_reply: None,
+            use_feishu: true,
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            progress_mode: ProgressMode::Compact,
+        });
+        config.channels_config.feishu = None;
+
+        let progress_modes = configured_runtime_channel_progress_modes(&config);
+        assert_eq!(progress_modes.get("feishu"), Some(&ProgressMode::Compact));
+        assert!(!progress_modes.contains_key("lark"));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use super::shell::collect_allowed_shell_env_vars;
 use super::traits::{Tool, ToolResult};
+use super::{action_command_preflight_for, ActionCommandPreflight};
 use crate::runtime::RuntimeAdapter;
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
@@ -104,42 +105,17 @@ impl ProcessTool {
             }
         }
 
-        // Reuse shell security chain: rate limit → command validation → path check → record.
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
         let approved = args
             .get("approved")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        if let Err(reason) = self.security.validate_command_execution(command, approved) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(reason),
-            });
-        }
-
-        if let Some(path) = self.security.forbidden_path_argument(command) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Path blocked by security policy: {path}")),
-            });
-        }
-
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
+        // Keep process tool aligned with shell tool security preflight behavior.
+        if let Some(blocked_result) = action_command_preflight_for(
+            self.security.as_ref(),
+            ActionCommandPreflight::new("process.spawn", Some(command), approved),
+        ) {
+            return Ok(blocked_result);
         }
 
         // Build command via runtime adapter.
@@ -535,7 +511,9 @@ mod tests {
     use super::*;
     use crate::config::{AuditConfig, SyscallAnomalyConfig};
     use crate::runtime::NativeRuntime;
+    use crate::security::policy::{parse_security_policy_block_event, CommandPolicyViolation};
     use crate::security::{AutonomyLevel, SecurityPolicy, SyscallAnomalyDetector};
+    use crate::tools::{action_command_preflight_for, policy_blocked_result};
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -595,6 +573,36 @@ mod tests {
     fn constants_are_correct() {
         assert_eq!(MAX_OUTPUT_BYTES, 524_288);
         assert_eq!(MAX_PROCESSES, 8);
+    }
+
+    #[test]
+    fn policy_blocked_result_renders_structured_event_fields() {
+        let violation = CommandPolicyViolation::new(
+            "autonomy.allowed_commands",
+            "Command not allowed by security policy: curl https://evil.example",
+            "curl https://evil.example",
+        );
+        let result = policy_blocked_result(&violation);
+        assert!(!result.success);
+        let event = parse_security_policy_block_event(result.error.as_deref().unwrap())
+            .expect("expected structured security policy block event");
+        assert_eq!(event.policy_id, "autonomy.allowed_commands");
+        assert_eq!(event.command_fragment, "curl https://evil.example");
+        assert!(event
+            .reason
+            .contains("Command not allowed by security policy"));
+    }
+
+    #[test]
+    fn parse_security_policy_block_event_extracts_fields() {
+        let message = "blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example";
+        let event = parse_security_policy_block_event(message)
+            .expect("formatted block message should parse into structured event");
+        assert_eq!(event.policy_id, "autonomy.allowed_commands");
+        assert_eq!(event.command_fragment, "curl https://evil.example");
+        assert!(event
+            .reason
+            .contains("Command not allowed by security policy"));
     }
 
     #[tokio::test]
@@ -700,6 +708,56 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
+        let event = parse_security_policy_block_event(result.error.as_deref().unwrap())
+            .expect("expected structured security policy block event");
+        assert_eq!(event.policy_id, "autonomy.allowed_commands");
+        assert_eq!(event.command_fragment, "rm -rf /");
+        assert!(event
+            .reason
+            .contains("Command not allowed by security policy"));
+    }
+
+    #[tokio::test]
+    async fn spawn_blocks_disallowed_command_matches_preflight_event_fields() {
+        let security = test_security();
+        let command = "rm -rf /";
+        let preflight = action_command_preflight_for(
+            security.as_ref(),
+            ActionCommandPreflight::new("process.spawn", Some(command), false),
+        )
+        .expect("expected command preflight to block disallowed command");
+        assert!(!preflight.success);
+        let preflight_event = parse_security_policy_block_event(
+            preflight
+                .error
+                .as_deref()
+                .expect("preflight block should include structured error"),
+        )
+        .expect("preflight block should parse into structured policy event");
+
+        let tool = ProcessTool::new(security, test_runtime());
+        let spawn = tool
+            .execute(json!({
+                "action": "spawn",
+                "command": command
+            }))
+            .await
+            .unwrap();
+        assert!(!spawn.success);
+        let spawn_event = parse_security_policy_block_event(
+            spawn
+                .error
+                .as_deref()
+                .expect("spawn block should include structured error"),
+        )
+        .expect("spawn block should parse into structured policy event");
+
+        assert_eq!(spawn_event.policy_id, preflight_event.policy_id);
+        assert_eq!(
+            spawn_event.command_fragment,
+            preflight_event.command_fragment
+        );
+        assert_eq!(spawn_event.reason, preflight_event.reason);
     }
 
     #[tokio::test]
@@ -713,7 +771,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap().contains("Path blocked"));
+        let event = parse_security_policy_block_event(result.error.as_deref().unwrap())
+            .expect("expected structured security policy block event");
+        assert_eq!(event.policy_id, "autonomy.workspace_path_guard");
+        assert_eq!(event.command_fragment, "cat /etc/passwd");
+        assert!(event.reason.contains("Path blocked"));
     }
 
     #[tokio::test]
@@ -773,7 +835,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap().contains("Rate limit"));
+        let event = parse_security_policy_block_event(result.error.as_deref().unwrap())
+            .expect("expected structured security policy block event");
+        assert_eq!(event.policy_id, "autonomy.max_actions_per_hour");
+        assert_eq!(event.command_fragment, "echo test");
+        assert!(event.reason.contains("Rate limit exceeded"));
     }
 
     struct NoLongRunningRuntime;

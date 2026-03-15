@@ -1,4 +1,9 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
+use crate::agent::prompt::build_post_action_verification_retry_prompt;
+use crate::channels::progress_event::{
+    format_tool_policy_block_event_from_args, render_policy_block_constraint_summary_with_config_key,
+    summarize_tool_policy_block_progress, truncate_tool_args_for_progress,
+};
 use crate::config::schema::{CostEnforcementMode, ModelPricing};
 use crate::config::{Config, ProgressMode};
 use crate::cost::{BudgetCheck, CostTracker, UsagePeriod};
@@ -9,7 +14,10 @@ use crate::providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
 };
 use crate::runtime;
-use crate::security::SecurityPolicy;
+use crate::security::{
+    policy::parse_command_policy_block_event,
+    SecurityPolicy,
+};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -280,6 +288,7 @@ const AUTO_CRON_DELIVERY_CHANNELS: &[&str] = &[
 
 const NON_CLI_APPROVAL_WAIT_TIMEOUT_SECS: u64 = 300;
 const NON_CLI_APPROVAL_POLL_INTERVAL_MS: u64 = 250;
+const TOOL_POLICY_BLOCK_HINT_MAX_CHARS: usize = 96;
 const MISSING_TOOL_CALL_RETRY_PROMPT: &str = "Internal correction: your last reply indicated you were about to take an action, but no valid tool call was emitted. If a tool is needed, emit it now using the required <tool_call>...</tool_call> format. If no tool is needed, provide the complete final answer now and do not defer action.";
 
 #[derive(Debug, Clone)]
@@ -473,7 +482,50 @@ fn budget_exceeded_message(
 struct ProgressEntry {
     name: String,
     hint: String,
-    completion: Option<(bool, u64)>,
+    completion: Option<(bool, u64, Option<String>)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ToolProgressSignal<'a> {
+    Running {
+        tool_name: &'a str,
+        hint: &'a str,
+    },
+    Completed {
+        tool_name: &'a str,
+        secs: u64,
+        success: bool,
+        detail: Option<&'a str>,
+    },
+}
+
+fn render_tool_progress_signal(signal: ToolProgressSignal<'_>) -> String {
+    let mut line = String::new();
+    match signal {
+        ToolProgressSignal::Running { tool_name, hint } => {
+            let _ = write!(line, "\u{23f3} {tool_name}");
+            if !hint.is_empty() {
+                let _ = write!(line, ": {hint}");
+            }
+        }
+        ToolProgressSignal::Completed {
+            tool_name,
+            secs,
+            success,
+            detail,
+        } => {
+            let mark = if success { "\u{2705}" } else { "\u{274c}" };
+            let _ = write!(line, "{mark} {tool_name} ({secs}s)");
+            if !success {
+                if let Some(detail) = detail {
+                    if !detail.is_empty() {
+                        let _ = write!(line, ": {detail}");
+                    }
+                }
+            }
+        }
+    }
+    line
 }
 
 #[derive(Debug, Default)]
@@ -492,55 +544,53 @@ impl ProgressTracker {
         idx
     }
 
-    fn complete(&mut self, idx: usize, success: bool, secs: u64) {
+    fn complete(&mut self, idx: usize, success: bool, secs: u64, failure_detail: Option<&str>) {
         if let Some(entry) = self.entries.get_mut(idx) {
-            entry.completion = Some((success, secs));
+            entry.completion = Some((success, secs, failure_detail.map(ToString::to_string)));
         }
     }
 
     fn render_delta(&self) -> String {
         let mut out = String::from(DRAFT_PROGRESS_BLOCK_SENTINEL);
         for entry in &self.entries {
-            match entry.completion {
-                None => {
-                    let _ = write!(out, "\u{23f3} {}", entry.name);
-                    if !entry.hint.is_empty() {
-                        let _ = write!(out, ": {}", entry.hint);
-                    }
-                    out.push('\n');
+            let line = match &entry.completion {
+                None => render_tool_progress_signal(ToolProgressSignal::Running {
+                    tool_name: &entry.name,
+                    hint: &entry.hint,
+                }),
+                Some((success, secs, detail)) => {
+                    render_tool_progress_signal(ToolProgressSignal::Completed {
+                        tool_name: &entry.name,
+                        secs: *secs,
+                        success: *success,
+                        detail: detail.as_deref(),
+                    })
                 }
-                Some((true, secs)) => {
-                    let _ = writeln!(out, "\u{2705} {} ({secs}s)", entry.name);
-                }
-                Some((false, secs)) => {
-                    let _ = writeln!(out, "\u{274c} {} ({secs}s)", entry.name);
-                }
-            }
+            };
+            out.push_str(&line);
+            out.push('\n');
         }
         out
     }
 }
-/// Extract a short hint from tool call arguments for progress display.
-fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len: usize) -> String {
-    let hint = match name {
-        "shell" => args.get("command").and_then(|v| v.as_str()),
-        "file_read" | "file_write" => args.get("path").and_then(|v| v.as_str()),
-        "composio_execute" => args.get("action_name").and_then(|v| v.as_str()),
-        "memory_recall" => args.get("query").and_then(|v| v.as_str()),
-        "memory_store" => args.get("key").and_then(|v| v.as_str()),
-        "web_search" => args.get("query").and_then(|v| v.as_str()),
-        "http_request" => args.get("url").and_then(|v| v.as_str()),
-        "browser_navigate" | "browser_screenshot" | "browser_click" | "browser_type" => {
-            args.get("url").and_then(|v| v.as_str())
-        }
-        _ => args
-            .get("action")
-            .and_then(|v| v.as_str())
-            .or_else(|| args.get("query").and_then(|v| v.as_str())),
-    };
-    match hint {
-        Some(s) => truncate_with_ellipsis(s, max_len),
-        None => String::new(),
+async fn emit_policy_block_progress_delta(
+    on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
+    tool_name: &str,
+    secs: u64,
+    reason: Option<&str>,
+) {
+    if let (Some(tx), Some(detail)) = (
+        on_delta,
+        summarize_tool_policy_block_progress(tool_name, reason),
+    ) {
+        let line = render_tool_progress_signal(ToolProgressSignal::Completed {
+            tool_name,
+            secs,
+            success: false,
+            detail: Some(detail.as_str()),
+        });
+        let line = format!("{DRAFT_PROGRESS_SENTINEL}{line}\n");
+        let _ = tx.send(line).await;
     }
 }
 
@@ -567,17 +617,41 @@ fn strip_tool_error_prefix(reason: &str) -> &str {
         .unwrap_or(trimmed)
 }
 
+fn contains_any_marker(haystack: &str, markers: &[&str]) -> bool {
+    markers.iter().any(|marker| haystack.contains(marker))
+}
+
+fn looks_like_workspace_path_block_reason(lower_reason: &str) -> bool {
+    contains_any_marker(
+        lower_reason,
+        &[
+            "path not allowed by security policy",
+            "path blocked by security policy",
+            "outside the allowed workspace",
+            "escapes workspace",
+        ],
+    )
+}
+
+fn references_workspace_path_policy_knobs(lower_reason: &str) -> bool {
+    contains_any_marker(lower_reason, &["allowed_roots", "workspace_only"])
+}
+
 pub(crate) fn looks_like_runtime_constraint_reason(reason: &str) -> bool {
+    if parse_command_policy_block_event(reason).is_some() {
+        return true;
+    }
+
+    if render_policy_block_constraint_summary_with_config_key(reason, 48).is_some() {
+        return true;
+    }
+
     let lower = strip_tool_error_prefix(reason).to_ascii_lowercase();
-    lower.contains("security policy")
-        || lower.contains("blocked by policy")
-        || lower.contains("requires explicit approval")
+    lower.contains("requires explicit approval")
         || lower.contains("denied by user")
         || lower.contains("not available in this channel")
-        || lower.contains("outside the allowed workspace")
-        || lower.contains("escapes workspace")
-        || lower.contains("allowed_roots")
-        || lower.contains("workspace_only")
+        || looks_like_workspace_path_block_reason(&lower)
+        || references_workspace_path_policy_knobs(&lower)
         || lower.contains("allow_sensitive_file_reads")
         || lower.contains("allow_sensitive_file_writes")
         || lower.contains("security.url_access.")
@@ -590,14 +664,16 @@ pub(crate) fn normalize_runtime_constraint_reason(reason: &str) -> String {
         return String::new();
     }
 
+    if let Some(summary) = render_policy_block_constraint_summary_with_config_key(trimmed, 72) {
+        return format!(
+            "{summary} Guidance: choose an allowed command/tool, or adjust the corresponding `[autonomy]` policy gate."
+        );
+    }
+
     let lower = trimmed.to_ascii_lowercase();
 
-    if lower.contains("path not allowed by security policy")
-        || lower.contains("path blocked by security policy")
-        || lower.contains("outside the allowed workspace")
-        || lower.contains("escapes workspace")
-    {
-        if lower.contains("allowed_roots") || lower.contains("workspace_only") {
+    if looks_like_workspace_path_block_reason(&lower) {
+        if references_workspace_path_policy_knobs(&lower) {
             return trimmed.to_string();
         }
         return format!(
@@ -614,14 +690,6 @@ pub(crate) fn normalize_runtime_constraint_reason(reason: &str) -> String {
     if lower.contains("not available in this channel") {
         return format!(
             "{trimmed} Guidance: review the channel/runtime tool exclusion list or use another allowed tool."
-        );
-    }
-
-    if lower.contains("command not allowed by security policy")
-        || lower.contains("high-risk command is disallowed by policy")
-    {
-        return format!(
-            "{trimmed} Guidance: use a safer dedicated tool, or adjust `[autonomy]` command/approval policy."
         );
     }
 
@@ -686,6 +754,209 @@ pub(crate) fn build_missing_tool_call_retry_prompt(reason: &str, attempt: usize)
          Either (1) emit one valid <tool_call>...</tool_call> block immediately, or (2) stop using tools and provide the complete final answer now. \
          Do not emit partial tags, protocol fragments, or placeholders."
     )
+}
+
+fn shell_command_is_read_only_probe(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if contains_any_marker(
+        &lower,
+        &[
+            " >",
+            ">>",
+            "2>",
+            "1>",
+            "| tee",
+            " tee ",
+            "sed -i",
+            " rm ",
+            "rm -",
+            " mv ",
+            " cp ",
+            " chmod ",
+            " chown ",
+            " touch ",
+            " mkdir ",
+            " rmdir ",
+            " del ",
+            " remove-item ",
+            " set-content ",
+            " out-file ",
+        ],
+    ) {
+        return false;
+    }
+
+    let mut words = lower.split_whitespace();
+    let first = words.next().unwrap_or_default();
+    match first {
+        "ls" | "dir" | "pwd" | "cat" | "head" | "tail" | "grep" | "rg" | "find" | "which"
+        | "where" | "echo" | "wc" | "stat" | "type" | "tree" | "git" | "cargo" => true,
+        "powershell" | "pwsh" => contains_any_marker(
+            &lower,
+            &[
+                "get-childitem",
+                "get-content",
+                "select-string",
+                "get-process",
+            ],
+        ),
+        _ => false,
+    }
+}
+
+fn tool_call_requires_post_action_verification(
+    tool_name: &str,
+    args: &serde_json::Value,
+    success: bool,
+) -> bool {
+    if !success {
+        return false;
+    }
+
+    match tool_name {
+        "file_write" => true,
+        "cron_add" | "cron_update" | "cron_remove" | "cron_run" => true,
+        "schedule" => args
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|action| matches!(action, "create" | "cancel" | "pause" | "resume")),
+        "shell" => args
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|command| !shell_command_is_read_only_probe(command)),
+        _ => false,
+    }
+}
+
+fn tool_call_satisfies_post_action_verification(
+    tool_name: &str,
+    args: &serde_json::Value,
+    success: bool,
+) -> bool {
+    if !success {
+        return false;
+    }
+
+    match tool_name {
+        "file_read" | "image_info" | "cron_list" | "cron_runs" => true,
+        "schedule" => args
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|action| matches!(action, "list" | "get")),
+        "shell" => args
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(shell_command_is_read_only_probe),
+        _ => false,
+    }
+}
+
+fn summarize_post_action_verification_target(tool_name: &str, args: &serde_json::Value) -> String {
+    match tool_name {
+        "file_write" => args
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(|path| format!("file_write(path={})", truncate_with_ellipsis(path, 72)))
+            .unwrap_or_else(|| "file_write".to_string()),
+        "shell" => args
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(|cmd| format!("shell(command={})", truncate_with_ellipsis(cmd, 72)))
+            .unwrap_or_else(|| "shell".to_string()),
+        _ => tool_name.to_string(),
+    }
+}
+
+enum ToolCallFollowthroughRequirement {
+    RetryToolCall { reason: &'static str },
+    PostActionVerification { requirement: String },
+}
+
+impl ToolCallFollowthroughRequirement {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::RetryToolCall { reason } => reason,
+            Self::PostActionVerification { .. } => "post_action_verification_missing",
+        }
+    }
+
+    fn retry_prompt(&self, attempt: usize) -> String {
+        match self {
+            Self::RetryToolCall { reason } => build_missing_tool_call_retry_prompt(reason, attempt),
+            Self::PostActionVerification { requirement } => {
+                build_post_action_verification_retry_prompt(requirement, attempt)
+            }
+        }
+    }
+
+    fn progress_retry_line(&self, attempt: usize) -> String {
+        match self {
+            Self::PostActionVerification { .. } => format!(
+                "{DRAFT_PROGRESS_SENTINEL}\u{21bb} Retrying to enforce post-action verification (attempt {attempt})\n"
+            ),
+            Self::RetryToolCall { .. } => format!(
+                "{DRAFT_PROGRESS_SENTINEL}\u{21bb} Retrying after malformed or incomplete tool call (attempt {attempt})\n"
+            ),
+        }
+    }
+}
+
+fn determine_tool_call_followthrough_requirement(
+    parse_issue_detected: bool,
+    display_text: &str,
+    post_action_verification_requirement: Option<&str>,
+    tools_available: bool,
+) -> Option<ToolCallFollowthroughRequirement> {
+    if let Some(requirement) = post_action_verification_requirement {
+        return Some(ToolCallFollowthroughRequirement::PostActionVerification {
+            requirement: requirement.to_string(),
+        });
+    }
+    if parse_issue_detected && tools_available {
+        return Some(ToolCallFollowthroughRequirement::RetryToolCall {
+            reason: "parse_issue_detected",
+        });
+    }
+    if tools_available && looks_like_deferred_action_without_tool_call(display_text) {
+        return Some(ToolCallFollowthroughRequirement::RetryToolCall {
+            reason: "deferred_action_text_detected",
+        });
+    }
+    None
+}
+
+#[derive(Default)]
+struct PostActionVerificationTurn {
+    pending_requirements: Vec<String>,
+    verification_observed: bool,
+}
+
+impl PostActionVerificationTurn {
+    fn observe_tool_call(&mut self, tool_name: &str, args: &serde_json::Value, success: bool) {
+        if tool_call_satisfies_post_action_verification(tool_name, args, success) {
+            // A verification call only clears requirements that existed before it.
+            // Any mutating call after this point must re-establish a pending requirement.
+            self.verification_observed = true;
+            self.pending_requirements.clear();
+        }
+        if tool_call_requires_post_action_verification(tool_name, args, success) {
+            self.pending_requirements
+                .push(summarize_post_action_verification_target(tool_name, args));
+        }
+    }
+
+    fn apply(self, current_requirement: &mut Option<String>) {
+        if !self.pending_requirements.is_empty() {
+            *current_requirement = Some(self.pending_requirements.join(", "));
+        } else if self.verification_observed {
+            *current_requirement = None;
+        }
+    }
 }
 
 fn build_cron_default_delivery(
@@ -783,37 +1054,71 @@ fn maybe_inject_cron_delivery_defaults(
 
 async fn await_non_cli_approval_decision(
     mgr: &ApprovalManager,
+    tool_name: &str,
     request_id: &str,
     sender: &str,
     channel_name: &str,
     reply_target: &str,
     cancellation_token: Option<&CancellationToken>,
-) -> ApprovalResponse {
+) -> NonCliApprovalDecisionOutcome {
+    let denied_by_user_reason = format!(
+        "Command requires explicit approval for tool '{tool_name}' and was denied by user."
+    );
     let started = Instant::now();
 
     loop {
         if let Some(decision) = mgr.take_non_cli_pending_resolution(request_id) {
-            return decision;
+            return NonCliApprovalDecisionOutcome {
+                decision,
+                denied_policy: "runtime.approval.user_decision",
+                denied_reason: denied_by_user_reason.clone(),
+            };
         }
 
         if !mgr.has_non_cli_pending_request(request_id) {
             // Fail closed when the request disappears without an explicit resolution.
-            return ApprovalResponse::No;
+            return NonCliApprovalDecisionOutcome {
+                decision: ApprovalResponse::No,
+                denied_policy: "runtime.approval.pending_request_not_found",
+                denied_reason: format!(
+                    "Pending approval request '{request_id}' for tool '{tool_name}' was removed before a user decision was received."
+                ),
+            };
         }
 
         if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
-            return ApprovalResponse::No;
+            return NonCliApprovalDecisionOutcome {
+                decision: ApprovalResponse::No,
+                denied_policy: "runtime.approval.pending_request_cancelled",
+                denied_reason: format!(
+                    "Pending approval request '{request_id}' for tool '{tool_name}' was cancelled before a user decision was received."
+                ),
+            };
         }
 
         if started.elapsed() >= Duration::from_secs(NON_CLI_APPROVAL_WAIT_TIMEOUT_SECS) {
             let _ =
                 mgr.reject_non_cli_pending_request(request_id, sender, channel_name, reply_target);
             let _ = mgr.take_non_cli_pending_resolution(request_id);
-            return ApprovalResponse::No;
+            return NonCliApprovalDecisionOutcome {
+                decision: ApprovalResponse::No,
+                denied_policy: "runtime.approval.pending_request_timeout",
+                denied_reason: format!(
+                    "Pending approval request '{request_id}' for tool '{tool_name}' timed out after {} seconds without a user decision.",
+                    NON_CLI_APPROVAL_WAIT_TIMEOUT_SECS
+                ),
+            };
         }
 
         tokio::time::sleep(Duration::from_millis(NON_CLI_APPROVAL_POLL_INTERVAL_MS)).await;
     }
+}
+
+#[derive(Debug)]
+struct NonCliApprovalDecisionOutcome {
+    decision: ApprovalResponse,
+    denied_policy: &'static str,
+    denied_reason: String,
 }
 
 /// Convert a tool registry to OpenAI function-calling format for native tool support.
@@ -933,6 +1238,49 @@ fn build_assistant_history_with_tool_calls(text: &str, tool_calls: &[ToolCall]) 
     }
 
     parts.join("\n")
+}
+
+fn build_assistant_history_from_parsed_calls(tool_calls: &[ParsedToolCall]) -> String {
+    tool_calls
+        .iter()
+        .map(|call| {
+            let payload = if let Some(id) = &call.tool_call_id {
+                serde_json::json!({
+                    "id": id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                })
+            } else {
+                serde_json::json!({
+                    "name": call.name,
+                    "arguments": call.arguments,
+                })
+            };
+            format!("<tool_call>\n{payload}\n</tool_call>")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn suppress_assistant_text_in_history_when_verification_pending(
+    assistant_history_content: &str,
+    tool_calls: &[ParsedToolCall],
+    use_native_tools: bool,
+) -> String {
+    if use_native_tools {
+        if let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(assistant_history_content) {
+            if let Some(obj) = parsed.as_object_mut() {
+                obj.insert("content".to_string(), serde_json::Value::Null);
+                return parsed.to_string();
+            }
+        }
+
+        if let Some(native) = build_native_assistant_history_from_parsed_calls("", tool_calls, None) {
+            return native;
+        }
+    }
+
+    build_assistant_history_from_parsed_calls(tool_calls)
 }
 
 #[derive(Debug)]
@@ -1178,6 +1526,7 @@ pub(crate) async fn run_tool_call_loop(
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
     let mut missing_tool_call_retry_attempts = 0usize;
     let mut missing_tool_call_retry_prompt: Option<String> = None;
+    let mut post_action_verification_requirement: Option<String> = None;
     let mut runtime_constraint_prompt: Option<String> = None;
     let ld_config = LOOP_DETECTION_CONFIG
         .try_with(Clone::clone)
@@ -1644,22 +1993,41 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
-            let parse_retry_reason = if parse_issue_detected {
-                Some("parse_issue_detected")
-            } else if looks_like_deferred_action_without_tool_call(&display_text) {
-                Some("deferred_action_text_detected")
-            } else {
-                None
-            };
-            let missing_tool_call_followthrough =
-                !tool_specs.is_empty() && parse_retry_reason.is_some();
-            if missing_tool_call_followthrough {
+            let followthrough_requirement = determine_tool_call_followthrough_requirement(
+                parse_issue_detected,
+                &display_text,
+                post_action_verification_requirement.as_deref(),
+                !tool_specs.is_empty(),
+            );
+            if let Some(requirement) = followthrough_requirement {
+                if let ToolCallFollowthroughRequirement::PostActionVerification { requirement } =
+                    &requirement
+                {
+                    if tool_specs.is_empty() {
+                        runtime_trace::record_event(
+                            "post_action_verification_unavailable",
+                            Some(channel_name),
+                            Some(provider_name),
+                            Some(active_model.as_str()),
+                            Some(&turn_id),
+                            Some(false),
+                            Some("post-action verification required but no tools are available"),
+                            serde_json::json!({
+                                "iteration": iteration + 1,
+                                "requirement": requirement,
+                            }),
+                        );
+                        anyhow::bail!(
+                            "Post-action verification required ({}) but no tools are available in current context",
+                            requirement
+                        );
+                    }
+                }
+
                 missing_tool_call_retry_attempts += 1;
-                let retry_reason = parse_retry_reason.unwrap_or("unknown");
-                missing_tool_call_retry_prompt = Some(build_missing_tool_call_retry_prompt(
-                    retry_reason,
-                    missing_tool_call_retry_attempts,
-                ));
+                let retry_reason = requirement.reason();
+                missing_tool_call_retry_prompt =
+                    Some(requirement.retry_prompt(missing_tool_call_retry_attempts));
 
                 runtime_trace::record_event(
                     "tool_call_followthrough_retry",
@@ -1679,12 +2047,9 @@ pub(crate) async fn run_tool_call_loop(
 
                 if should_emit_verbose_progress(progress_mode) {
                     if let Some(ref tx) = on_delta {
-                        let _ = tx
-                            .send(format!(
-                                "{DRAFT_PROGRESS_SENTINEL}\u{21bb} Retrying after malformed or incomplete tool call (attempt {})\n",
-                                missing_tool_call_retry_attempts
-                            ))
-                            .await;
+                        let retry_line =
+                            requirement.progress_retry_line(missing_tool_call_retry_attempts);
+                        let _ = tx.send(retry_line).await;
                     }
                 }
 
@@ -1737,8 +2102,12 @@ pub(crate) async fn run_tool_call_loop(
 
         missing_tool_call_retry_attempts = 0;
 
-        // Print any text the LLM produced alongside tool calls (unless silent)
-        if !silent && !display_text.is_empty() {
+        // While post-action verification is pending, suppress free-form assistant text
+        // and keep output limited to structured progress / policy-block signals.
+        let suppress_text_until_verified = post_action_verification_requirement.is_some();
+
+        // Print any text the LLM produced alongside tool calls (unless silent).
+        if !silent && !display_text.is_empty() && !suppress_text_until_verified {
             print!("{display_text}");
             let _ = std::io::stdout().flush();
         }
@@ -1810,7 +2179,14 @@ pub(crate) async fn run_tool_call_loop(
             );
 
             if excluded_tools.iter().any(|ex| ex == &tool_name) {
-                let blocked = format!("Tool '{tool_name}' is not available in this channel.");
+                let reason = format!("Tool '{tool_name}' is not available in this channel.");
+                let blocked = format_tool_policy_block_event_from_args(
+                    "runtime.channel.excluded_tools",
+                    reason,
+                    &tool_name,
+                    &tool_args,
+                    TOOL_POLICY_BLOCK_HINT_MAX_CHARS,
+                );
                 runtime_trace::record_event(
                     "tool_call_result",
                     Some(channel_name),
@@ -1832,10 +2208,12 @@ pub(crate) async fn run_tool_call_loop(
                     ToolExecutionOutcome {
                         output: blocked.clone(),
                         success: false,
-                        error_reason: Some(blocked),
+                        error_reason: Some(blocked.clone()),
                         duration: Duration::ZERO,
                     },
                 ));
+                emit_policy_block_progress_delta(on_delta.as_ref(), &tool_name, 0, Some(&blocked))
+                    .await;
                 continue;
             }
 
@@ -1871,8 +2249,14 @@ pub(crate) async fn run_tool_call_loop(
                         arguments: tool_args.clone(),
                     };
 
-                    let decision = if channel_name == "cli" {
-                        mgr.prompt_cli(&request)
+                    let (decision, denied_policy, denied_reason) = if channel_name == "cli" {
+                        (
+                            mgr.prompt_cli(&request),
+                            "runtime.approval.user_decision",
+                            format!(
+                                "Command requires explicit approval for tool '{tool_name}' and was denied by user."
+                            ),
+                        )
                     } else if let Some(ctx) = non_cli_approval_context.as_ref() {
                         let pending = mgr.create_non_cli_pending_request(
                             &tool_name,
@@ -1891,23 +2275,41 @@ pub(crate) async fn run_tool_call_loop(
                             arguments: tool_args.clone(),
                         });
 
-                        await_non_cli_approval_decision(
+                        let pending_outcome = await_non_cli_approval_decision(
                             mgr,
+                            &tool_name,
                             &pending.request_id,
                             &ctx.sender,
                             channel_name,
                             &ctx.reply_target,
                             cancellation_token.as_ref(),
                         )
-                        .await
+                        .await;
+                        (
+                            pending_outcome.decision,
+                            pending_outcome.denied_policy,
+                            pending_outcome.denied_reason,
+                        )
                     } else {
-                        ApprovalResponse::No
+                        (
+                            ApprovalResponse::No,
+                            "runtime.approval.non_cli_context_required",
+                            format!(
+                                "Command requires explicit approval for tool '{tool_name}' on channel '{channel_name}', but no approval context is available."
+                            ),
+                        )
                     };
 
                     mgr.record_decision(&tool_name, &tool_args, decision, channel_name);
 
                     if decision == ApprovalResponse::No {
-                        let denied = "Denied by user.".to_string();
+                        let denied = format_tool_policy_block_event_from_args(
+                            denied_policy,
+                            denied_reason,
+                            &tool_name,
+                            &tool_args,
+                            TOOL_POLICY_BLOCK_HINT_MAX_CHARS,
+                        );
                         runtime_trace::record_event(
                             "tool_call_result",
                             Some(channel_name),
@@ -1928,10 +2330,17 @@ pub(crate) async fn run_tool_call_loop(
                             ToolExecutionOutcome {
                                 output: denied.clone(),
                                 success: false,
-                                error_reason: Some(denied),
+                                error_reason: Some(denied.clone()),
                                 duration: Duration::ZERO,
                             },
                         ));
+                        emit_policy_block_progress_delta(
+                            on_delta.as_ref(),
+                            &tool_name,
+                            0,
+                            Some(&denied),
+                        )
+                        .await;
                         continue;
                     }
                 }
@@ -2024,6 +2433,7 @@ pub(crate) async fn run_tool_call_loop(
             .await?
         };
 
+        let mut post_action_verification_turn = PostActionVerificationTurn::default();
         for (((idx, call), mut outcome), progress_idx) in executable_indices
             .iter()
             .zip(executable_calls.iter())
@@ -2077,13 +2487,26 @@ pub(crate) async fn run_tool_call_loop(
                     .await;
             }
 
+            let secs = outcome.duration.as_secs();
+            let failure_detail = if outcome.success {
+                None
+            } else {
+                summarize_tool_policy_block_progress(&call.name, outcome.error_reason.as_deref())
+            };
             if let Some(idx) = progress_idx {
-                let secs = outcome.duration.as_secs();
-                progress_tracker.complete(*idx, outcome.success, secs);
+                progress_tracker.complete(*idx, outcome.success, secs, failure_detail.as_deref());
                 if let Some(ref tx) = on_delta {
                     tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
                     let _ = tx.send(progress_tracker.render_delta()).await;
                 }
+            } else if progress_mode == ProgressMode::Off {
+                emit_policy_block_progress_delta(
+                    on_delta.as_ref(),
+                    &call.name,
+                    secs,
+                    outcome.error_reason.as_deref(),
+                )
+                .await;
             }
 
             // ── Loop detection: record call ──────────────────────
@@ -2092,8 +2515,16 @@ pub(crate) async fn run_tool_call_loop(
                 loop_detector.record_call(&sig.0, &sig.1, &outcome.output, outcome.success);
             }
 
+            post_action_verification_turn.observe_tool_call(
+                &call.name,
+                &call.arguments,
+                outcome.success,
+            );
+
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
+
+        post_action_verification_turn.apply(&mut post_action_verification_requirement);
 
         let runtime_constraint_reasons = summarize_runtime_constraint_reasons(
             ordered_results
@@ -2118,6 +2549,15 @@ pub(crate) async fn run_tool_call_loop(
         // Native mode: use JSON-structured messages so convert_messages() can
         // reconstruct proper OpenAI-format tool_calls and tool result messages.
         // Prompt mode: use XML-based text format as before.
+        let assistant_history_content = if suppress_text_until_verified {
+            suppress_assistant_text_in_history_when_verification_pending(
+                &assistant_history_content,
+                &tool_calls,
+                use_native_tools,
+            )
+        } else {
+            assistant_history_content
+        };
         history.push(ChatMessage::assistant(assistant_history_content));
         if native_tool_calls.is_empty() {
             let all_results_have_ids = use_native_tools
@@ -3413,6 +3853,7 @@ mod tests {
     struct ScriptedProvider {
         responses: Arc<Mutex<VecDeque<ChatResponse>>>,
         capabilities: ProviderCapabilities,
+        seen_requests: Option<Arc<Mutex<Vec<Vec<ChatMessage>>>>>,
     }
 
     impl ScriptedProvider {
@@ -3430,11 +3871,17 @@ mod tests {
             Self {
                 responses: Arc::new(Mutex::new(scripted)),
                 capabilities: ProviderCapabilities::default(),
+                seen_requests: None,
             }
         }
 
         fn with_native_tool_support(mut self) -> Self {
             self.capabilities.native_tool_calling = true;
+            self
+        }
+
+        fn with_seen_requests(mut self, seen_requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>) -> Self {
+            self.seen_requests = Some(seen_requests);
             self
         }
     }
@@ -3457,10 +3904,16 @@ mod tests {
 
         async fn chat(
             &self,
-            _request: ChatRequest<'_>,
+            request: ChatRequest<'_>,
             _model: &str,
             _temperature: f64,
         ) -> anyhow::Result<ChatResponse> {
+            if let Some(seen_requests) = &self.seen_requests {
+                seen_requests
+                    .lock()
+                    .expect("seen_requests lock should be valid")
+                    .push(request.messages.to_vec());
+            }
             let mut responses = self
                 .responses
                 .lock()
@@ -3971,8 +4424,9 @@ mod tests {
             ChatMessage::user("run shell"),
         ];
         let observer = NoopObserver;
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(8);
 
-        let result = run_tool_call_loop(
+        let result = run_tool_call_loop_with_reply_target(
             &provider,
             &mut history,
             &tools_registry,
@@ -3983,12 +4437,14 @@ mod tests {
             true,
             Some(&approval_mgr),
             "telegram",
+            Some("chat-approval"),
             &crate::config::MultimodalConfig::default(),
             4,
             None,
-            None,
+            Some(delta_tx),
             None,
             &[],
+            ProgressMode::Off,
         )
         .await
         .expect("tool loop should complete with denied tool execution");
@@ -3998,6 +4454,45 @@ mod tests {
             max_active.load(Ordering::SeqCst),
             0,
             "shell tool must not execute when approval is unavailable on non-CLI channels"
+        );
+
+        let tool_results_message = history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("tool results message should be present");
+        let blocked_line = tool_results_message
+            .content
+            .lines()
+            .find(|line| line.contains("blocked by security policy"))
+            .expect("structured policy block line should be included");
+        let parsed = parse_command_policy_block_event(blocked_line)
+            .expect("blocked reason should be parseable as a policy block event");
+        assert_eq!(
+            parsed.policy_id,
+            "runtime.approval.non_cli_context_required"
+        );
+        assert_eq!(parsed.command_fragment, "shell echo hi");
+        assert!(
+            parsed.reason.contains("no approval context is available"),
+            "approval block reason should explain unavailable context, got: {}",
+            parsed.reason
+        );
+
+        let mut progress_deltas = Vec::new();
+        while let Ok(delta) = delta_rx.try_recv() {
+            progress_deltas.push(delta);
+        }
+        assert!(
+            progress_deltas
+                .iter()
+                .any(|delta| delta.contains("policy=runtime.approval.non_cli_context_required")),
+            "approval policy block should be sent to progress stream, got deltas: {progress_deltas:?}"
+        );
+        assert!(
+            progress_deltas
+                .iter()
+                .any(|delta| delta.contains("command=shell echo hi")),
+            "approval command fragment should be sent to progress stream, got deltas: {progress_deltas:?}"
         );
     }
 
@@ -4142,6 +4637,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_tool_call_loop_reports_block_when_non_cli_pending_request_disappears() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"echo hi"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(
+            "shell",
+            50,
+            Arc::clone(&active),
+            Arc::clone(&max_active),
+        ))];
+
+        let approval_mgr = Arc::new(ApprovalManager::from_config(
+            &crate::config::AutonomyConfig::default(),
+        ));
+        let (prompt_tx, mut prompt_rx) =
+            tokio::sync::mpsc::unbounded_channel::<NonCliApprovalPrompt>();
+        let approval_mgr_for_task = Arc::clone(&approval_mgr);
+        let cleanup_task = tokio::spawn(async move {
+            let prompt = prompt_rx
+                .recv()
+                .await
+                .expect("approval prompt should arrive");
+            let removed =
+                approval_mgr_for_task.clear_non_cli_pending_requests_for_tool(&prompt.tool_name);
+            assert!(
+                removed >= 1,
+                "at least one pending request should be removed for tool cleanup"
+            );
+        });
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run shell"),
+        ];
+        let observer = NoopObserver;
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(8);
+
+        let result = run_tool_call_loop_with_non_cli_approval_context(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            Some(approval_mgr.as_ref()),
+            "telegram",
+            Some(NonCliApprovalContext {
+                sender: "alice".to_string(),
+                reply_target: "chat-approval".to_string(),
+                prompt_tx,
+            }),
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            Some(delta_tx),
+            None,
+            &[],
+            ProgressMode::Off,
+            None,
+        )
+        .await
+        .expect("tool loop should complete with structured pending-request block");
+
+        cleanup_task.await.expect("cleanup task should complete");
+        assert_eq!(result, "done");
+        assert_eq!(
+            max_active.load(Ordering::SeqCst),
+            0,
+            "shell tool must not execute when pending approval request disappears"
+        );
+
+        let tool_results_message = history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("tool results message should be present");
+        let blocked_line = tool_results_message
+            .content
+            .lines()
+            .find(|line| line.contains("blocked by security policy"))
+            .expect("structured policy block line should be included");
+        let parsed = parse_command_policy_block_event(blocked_line)
+            .expect("blocked reason should be parseable as a policy block event");
+        assert_eq!(
+            parsed.policy_id,
+            "runtime.approval.pending_request_not_found"
+        );
+        assert_eq!(parsed.command_fragment, "shell echo hi");
+        assert!(
+            parsed.reason.contains("was removed before a user decision"),
+            "pending-request block reason should explain request removal, got: {}",
+            parsed.reason
+        );
+
+        let mut progress_deltas = Vec::new();
+        while let Ok(delta) = delta_rx.try_recv() {
+            progress_deltas.push(delta);
+        }
+        assert!(
+            progress_deltas
+                .iter()
+                .any(|delta| delta.contains("policy=runtime.approval.pending_request_not_found")),
+            "pending-request block should be sent to progress stream, got deltas: {progress_deltas:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn run_tool_call_loop_consumes_one_time_non_cli_allow_all_token() {
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"<tool_call>
@@ -4223,8 +4832,9 @@ mod tests {
         ];
         let observer = NoopObserver;
         let excluded_tools = vec!["shell".to_string()];
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(8);
 
-        let result = run_tool_call_loop(
+        let result = run_tool_call_loop_with_reply_target(
             &provider,
             &mut history,
             &tools_registry,
@@ -4235,12 +4845,14 @@ mod tests {
             true,
             None,
             "telegram",
+            Some("chat-1"),
             &crate::config::MultimodalConfig::default(),
             4,
             None,
-            None,
+            Some(delta_tx),
             None,
             &excluded_tools,
+            ProgressMode::Off,
         )
         .await
         .expect("tool loop should complete with blocked tool execution");
@@ -4261,6 +4873,135 @@ mod tests {
                 .content
                 .contains("not available in this channel"),
             "blocked reason should be visible to the model"
+        );
+        let blocked_line = tool_results_message
+            .content
+            .lines()
+            .find(|line| line.contains("blocked by security policy"))
+            .expect("structured policy block line should be included");
+        let parsed = parse_command_policy_block_event(blocked_line)
+            .expect("blocked tool reason should be parseable as a policy block event");
+        assert_eq!(parsed.policy_id, "runtime.channel.excluded_tools");
+        assert_eq!(parsed.command_fragment, "shell echo hi");
+        assert!(parsed.reason.contains("not available in this channel"));
+
+        let mut progress_deltas = Vec::new();
+        while let Ok(delta) = delta_rx.try_recv() {
+            progress_deltas.push(delta);
+        }
+        assert!(
+            progress_deltas
+                .iter()
+                .any(|delta| delta.contains("policy=runtime.channel.excluded_tools")),
+            "excluded-tool policy block should be sent to progress stream, got deltas: {progress_deltas:?}"
+        );
+        assert!(
+            progress_deltas
+                .iter()
+                .any(|delta| delta.contains("command=shell echo hi")),
+            "excluded-tool command fragment should be sent to progress stream, got deltas: {progress_deltas:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_reports_command_context_rule_block_in_progress_stream() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"curl https://evil.example/data"}}
+</tool_call>"#,
+            "done",
+        ]);
+        let workspace = TempDir::new().expect("workspace should be created");
+        let autonomy_config = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Full,
+            block_high_risk_commands: false,
+            allowed_commands: vec!["curl".to_string()],
+            command_context_rules: vec![crate::config::CommandContextRuleConfig {
+                command: "curl".to_string(),
+                action: crate::config::CommandContextRuleAction::Allow,
+                allowed_domains: vec!["api.example.com".to_string()],
+                allowed_path_prefixes: Vec::new(),
+                denied_path_prefixes: Vec::new(),
+                allow_high_risk: false,
+            }],
+            ..crate::config::AutonomyConfig::default()
+        };
+        let security = Arc::new(crate::security::SecurityPolicy::from_config(
+            &autonomy_config,
+            workspace.path(),
+        ));
+        let tools_registry: Vec<Box<dyn Tool>> =
+            vec![Box::new(crate::tools::shell::ShellTool::new(
+                Arc::clone(&security),
+                Arc::new(crate::runtime::NativeRuntime::new()),
+            ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run curl"),
+        ];
+        let observer = NoopObserver;
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(8);
+
+        let result = run_tool_call_loop_with_reply_target(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "feishu",
+            Some("chat-ctx"),
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            Some(delta_tx),
+            None,
+            &[],
+            ProgressMode::Off,
+        )
+        .await
+        .expect("tool loop should complete with command_context_rules block");
+
+        assert_eq!(result, "done");
+        let tool_results_message = history
+            .iter()
+            .find(|msg| msg.role == "user" && msg.content.starts_with("[Tool results]"))
+            .expect("tool results message should be present");
+        let blocked_line = tool_results_message
+            .content
+            .lines()
+            .find(|line| line.contains("blocked by security policy"))
+            .expect("structured policy block line should be included");
+        let parsed = parse_command_policy_block_event(blocked_line)
+            .expect("blocked reason should be parseable as a policy block event");
+        assert_eq!(parsed.policy_id, "autonomy.command_context_rules");
+        assert_eq!(parsed.command_fragment, "curl https://evil.example/data");
+
+        let mut progress_deltas = Vec::new();
+        while let Ok(delta) = delta_rx.try_recv() {
+            progress_deltas.push(delta);
+        }
+        assert!(
+            progress_deltas
+                .iter()
+                .any(|delta| delta.contains("policy=autonomy.command_context_rules")),
+            "command_context_rules policy block should be sent to progress stream, got deltas: {progress_deltas:?}"
+        );
+        assert!(
+            progress_deltas
+                .iter()
+                .any(|delta| delta.contains("command=curl https://evil.example/data")),
+            "command_context_rules command fragment should be sent to progress stream, got deltas: {progress_deltas:?}"
+        );
+        assert!(
+            progress_deltas
+                .iter()
+                .any(|delta| delta.contains("config_key=autonomy.command_context_rules")),
+            "command_context_rules config key should be sent to progress stream, got deltas: {progress_deltas:?}"
         );
     }
 
@@ -4429,6 +5170,225 @@ mod tests {
             invocations.load(Ordering::SeqCst),
             1,
             "the fallback retry should lead to an actual tool execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_requires_post_action_verification_before_final_answer() {
+        let seen_requests = Arc::new(Mutex::new(Vec::<Vec<ChatMessage>>::new()));
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"shell","arguments":{"command":"touch /tmp/zeroclaw.out"}}
+</tool_call>"#,
+            "done without verification",
+            r#"<tool_call>
+{"name":"file_read","arguments":{"path":"README.md"}}
+</tool_call>"#,
+            "done after verification",
+        ])
+        .with_seen_requests(Arc::clone(&seen_requests));
+
+        let shell_invocations = Arc::new(AtomicUsize::new(0));
+        let verify_invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(CountingTool::new("shell", Arc::clone(&shell_invocations))),
+            Box::new(CountingTool::new(
+                "file_read",
+                Arc::clone(&verify_invocations),
+            )),
+        ];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("apply change and finish"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            6,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("loop should enforce post-action verification before final answer");
+
+        assert_eq!(result, "done after verification");
+        assert_eq!(shell_invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            verify_invocations.load(Ordering::SeqCst),
+            1,
+            "verification tool call should be required before final response"
+        );
+
+        let recorded_requests = seen_requests
+            .lock()
+            .expect("seen_requests lock should be valid");
+        let expected_requirement = summarize_post_action_verification_target(
+            "shell",
+            &serde_json::json!({ "command": "touch /tmp/zeroclaw.out" }),
+        );
+        let expected_retry_prompt =
+            build_post_action_verification_retry_prompt(&expected_requirement, 1);
+        let injected_retry_prompt_seen = recorded_requests.iter().any(|messages| {
+            messages.iter().any(|message| {
+                message.role == "user"
+                    && message.content.contains(expected_retry_prompt.as_str())
+            })
+        });
+        assert!(
+            injected_retry_prompt_seen,
+            "missing post-action verification should inject retry guidance before final response"
+        );
+        assert!(
+            history.iter().all(|message| {
+                !(message.role == "assistant"
+                    && message.content.contains("done without verification"))
+            }),
+            "unverified assistant text should not be surfaced in conversation history"
+        );
+        assert!(
+            history.iter().any(|message| {
+                message.role == "assistant" && message.content.contains("done after verification")
+            }),
+            "verified assistant text should remain visible in conversation history"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_requires_post_action_verification_after_latest_mutation_in_turn() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"file_read","arguments":{"path":"README.md"}}
+</tool_call>
+<tool_call>
+{"name":"shell","arguments":{"command":"touch /tmp/zeroclaw.out"}}
+</tool_call>"#,
+            "done without post-mutation verification",
+            r#"<tool_call>
+{"name":"file_read","arguments":{"path":"Cargo.toml"}}
+</tool_call>"#,
+            "done after post-mutation verification",
+        ]);
+
+        let shell_invocations = Arc::new(AtomicUsize::new(0));
+        let verify_invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(CountingTool::new(
+                "file_read",
+                Arc::clone(&verify_invocations),
+            )),
+            Box::new(CountingTool::new("shell", Arc::clone(&shell_invocations))),
+        ];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("modify and verify"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            6,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("loop should require verification after the latest mutation in a turn");
+
+        assert_eq!(result, "done after post-mutation verification");
+        assert_eq!(shell_invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            verify_invocations.load(Ordering::SeqCst),
+            2,
+            "verification before mutation should not satisfy the post-mutation verification gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_requires_post_action_verification_for_cron_mutation_before_final_answer(
+    ) {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"cron_add","arguments":{"schedule":"* * * * *","job_type":"agent","prompt":"status check"}}
+</tool_call>"#,
+            "done without verification",
+            r#"<tool_call>
+{"name":"cron_list","arguments":{}}
+</tool_call>"#,
+            "done after verification",
+        ]);
+
+        let cron_add_invocations = Arc::new(AtomicUsize::new(0));
+        let cron_list_invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(CountingTool::new(
+                "cron_add",
+                Arc::clone(&cron_add_invocations),
+            )),
+            Box::new(CountingTool::new(
+                "cron_list",
+                Arc::clone(&cron_list_invocations),
+            )),
+        ];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("create recurring task and finish"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            6,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("loop should enforce cron post-action verification before final answer");
+
+        assert_eq!(result, "done after verification");
+        assert_eq!(cron_add_invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cron_list_invocations.load(Ordering::SeqCst),
+            1,
+            "cron verification call should be required before final response"
         );
     }
 
@@ -6268,10 +7228,82 @@ Let me check the result."#;
         assert!(started.contains("⏳ shell: ls -la"));
         assert!(started.contains("⏳ web_search: rust async test"));
 
-        tracker.complete(first, true, 2);
-        tracker.complete(second, false, 1);
+        tracker.complete(first, true, 2, None);
+        tracker.complete(second, false, 1, None);
         let completed = tracker.render_delta();
         assert!(completed.contains("✅ shell (2s)"));
         assert!(completed.contains("❌ web_search (1s)"));
+    }
+
+    #[test]
+    fn summarize_policy_block_for_progress_extracts_policy_and_command() {
+        let raw = "blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example";
+        let summary = summarize_tool_policy_block_progress("shell", Some(raw))
+            .expect("security block summary should be rendered for progress");
+        assert!(summary.contains("policy=autonomy.allowed_commands"));
+        assert!(summary.contains("command=curl https://evil.example"));
+    }
+
+    #[test]
+    fn progress_tracker_renders_shell_structure_policy_on_blocked_tool() {
+        let raw = "blocked by security policy: policy=autonomy.shell_structure.redirection; command=cat </etc/passwd; reason=Shell command structure is blocked by security policy (allow_unsafe_shell_structures=false): input redirection";
+        let detail = summarize_tool_policy_block_progress("shell", Some(raw))
+            .expect("shell structure policy block should produce progress detail");
+
+        let mut tracker = ProgressTracker::default();
+        let idx = tracker.add("shell", "cat </etc/passwd");
+        tracker.complete(idx, false, 0, Some(detail.as_str()));
+
+        let rendered = tracker.render_delta();
+        assert!(rendered.contains("❌ shell (0s)"));
+        assert!(rendered.contains("policy=autonomy.shell_structure.redirection"));
+        assert!(rendered.contains("command=cat </etc/passwd"));
+        assert!(rendered.contains("reason=Shell command structure is blocked by security policy"));
+        assert!(rendered.contains("allow_unsafe_shell_structures=false"));
+    }
+
+    #[test]
+    fn normalize_runtime_constraint_reason_prefers_policy_event_summary() {
+        let raw = "blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example";
+        let normalized = normalize_runtime_constraint_reason(raw);
+        assert!(normalized.contains("security blocked (policy=autonomy.allowed_commands; command=curl https://evil.example; config_key=autonomy.allowed_commands)"));
+        assert!(normalized.contains("Guidance: choose an allowed command/tool"));
+        assert!(!normalized.contains("; reason="));
+    }
+
+    #[test]
+    fn normalize_runtime_constraint_reason_prefers_workspace_path_policy_event_summary() {
+        let raw = "blocked by security policy: policy=autonomy.workspace_path_guard; command=cat /etc/passwd; reason=Path blocked by security policy: /etc/passwd";
+        let normalized = normalize_runtime_constraint_reason(raw);
+        assert!(normalized.contains(
+            "security blocked (policy=autonomy.workspace_path_guard; command=cat /etc/passwd; config_key=autonomy.allowed_roots)"
+        ));
+        assert!(normalized.contains("Guidance: choose an allowed command/tool"));
+        assert!(!normalized.contains("; reason="));
+    }
+
+    #[test]
+    fn looks_like_runtime_constraint_reason_requires_specific_block_signals() {
+        assert!(!looks_like_runtime_constraint_reason(
+            "This is just a generic mention of a security policy."
+        ));
+
+        let structured_block = "blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example";
+        assert!(looks_like_runtime_constraint_reason(structured_block));
+    }
+
+    #[test]
+    fn summarize_runtime_constraint_reasons_preserves_policy_and_command_for_retry_prompt() {
+        let raw = "blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example";
+        let reasons = summarize_runtime_constraint_reasons([raw], 3);
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("policy=autonomy.allowed_commands"));
+        assert!(reasons[0].contains("command=curl https://evil.example"));
+        assert!(reasons[0].contains("config_key=autonomy.allowed_commands"));
+
+        let prompt =
+            build_runtime_constraint_retry_prompt(&reasons).expect("retry prompt should exist");
+        assert!(prompt.contains("policy=autonomy.allowed_commands"));
+        assert!(prompt.contains("command=curl https://evil.example"));
     }
 }

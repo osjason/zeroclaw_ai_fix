@@ -1,3 +1,4 @@
+use super::cron_common::{ensure_cron_enabled, parse_job_request, preflight_command_allowed};
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron::{self, CronJobPatch, DeliveryConfig, JobType, Schedule};
@@ -11,48 +12,60 @@ pub struct CronUpdateTool {
     security: Arc<SecurityPolicy>,
 }
 
+struct CronUpdateRequest {
+    job_id: String,
+    approved: bool,
+    patch: CronJobPatch,
+    default_delivery: Option<DeliveryConfig>,
+}
+
+impl CronUpdateRequest {
+    fn command_for_preflight(&self) -> Option<&str> {
+        self.patch.command.as_deref()
+    }
+}
+
 impl CronUpdateTool {
     pub fn new(config: Arc<Config>, security: Arc<SecurityPolicy>) -> Self {
         Self { config, security }
     }
 
-    fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
-        if !self.security.can_act() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Security policy: read-only mode, cannot perform '{action}'"
-                )),
-            });
+    fn error_result(message: impl Into<String>) -> ToolResult {
+        ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(message.into()),
         }
-
-        if self.security.is_rate_limited() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
-            });
-        }
-
-        if !self.security.record_action() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".to_string()),
-            });
-        }
-
-        None
     }
 
-    fn parse_default_delivery(args: &serde_json::Value) -> Result<Option<DeliveryConfig>, String> {
+    fn parse_default_delivery(
+        args: &serde_json::Value,
+    ) -> Result<Option<DeliveryConfig>, ToolResult> {
         match args.get("default_delivery") {
             Some(value) => serde_json::from_value::<DeliveryConfig>(value.clone())
                 .map(Some)
-                .map_err(|e| format!("Invalid default_delivery payload: {e}")),
+                .map_err(|e| Self::error_result(format!("Invalid default_delivery payload: {e}"))),
             None => Ok(None),
         }
+    }
+
+    fn parse_patch(args: &serde_json::Value) -> Result<CronJobPatch, ToolResult> {
+        let patch_val = match args.get("patch") {
+            Some(value) => value.clone(),
+            None => return Err(Self::error_result("Missing 'patch' parameter")),
+        };
+        serde_json::from_value::<CronJobPatch>(patch_val)
+            .map_err(|e| Self::error_result(format!("Invalid patch payload: {e}")))
+    }
+
+    fn parse_request(args: &serde_json::Value) -> Result<CronUpdateRequest, ToolResult> {
+        let request = parse_job_request(args)?;
+        Ok(CronUpdateRequest {
+            job_id: request.job_id.to_string(),
+            approved: request.approved,
+            patch: Self::parse_patch(args)?,
+            default_delivery: Self::parse_default_delivery(args)?,
+        })
     }
 
     fn should_apply_default_delivery(
@@ -119,100 +132,46 @@ impl Tool for CronUpdateTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.config.cron.enabled {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
-            });
+        if let Err(blocked) = ensure_cron_enabled(&self.config, "cron_update") {
+            return Ok(blocked);
         }
-
-        let job_id = match args.get("job_id").and_then(serde_json::Value::as_str) {
-            Some(v) if !v.trim().is_empty() => v,
-            _ => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some("Missing 'job_id' parameter".to_string()),
-                });
-            }
+        let request = match Self::parse_request(&args) {
+            Ok(request) => request,
+            Err(blocked) => return Ok(blocked),
         };
-
-        let patch_val = match args.get("patch") {
-            Some(v) => v.clone(),
-            None => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some("Missing 'patch' parameter".to_string()),
-                });
-            }
-        };
-
-        let patch = match serde_json::from_value::<CronJobPatch>(patch_val) {
-            Ok(patch) => patch,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Invalid patch payload: {e}")),
-                });
-            }
-        };
-        let approved = args
-            .get("approved")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let default_delivery = match Self::parse_default_delivery(&args) {
-            Ok(default_delivery) => default_delivery,
-            Err(error) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(error),
-                });
-            }
-        };
-
-        if let Some(command) = &patch.command {
-            if let Err(reason) = self.security.validate_command_execution(command, approved) {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(reason),
-                });
-            }
+        if let Some(blocked) = preflight_command_allowed(
+            self.security.as_ref(),
+            "cron_update",
+            request.command_for_preflight(),
+            request.approved,
+        ) {
+            return Ok(blocked);
         }
+        let CronUpdateRequest {
+            job_id,
+            mut patch,
+            default_delivery,
+            ..
+        } = request;
 
-        let mut patch = patch;
-        let existing_job = match cron::get_job(&self.config, job_id) {
+        let existing_job = match cron::get_job(&self.config, &job_id) {
             Ok(job) => job,
             Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(e.to_string()),
-                });
+                return Ok(Self::error_result(e.to_string()));
             }
         };
         if Self::should_apply_default_delivery(&existing_job, &patch, default_delivery.as_ref()) {
             patch.delivery = default_delivery;
         }
 
-        if let Some(blocked) = self.enforce_mutation_allowed("cron_update") {
-            return Ok(blocked);
-        }
-
-        match cron::update_job(&self.config, job_id, patch) {
+        match cron::update_job(&self.config, &job_id, patch) {
             Ok(job) => Ok(ToolResult {
                 success: true,
                 output: serde_json::to_string_pretty(&job)?,
                 error: None,
             }),
             Err(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(e.to_string()),
+                ..Self::error_result(e.to_string())
             }),
         }
     }
@@ -222,7 +181,9 @@ impl Tool for CronUpdateTool {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::security::policy::parse_security_policy_block_event;
     use crate::security::AutonomyLevel;
+    use crate::tools::{action_command_preflight_for, ActionCommandPreflight};
     use tempfile::TempDir;
 
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
@@ -287,7 +248,64 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("not allowed"));
+        let blocked = result.error.unwrap_or_default();
+        let event = parse_security_policy_block_event(&blocked)
+            .expect("cron_update should expose structured security block event");
+        assert_eq!(event.policy_id, "autonomy.allowed_commands");
+        assert_eq!(event.command_fragment, "curl https://example.com");
+        assert!(event.reason.contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn blocks_disallowed_command_updates_match_preflight_event_fields() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.autonomy.allowed_commands = vec!["echo".into()];
+        tokio::fs::create_dir_all(&config.workspace_dir)
+            .await
+            .unwrap();
+        let cfg = Arc::new(config);
+        let security = test_security(&cfg);
+        let command = "curl https://example.com";
+        let preflight = action_command_preflight_for(
+            security.as_ref(),
+            ActionCommandPreflight::new("cron_update", Some(command), false),
+        )
+        .expect("expected cron_update preflight to block disallowed command");
+        assert!(!preflight.success);
+        let preflight_event = parse_security_policy_block_event(
+            preflight
+                .error
+                .as_deref()
+                .expect("preflight block should include structured error"),
+        )
+        .expect("preflight block should parse into structured policy event");
+
+        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
+        let tool = CronUpdateTool::new(cfg, security);
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "command": command }
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let event = parse_security_policy_block_event(
+            result
+                .error
+                .as_deref()
+                .expect("cron_update block should include structured error"),
+        )
+        .expect("cron_update block should parse into structured policy event");
+
+        assert_eq!(event.policy_id, preflight_event.policy_id);
+        assert_eq!(event.command_fragment, preflight_event.command_fragment);
+        assert_eq!(event.reason, preflight_event.reason);
     }
 
     #[tokio::test]
@@ -312,7 +330,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("read-only"));
+        let blocked = result.error.unwrap_or_default();
+        let event = parse_security_policy_block_event(&blocked)
+            .expect("cron_update read-only block should expose structured security block event");
+        assert_eq!(event.policy_id, "autonomy.read_only");
+        assert_eq!(event.command_fragment, "cron_update");
+        assert!(event.reason.contains("read-only"));
     }
 
     #[tokio::test]
@@ -327,26 +350,50 @@ mod tests {
         config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let cfg = Arc::new(config);
+        let security = test_security(&cfg);
+        let command = "touch cron-update-approval-test";
+        let preflight = action_command_preflight_for(
+            security.as_ref(),
+            ActionCommandPreflight::new("cron_update", Some(command), false),
+        )
+        .expect("expected cron_update preflight to require explicit approval");
+        assert!(!preflight.success);
+        let preflight_event = parse_security_policy_block_event(
+            preflight
+                .error
+                .as_deref()
+                .expect("preflight approval block should include structured error"),
+        )
+        .expect("preflight approval block should parse into structured policy event");
         let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
-        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        let tool = CronUpdateTool::new(cfg.clone(), security);
 
         let denied = tool
             .execute(json!({
                 "job_id": job.id,
-                "patch": { "command": "touch cron-update-approval-test" }
+                "patch": { "command": command }
             }))
             .await
             .unwrap();
         assert!(!denied.success);
-        assert!(denied
-            .error
-            .unwrap_or_default()
-            .contains("explicit approval"));
+        let denied_event = parse_security_policy_block_event(
+            denied
+                .error
+                .as_deref()
+                .expect("cron_update approval block should include structured error"),
+        )
+        .expect("cron_update approval block should parse into structured policy event");
+        assert_eq!(denied_event.policy_id, preflight_event.policy_id);
+        assert_eq!(
+            denied_event.command_fragment,
+            preflight_event.command_fragment
+        );
+        assert_eq!(denied_event.reason, preflight_event.reason);
 
         let approved = tool
             .execute(json!({
                 "job_id": job.id,
-                "patch": { "command": "touch cron-update-approval-test" },
+                "patch": { "command": command },
                 "approved": true
             }))
             .await
@@ -372,16 +419,18 @@ mod tests {
         let result = tool
             .execute(json!({
                 "job_id": job.id,
-                "patch": { "enabled": false }
+                "patch": { "command": "echo should-not-run" }
             }))
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("Rate limit exceeded"));
-        assert!(cron::get_job(&cfg, &job.id).unwrap().enabled);
+        let blocked = result.error.unwrap_or_default();
+        let event = parse_security_policy_block_event(&blocked)
+            .expect("cron_update rate-limit block should expose structured security block event");
+        assert_eq!(event.policy_id, "autonomy.max_actions_per_hour");
+        assert_eq!(event.command_fragment, "echo should-not-run");
+        assert!(event.reason.contains("Rate limit exceeded"));
+        assert_eq!(cron::get_job(&cfg, &job.id).unwrap().command, "echo ok");
     }
 
     #[tokio::test]

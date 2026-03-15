@@ -1,6 +1,8 @@
 use parking_lot::Mutex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -38,6 +40,375 @@ pub enum CommandRiskLevel {
     Low,
     Medium,
     High,
+}
+
+const MAX_COMMAND_FRAGMENT_CHARS: usize = 160;
+const SECURITY_BLOCK_MESSAGE_PREFIX: &str = "blocked by security policy:";
+const NO_COMMAND_FRAGMENT: &str = "<none>";
+const READ_ONLY_POLICY_ID: &str = "autonomy.read_only";
+const READ_ONLY_REASON: &str = "autonomy is read-only";
+const MAX_ACTIONS_POLICY_ID: &str = "autonomy.max_actions_per_hour";
+const RATE_LIMIT_PRECHECK_REASON: &str = "Rate limit exceeded: too many actions in the last hour";
+const RATE_LIMIT_BUDGET_REASON: &str = "Rate limit exceeded: action budget exhausted";
+const COMMAND_CONTEXT_RULES_POLICY_ID: &str = "autonomy.command_context_rules";
+
+/// Structured metadata extracted from a formatted security policy block event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PolicyBlockEvent<'a> {
+    pub policy_id: &'a str,
+    pub command_fragment: &'a str,
+    pub reason: &'a str,
+}
+
+pub(crate) type CommandPolicyBlockEvent<'a> = PolicyBlockEvent<'a>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShellStructureBlock {
+    policy_id: &'static str,
+    reason: &'static str,
+}
+
+fn detect_shell_structure_block(command: &str) -> Option<ShellStructureBlock> {
+    if command.contains('`')
+        || contains_unquoted_shell_variable_expansion(command)
+        || command.contains("<(")
+        || command.contains(">(")
+    {
+        return Some(ShellStructureBlock {
+            policy_id: "autonomy.shell_structure.subshell",
+            reason:
+                "Shell subshell/expansion operators (`...`, `$()`, `${}`, `<(`, `>(`) are blocked by security policy",
+        });
+    }
+
+    // Ignore quoted literals, e.g. `echo \"a>b\"` and `echo \"a<b\"`.
+    if contains_unquoted_char(command, '>') || contains_unquoted_char(command, '<') {
+        return Some(ShellStructureBlock {
+            policy_id: "autonomy.shell_structure.redirection",
+            reason: "Shell redirection operators (`<`, `>`, `>>`) are blocked by security policy",
+        });
+    }
+
+    if command
+        .split_whitespace()
+        .any(|w| w == "tee" || w.ends_with("/tee"))
+    {
+        return Some(ShellStructureBlock {
+            policy_id: "autonomy.shell_structure.tee",
+            reason: "The `tee` command is blocked by security policy",
+        });
+    }
+
+    // Keep `&&` allowed; only block unquoted single ampersand operator.
+    if contains_unquoted_single_ampersand(command) {
+        return Some(ShellStructureBlock {
+            policy_id: "autonomy.shell_structure.background",
+            reason: "Single `&` background chaining is blocked by security policy",
+        });
+    }
+
+    None
+}
+
+fn shell_structure_violation(command: &str) -> Option<CommandPolicyViolation> {
+    detect_shell_structure_block(command).map(|block| {
+        CommandPolicyViolation::new(
+            block.policy_id,
+            format!(
+                "{}. Set `[autonomy].allow_unsafe_shell_structures = true` to opt in.",
+                block.reason
+            ),
+            command,
+        )
+    })
+}
+
+/// Structured reason for a command blocked by security policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandPolicyViolation {
+    policy_id: &'static str,
+    reason: String,
+    command_fragment: String,
+}
+
+impl CommandPolicyViolation {
+    pub fn new(policy_id: &'static str, reason: impl Into<String>, command: &str) -> Self {
+        Self {
+            policy_id,
+            reason: reason.into(),
+            command_fragment: command_fragment(command),
+        }
+    }
+
+    pub fn from_block_event(
+        policy_id: &'static str,
+        reason: impl Into<String>,
+        command: Option<&str>,
+    ) -> Self {
+        Self::new(
+            policy_id,
+            reason,
+            command
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(NO_COMMAND_FRAGMENT),
+        )
+    }
+
+    pub fn policy_id(&self) -> &'static str {
+        self.policy_id
+    }
+
+    pub fn command_fragment(&self) -> &str {
+        &self.command_fragment
+    }
+
+    pub fn format_block_message(&self) -> String {
+        format!(
+            "blocked by security policy: policy={}; command={}; reason={}",
+            self.policy_id, self.command_fragment, self.reason
+        )
+    }
+}
+
+impl fmt::Display for CommandPolicyViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+impl std::error::Error for CommandPolicyViolation {}
+
+pub fn format_policy_block_event(
+    policy_id: &'static str,
+    reason: impl Into<String>,
+    command: Option<&str>,
+) -> String {
+    CommandPolicyViolation::from_block_event(policy_id, reason, command).format_block_message()
+}
+
+pub(crate) fn read_only_policy_block_event(command: Option<&str>) -> String {
+    format_policy_block_event(READ_ONLY_POLICY_ID, READ_ONLY_REASON, command)
+}
+
+pub(crate) fn rate_limit_precheck_policy_block_event(command: Option<&str>) -> String {
+    format_policy_block_event(MAX_ACTIONS_POLICY_ID, RATE_LIMIT_PRECHECK_REASON, command)
+}
+
+pub(crate) fn action_budget_exhausted_policy_block_event(command: Option<&str>) -> String {
+    format_policy_block_event(MAX_ACTIONS_POLICY_ID, RATE_LIMIT_BUDGET_REASON, command)
+}
+
+pub(crate) fn action_precheck_violation(
+    security: &SecurityPolicy,
+    action_subject: &str,
+) -> Option<CommandPolicyViolation> {
+    if !security.can_act() {
+        return Some(CommandPolicyViolation::from_block_event(
+            READ_ONLY_POLICY_ID,
+            READ_ONLY_REASON,
+            Some(action_subject),
+        ));
+    }
+
+    if security.is_rate_limited() {
+        return Some(CommandPolicyViolation::from_block_event(
+            MAX_ACTIONS_POLICY_ID,
+            RATE_LIMIT_PRECHECK_REASON,
+            Some(action_subject),
+        ));
+    }
+
+    None
+}
+
+pub(crate) fn action_budget_violation(
+    security: &SecurityPolicy,
+    action_subject: &str,
+) -> Option<CommandPolicyViolation> {
+    if security.record_action() {
+        None
+    } else {
+        Some(CommandPolicyViolation::from_block_event(
+            MAX_ACTIONS_POLICY_ID,
+            RATE_LIMIT_BUDGET_REASON,
+            Some(action_subject),
+        ))
+    }
+}
+
+pub(crate) fn action_command_preflight_violation(
+    security: &SecurityPolicy,
+    action_subject: &str,
+    command_validation: Option<(&str, bool)>,
+) -> Option<CommandPolicyViolation> {
+    let subject = command_validation_subject(action_subject, command_validation);
+
+    if let Some(blocked) = action_precheck_violation(security, subject) {
+        return Some(blocked);
+    }
+
+    if let Some((command, approved)) = command_validation {
+        if let Some(blocked) = command_policy_precheck_violation(security, command, approved) {
+            return Some(blocked);
+        }
+    }
+
+    action_budget_violation(security, subject)
+}
+
+pub(crate) fn action_command_preflight_with_approval_violation(
+    security: &SecurityPolicy,
+    action_subject: &str,
+    command: Option<&str>,
+    approved: bool,
+) -> Option<CommandPolicyViolation> {
+    action_command_preflight_violation(
+        security,
+        action_subject,
+        command.map(|value| (value, approved)),
+    )
+}
+
+fn command_validation_subject<'a>(
+    action_subject: &'a str,
+    command_validation: Option<(&'a str, bool)>,
+) -> &'a str {
+    command_validation
+        .map(|(command, _)| command.trim())
+        .filter(|command| !command.is_empty())
+        .unwrap_or(action_subject)
+}
+
+pub(crate) fn command_policy_precheck_violation(
+    security: &SecurityPolicy,
+    command: &str,
+    approved: bool,
+) -> Option<CommandPolicyViolation> {
+    security
+        .validate_command_execution_with_reason(command, approved)
+        .err()
+}
+
+pub(crate) fn is_command_policy_block_message(message: &str) -> bool {
+    strip_security_block_prefix(message).is_some()
+}
+
+pub(crate) fn parse_security_policy_block_event(message: &str) -> Option<PolicyBlockEvent<'_>> {
+    let detail = strip_security_block_prefix(message)?;
+    let detail = parse_block_event_detail(detail)?;
+
+    Some(PolicyBlockEvent {
+        policy_id: detail.policy_id,
+        command_fragment: detail.command_fragment,
+        reason: detail.reason,
+    })
+}
+
+pub(crate) fn parse_command_policy_block_event(
+    message: &str,
+) -> Option<CommandPolicyBlockEvent<'_>> {
+    parse_security_policy_block_event(message)
+}
+
+pub(crate) fn policy_block_config_key(policy_id: &str) -> Option<&str> {
+    let mapped = match policy_id {
+        "autonomy.shell_structure.subshell"
+        | "autonomy.shell_structure.redirection"
+        | "autonomy.shell_structure.tee"
+        | "autonomy.shell_structure.background" => "autonomy.allow_unsafe_shell_structures",
+        "autonomy.workspace_path_guard" => "autonomy.allowed_roots",
+        _ => policy_id,
+    };
+
+    if mapped.starts_with("autonomy.") {
+        Some(mapped)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn summarize_command_policy_block(
+    message: &str,
+    max_command_chars: usize,
+) -> Option<String> {
+    let detail = strip_security_block_prefix(message)?;
+    if let Some(event) = parse_block_event_detail(detail) {
+        let command = truncate_chars(event.command_fragment, max_command_chars.max(16));
+        if let Some(config_key) = policy_block_config_key(event.policy_id) {
+            return Some(format!(
+                "policy={}; command={command}; config_key={config_key}",
+                event.policy_id
+            ));
+        }
+        return Some(format!("policy={}; command={command}", event.policy_id));
+    }
+
+    Some(truncate_chars(
+        detail,
+        max_command_chars.saturating_add(40).max(40),
+    ))
+}
+
+fn strip_tool_error_prefix(message: &str) -> &str {
+    message
+        .strip_prefix("Error:")
+        .map(str::trim)
+        .unwrap_or(message)
+}
+
+fn strip_security_block_prefix(message: &str) -> Option<&str> {
+    let trimmed = strip_tool_error_prefix(message.trim());
+    if trimmed.len() < SECURITY_BLOCK_MESSAGE_PREFIX.len() {
+        return None;
+    }
+    let (prefix, rest) = trimmed.split_at(SECURITY_BLOCK_MESSAGE_PREFIX.len());
+    if !prefix.eq_ignore_ascii_case(SECURITY_BLOCK_MESSAGE_PREFIX) {
+        return None;
+    }
+    Some(rest.trim())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockEventDetail<'a> {
+    policy_id: &'a str,
+    command_fragment: &'a str,
+    reason: &'a str,
+}
+
+fn parse_block_event_detail(detail: &str) -> Option<BlockEventDetail<'_>> {
+    let detail = detail.strip_prefix("policy=")?;
+    let (policy_id, rest) = detail.split_once("; command=")?;
+    let (command_fragment, reason) = rest.split_once("; reason=").unwrap_or((rest, ""));
+    let policy_id = policy_id.trim();
+    let command_fragment = command_fragment.trim();
+    if policy_id.is_empty() || command_fragment.is_empty() {
+        return None;
+    }
+
+    Some(BlockEventDetail {
+        policy_id,
+        command_fragment,
+        reason: reason.trim(),
+    })
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let total_chars = value.chars().count();
+    if total_chars <= max_chars {
+        return value.to_string();
+    }
+
+    let truncated: String = value.chars().take(max_chars).collect();
+    format!("{truncated}...")
+}
+
+fn command_fragment(command: &str) -> String {
+    let compact = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return "<empty>".to_string();
+    }
+    truncate_chars(&compact, MAX_COMMAND_FRAGMENT_CHARS)
 }
 
 /// Classifies whether a tool operation is read-only or side-effecting.
@@ -99,12 +470,14 @@ pub struct SecurityPolicy {
     pub workspace_dir: PathBuf,
     pub workspace_only: bool,
     pub allowed_commands: Vec<String>,
+    pub command_context_rules: Vec<crate::config::CommandContextRuleConfig>,
     pub forbidden_paths: Vec<String>,
     pub allowed_roots: Vec<PathBuf>,
     pub max_actions_per_hour: u32,
     pub max_cost_per_day_cents: u32,
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
+    pub allow_unsafe_shell_structures: bool,
     pub shell_env_passthrough: Vec<String>,
     pub allow_sensitive_file_reads: bool,
     pub allow_sensitive_file_writes: bool,
@@ -132,6 +505,7 @@ impl Default for SecurityPolicy {
                 "tail".into(),
                 "date".into(),
             ],
+            command_context_rules: Vec::new(),
             forbidden_paths: vec![
                 // System directories (blocked even when workspace_only=false)
                 "/etc".into(),
@@ -160,6 +534,7 @@ impl Default for SecurityPolicy {
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
+            allow_unsafe_shell_structures: false,
             shell_env_passthrough: vec![],
             allow_sensitive_file_reads: false,
             allow_sensitive_file_writes: false,
@@ -565,7 +940,323 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
     allowed == executable_base
 }
 
+struct CommandContextSegmentEval<'a> {
+    has_matching_rules: bool,
+    allow_rules: Vec<&'a crate::config::CommandContextRuleConfig>,
+    matched_allow: Option<&'a crate::config::CommandContextRuleConfig>,
+    matched_deny: Option<&'a crate::config::CommandContextRuleConfig>,
+}
+
 impl SecurityPolicy {
+    fn evaluate_command_context_segment<'a>(
+        &'a self,
+        executable: &str,
+        base_cmd: &str,
+        args: &[String],
+    ) -> CommandContextSegmentEval<'a> {
+        let matching: Vec<&crate::config::CommandContextRuleConfig> = self
+            .command_context_rules
+            .iter()
+            .filter(|rule| Self::command_rule_matches_command(rule, executable, base_cmd))
+            .collect();
+
+        let matched_deny = matching
+            .iter()
+            .copied()
+            .find(|rule| {
+                rule.action == crate::config::CommandContextRuleAction::Deny
+                    && self.command_rule_matches_context(rule, args)
+            });
+
+        let allow_rules: Vec<&crate::config::CommandContextRuleConfig> = matching
+            .iter()
+            .copied()
+            .filter(|rule| rule.action == crate::config::CommandContextRuleAction::Allow)
+            .collect();
+        let matched_allow = allow_rules
+            .iter()
+            .copied()
+            .find(|rule| self.command_rule_matches_context(rule, args));
+
+        CommandContextSegmentEval {
+            has_matching_rules: !matching.is_empty(),
+            allow_rules,
+            matched_allow,
+            matched_deny,
+        }
+    }
+
+    fn normalize_segment_args(segment: &str) -> Vec<String> {
+        skip_env_assignments(segment)
+            .split_whitespace()
+            .skip(1)
+            .map(|token| strip_wrapping_quotes(token).trim().to_string())
+            .filter(|token| !token.is_empty())
+            .collect()
+    }
+
+    fn segment_command_parts(segment: &str) -> Option<(String, String)> {
+        let cmd_part = skip_env_assignments(segment);
+        let mut words = cmd_part.split_whitespace();
+        let executable = strip_wrapping_quotes(words.next()?).trim();
+        if executable.is_empty() {
+            return None;
+        }
+        let base_cmd = executable.rsplit('/').next().unwrap_or("").trim();
+        if base_cmd.is_empty() {
+            return None;
+        }
+        Some((executable.to_string(), base_cmd.to_string()))
+    }
+
+    fn command_rule_matches_command(
+        rule: &crate::config::CommandContextRuleConfig,
+        executable: &str,
+        base_cmd: &str,
+    ) -> bool {
+        is_allowlist_entry_match(rule.command.trim(), executable, base_cmd)
+    }
+
+    fn host_matches_pattern(host: &str, pattern: &str) -> bool {
+        let host = host.to_ascii_lowercase();
+        let pattern = pattern.trim().to_ascii_lowercase();
+        if let Some(suffix) = pattern.strip_prefix("*.") {
+            return host == suffix || host.ends_with(&format!(".{suffix}"));
+        }
+        host == pattern
+    }
+
+    fn command_rule_domain_constraint_match(
+        rule: &crate::config::CommandContextRuleConfig,
+        args: &[String],
+    ) -> bool {
+        if rule.allowed_domains.is_empty() {
+            return true;
+        }
+
+        let hosts: Vec<String> = args
+            .iter()
+            .filter_map(|arg| {
+                let parsed = reqwest::Url::parse(arg).ok()?;
+                parsed.host_str().map(|h| h.to_ascii_lowercase())
+            })
+            .collect();
+        if hosts.is_empty() {
+            return false;
+        }
+
+        hosts.iter().all(|host| {
+            rule.allowed_domains
+                .iter()
+                .any(|pattern| Self::host_matches_pattern(host, pattern))
+        })
+    }
+
+    fn resolve_rule_prefix(&self, prefix: &str) -> PathBuf {
+        let expanded = expand_user_path(prefix.trim());
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            self.workspace_dir.join(expanded)
+        }
+    }
+
+    fn resolve_arg_path<'a>(&self, raw: &'a str) -> Option<Cow<'a, str>> {
+        let candidate = strip_wrapping_quotes(raw).trim();
+        if candidate.is_empty() || candidate.contains("://") {
+            return None;
+        }
+        if candidate.starts_with('-') {
+            if let Some((_, value)) = candidate.split_once('=') {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    return Some(Cow::Owned(trimmed.to_string()));
+                }
+            }
+            if let Some(value) = attached_short_option_value(candidate) {
+                return Some(Cow::Owned(value.to_string()));
+            }
+            return None;
+        }
+        if let Some(target) = redirection_target(candidate) {
+            let trimmed = target.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            return Some(Cow::Owned(trimmed.to_string()));
+        }
+        if looks_like_path(candidate) {
+            return Some(Cow::Borrowed(candidate));
+        }
+        None
+    }
+
+    fn command_rule_path_constraint_match(
+        &self,
+        rule: &crate::config::CommandContextRuleConfig,
+        args: &[String],
+    ) -> bool {
+        let path_args: Vec<PathBuf> = args
+            .iter()
+            .filter_map(|arg| self.resolve_arg_path(arg))
+            .map(|raw| {
+                let expanded = expand_user_path(raw.as_ref());
+                if expanded.is_absolute() {
+                    expanded
+                } else {
+                    self.workspace_dir.join(expanded)
+                }
+            })
+            .collect();
+
+        if !rule.allowed_path_prefixes.is_empty() {
+            if path_args.is_empty() {
+                return false;
+            }
+            let allowed_prefixes: Vec<PathBuf> = rule
+                .allowed_path_prefixes
+                .iter()
+                .map(|prefix| self.resolve_rule_prefix(prefix))
+                .collect();
+            if !path_args.iter().all(|path| {
+                allowed_prefixes
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix))
+            }) {
+                return false;
+            }
+        }
+
+        if !rule.denied_path_prefixes.is_empty() {
+            let denied_prefixes: Vec<PathBuf> = rule
+                .denied_path_prefixes
+                .iter()
+                .map(|prefix| self.resolve_rule_prefix(prefix))
+                .collect();
+            if rule.action == crate::config::CommandContextRuleAction::Deny {
+                if path_args.is_empty() {
+                    return false;
+                }
+                return path_args.iter().any(|path| {
+                    denied_prefixes
+                        .iter()
+                        .any(|prefix| path.starts_with(prefix))
+                });
+            }
+            if path_args.iter().any(|path| {
+                denied_prefixes
+                    .iter()
+                    .any(|prefix| path.starts_with(prefix))
+            }) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    fn command_rule_matches_context(
+        &self,
+        rule: &crate::config::CommandContextRuleConfig,
+        args: &[String],
+    ) -> bool {
+        Self::command_rule_domain_constraint_match(rule, args)
+            && self.command_rule_path_constraint_match(rule, args)
+    }
+
+    fn command_context_rule_action_label(
+        action: crate::config::CommandContextRuleAction,
+    ) -> &'static str {
+        match action {
+            crate::config::CommandContextRuleAction::Allow => "allow",
+            crate::config::CommandContextRuleAction::Deny => "deny",
+        }
+    }
+
+    fn command_context_rule_constraint_summary(
+        rule: &crate::config::CommandContextRuleConfig,
+    ) -> String {
+        let mut parts = Vec::new();
+        parts.push(format!(
+            "rule_action={}",
+            Self::command_context_rule_action_label(rule.action)
+        ));
+        parts.push(format!("rule_command={}", rule.command.trim()));
+        if !rule.allowed_domains.is_empty() {
+            parts.push(format!("allowed_domains={}", rule.allowed_domains.join(",")));
+        }
+        if !rule.allowed_path_prefixes.is_empty() {
+            parts.push(format!(
+                "allowed_path_prefixes={}",
+                rule.allowed_path_prefixes.join(",")
+            ));
+        }
+        if !rule.denied_path_prefixes.is_empty() {
+            parts.push(format!(
+                "denied_path_prefixes={}",
+                rule.denied_path_prefixes.join(",")
+            ));
+        }
+        if rule.allow_high_risk {
+            parts.push("allow_high_risk=true".to_string());
+        }
+        parts.join("; ")
+    }
+
+    fn command_context_rules_violation(
+        &self,
+        command: &str,
+    ) -> Result<bool, CommandPolicyViolation> {
+        if self.command_context_rules.is_empty() {
+            return Ok(false);
+        }
+
+        let mut allow_high_risk = false;
+
+        for segment in split_unquoted_segments(command) {
+            let Some((executable, base_cmd)) = Self::segment_command_parts(&segment) else {
+                continue;
+            };
+            let args = Self::normalize_segment_args(&segment);
+            let eval = self.evaluate_command_context_segment(&executable, &base_cmd, &args);
+            if !eval.has_matching_rules {
+                continue;
+            }
+
+            if let Some(rule) = eval.matched_deny {
+                return Err(CommandPolicyViolation::new(
+                    COMMAND_CONTEXT_RULES_POLICY_ID,
+                    format!(
+                        "Command blocked by command_context_rules: deny rule matched for '{}'; {}",
+                        rule.command.trim(),
+                        Self::command_context_rule_constraint_summary(rule),
+                    ),
+                    command,
+                ));
+            }
+
+            if !eval.allow_rules.is_empty() {
+                let Some(rule) = eval.matched_allow else {
+                    return Err(CommandPolicyViolation::new(
+                        COMMAND_CONTEXT_RULES_POLICY_ID,
+                        format!(
+                            "Command blocked by command_context_rules: no allow rule matched constraints for '{}'; allow_rule_count={}; first_allow_rule={}",
+                            base_cmd,
+                            eval.allow_rules.len(),
+                            Self::command_context_rule_constraint_summary(eval.allow_rules[0]),
+                        ),
+                        command,
+                    ));
+                };
+                if rule.allow_high_risk {
+                    allow_high_risk = true;
+                }
+            }
+        }
+
+        Ok(allow_high_risk)
+    }
+
     // ── Risk Classification ──────────────────────────────────────────────
     // Risk is assessed per-segment (split on shell operators), and the
     // highest risk across all segments wins. This prevents bypasses like
@@ -680,7 +1371,7 @@ impl SecurityPolicy {
 
     // ── Command Execution Policy Gate ──────────────────────────────────────
     // Validation follows a strict precedence order:
-    //   1. Allowlist check (is the base command permitted at all?)
+    //   1. Command identity/context checks (allowlist + command_context_rules)
     //   2. Risk classification (high / medium / low)
     //   3. Policy flags (block_high_risk_commands, require_approval_for_medium_risk)
     //   4. Autonomy level × approval status (supervised requires explicit approval)
@@ -693,32 +1384,75 @@ impl SecurityPolicy {
         command: &str,
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
-        if !self.is_command_allowed(command) {
-            return Err(format!("Command not allowed by security policy: {command}"));
+        self.validate_command_execution_with_reason(command, approved)
+            .map_err(|err| err.to_string())
+    }
+
+    /// Validate full command execution policy and return structured policy
+    /// metadata when blocked.
+    pub fn validate_command_execution_with_reason(
+        &self,
+        command: &str,
+        approved: bool,
+    ) -> Result<CommandRiskLevel, CommandPolicyViolation> {
+        if self.autonomy == AutonomyLevel::ReadOnly {
+            return Err(CommandPolicyViolation::new(
+                "autonomy.read_only",
+                format!(
+                    "Command not allowed by security policy (autonomy is read-only): {command}"
+                ),
+                command,
+            ));
+        }
+
+        if !self.allow_unsafe_shell_structures {
+            if let Some(violation) = shell_structure_violation(command) {
+                return Err(violation);
+            }
+        }
+
+        let allow_high_risk_by_context = self.command_context_rules_violation(command)?;
+
+        if !self.is_command_allowed_with_context_override(command) {
+            return Err(CommandPolicyViolation::new(
+                "autonomy.allowed_commands",
+                format!("Command not allowed by security policy: {command}"),
+                command,
+            ));
         }
 
         if let Some(path) = self.forbidden_path_argument(command) {
-            return Err(format!("Path blocked by security policy: {path}"));
+            return Err(CommandPolicyViolation::new(
+                "autonomy.workspace_path_guard",
+                format!("Path blocked by security policy: {path}"),
+                command,
+            ));
         }
 
         let risk = self.command_risk_level(command);
 
         if risk == CommandRiskLevel::High {
-            if self.block_high_risk_commands {
+            if self.block_high_risk_commands && !allow_high_risk_by_context {
                 let lower = command.to_ascii_lowercase();
                 if lower.contains("curl") || lower.contains("wget") {
-                    return Err(
-                        "Command blocked: high-risk command is disallowed by policy. Shell curl/wget are blocked; use `http_request` or `web_fetch` with configured allowed_domains."
-                            .into(),
-                    );
+                    return Err(CommandPolicyViolation::new(
+                        "autonomy.block_high_risk_commands",
+                        "Command blocked: high-risk command is disallowed by policy. Shell curl/wget are blocked; use `http_request` or `web_fetch` with configured allowed_domains.",
+                        command,
+                    ));
                 }
-                return Err("Command blocked: high-risk command is disallowed by policy".into());
+                return Err(CommandPolicyViolation::new(
+                    "autonomy.block_high_risk_commands",
+                    "Command blocked: high-risk command is disallowed by policy",
+                    command,
+                ));
             }
             if self.autonomy == AutonomyLevel::Supervised && !approved {
-                return Err(
-                    "Command requires explicit approval (approved=true): high-risk operation"
-                        .into(),
-                );
+                return Err(CommandPolicyViolation::new(
+                    "autonomy.require_approval_for_high_risk",
+                    "Command requires explicit approval (approved=true): high-risk operation",
+                    command,
+                ));
             }
         }
 
@@ -727,12 +1461,62 @@ impl SecurityPolicy {
             && self.require_approval_for_medium_risk
             && !approved
         {
-            return Err(
-                "Command requires explicit approval (approved=true): medium-risk operation".into(),
-            );
+            return Err(CommandPolicyViolation::new(
+                "autonomy.require_approval_for_medium_risk",
+                "Command requires explicit approval (approved=true): medium-risk operation",
+                command,
+            ));
         }
 
         Ok(risk)
+    }
+
+    /// Check whether a command is allowed by the global allowlist, with
+    /// `command_context_rules` allow-rules able to explicitly admit segments.
+    ///
+    /// Safety guards remain in force:
+    /// - read-only autonomy still blocks all act commands
+    /// - shell structure guard still applies when unsafe structures are disabled
+    /// - argument-level safety checks still apply (e.g., `find -exec`, risky `git config`)
+    fn is_command_allowed_with_context_override(&self, command: &str) -> bool {
+        if self.autonomy == AutonomyLevel::ReadOnly {
+            return false;
+        }
+
+        if !self.allow_unsafe_shell_structures && detect_shell_structure_block(command).is_some() {
+            return false;
+        }
+
+        let segments = split_unquoted_segments(command);
+        let mut has_cmd = false;
+
+        for segment in &segments {
+            let Some((executable, base_cmd)) = Self::segment_command_parts(segment) else {
+                continue;
+            };
+            has_cmd = true;
+
+            let args = Self::normalize_segment_args(segment);
+            let lowered_args: Vec<String> = args.iter().map(|arg| arg.to_ascii_lowercase()).collect();
+            if !self.is_args_safe(&base_cmd, &lowered_args) {
+                return false;
+            }
+
+            let allowlisted = self
+                .allowed_commands
+                .iter()
+                .any(|allowed| is_allowlist_entry_match(allowed, &executable, &base_cmd));
+            if allowlisted {
+                continue;
+            }
+
+            let eval = self.evaluate_command_context_segment(&executable, &base_cmd, &args);
+            if eval.matched_allow.is_none() {
+                return false;
+            }
+        }
+
+        has_cmd
     }
 
     // ── Layered Command Allowlist ──────────────────────────────────────────
@@ -754,77 +1538,14 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Block subshell/expansion operators — these allow hiding arbitrary
-        // commands inside an allowed command (e.g. `echo $(rm -rf /)`) and
-        // bypassing path checks through variable indirection. The helper below
-        // ignores escapes and literals inside single quotes, so `$(` or `${`
-        // literals are permitted there.
-        if command.contains('`')
-            || contains_unquoted_shell_variable_expansion(command)
-            || command.contains("<(")
-            || command.contains(">(")
-        {
+        if !self.allow_unsafe_shell_structures && detect_shell_structure_block(command).is_some() {
             return false;
         }
 
-        // Block shell redirections (`<`, `>`, `>>`) — they can read/write
-        // arbitrary paths and bypass path checks.
-        // Ignore quoted literals, e.g. `echo "a>b"` and `echo "a<b"`.
-        if contains_unquoted_char(command, '>') || contains_unquoted_char(command, '<') {
+        if self.command_context_rules_violation(command).is_err() {
             return false;
         }
-
-        // Block `tee` — it can write to arbitrary files, bypassing the
-        // redirect check above (e.g. `echo secret | tee /etc/crontab`)
-        if command
-            .split_whitespace()
-            .any(|w| w == "tee" || w.ends_with("/tee"))
-        {
-            return false;
-        }
-
-        // Block background command chaining (`&`), which can hide extra
-        // sub-commands and outlive timeout expectations. Keep `&&` allowed.
-        if contains_unquoted_single_ampersand(command) {
-            return false;
-        }
-
-        // Split on unquoted command separators and validate each sub-command.
-        let segments = split_unquoted_segments(command);
-        for segment in &segments {
-            // Strip leading env var assignments (e.g. FOO=bar cmd)
-            let cmd_part = skip_env_assignments(segment);
-
-            let mut words = cmd_part.split_whitespace();
-            let executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
-            let base_cmd = executable.rsplit('/').next().unwrap_or("");
-
-            if base_cmd.is_empty() {
-                continue;
-            }
-
-            if !self
-                .allowed_commands
-                .iter()
-                .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
-            {
-                return false;
-            }
-
-            // Validate arguments for the command
-            let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
-            if !self.is_args_safe(base_cmd, &args) {
-                return false;
-            }
-        }
-
-        // At least one command must be present
-        let has_cmd = segments.iter().any(|s| {
-            let s = skip_env_assignments(s.trim());
-            s.split_whitespace().next().is_some_and(|w| !w.is_empty())
-        });
-
-        has_cmd
+        self.is_command_allowed_with_context_override(command)
     }
 
     /// Check for dangerous arguments that allow sub-command execution.
@@ -1240,6 +1961,7 @@ impl SecurityPolicy {
             workspace_dir: workspace_dir.to_path_buf(),
             workspace_only: autonomy_config.workspace_only,
             allowed_commands: autonomy_config.allowed_commands.clone(),
+            command_context_rules: autonomy_config.command_context_rules.clone(),
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
             allowed_roots: autonomy_config
                 .allowed_roots
@@ -1257,6 +1979,7 @@ impl SecurityPolicy {
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
+            allow_unsafe_shell_structures: autonomy_config.allow_unsafe_shell_structures,
             shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),
             allow_sensitive_file_reads: autonomy_config.allow_sensitive_file_reads,
             allow_sensitive_file_writes: autonomy_config.allow_sensitive_file_writes,
@@ -1320,6 +2043,156 @@ mod tests {
     }
 
     #[test]
+    fn summarize_command_policy_block_extracts_policy_and_command() {
+        let violation = CommandPolicyViolation::new(
+            "autonomy.allowed_commands",
+            "Command not allowed by security policy: curl https://evil.example",
+            "curl https://evil.example",
+        );
+        let summary = summarize_command_policy_block(&violation.format_block_message(), 64)
+            .expect("formatted block message should parse");
+        assert_eq!(
+            summary,
+            "policy=autonomy.allowed_commands; command=curl https://evil.example; config_key=autonomy.allowed_commands"
+        );
+    }
+
+    #[test]
+    fn parse_command_policy_block_event_extracts_fields() {
+        let message = "blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example";
+        let parsed = parse_command_policy_block_event(message)
+            .expect("formatted block message should parse into structured event");
+        assert_eq!(parsed.policy_id, "autonomy.allowed_commands");
+        assert_eq!(parsed.command_fragment, "curl https://evil.example");
+        assert_eq!(
+            parsed.reason,
+            "Command not allowed by security policy: curl https://evil.example"
+        );
+    }
+
+    #[test]
+    fn is_command_policy_block_message_accepts_error_prefixed_payload() {
+        let message =
+            "Error: blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example";
+        assert!(is_command_policy_block_message(message));
+        let summary = summarize_command_policy_block(message, 64)
+            .expect("error-prefixed block message should still summarize");
+        assert_eq!(
+            summary,
+            "policy=autonomy.allowed_commands; command=curl https://evil.example; config_key=autonomy.allowed_commands"
+        );
+    }
+
+    #[test]
+    fn policy_block_config_key_maps_shell_structure_policy_to_opt_in_flag() {
+        let key = policy_block_config_key("autonomy.shell_structure.redirection")
+            .expect("shell structure policy should map to config key");
+        assert_eq!(key, "autonomy.allow_unsafe_shell_structures");
+    }
+
+    #[test]
+    fn format_policy_block_event_uses_placeholder_command_when_missing() {
+        let message =
+            format_policy_block_event("autonomy.read_only", "autonomy is read-only", None);
+        assert!(message.contains("policy=autonomy.read_only"));
+        assert!(message.contains("command=<none>"));
+        assert!(message.contains("reason=autonomy is read-only"));
+    }
+
+    #[test]
+    fn validate_command_execution_reports_shell_structure_policy_id() {
+        let p = default_policy();
+        let violation = p
+            .validate_command_execution_with_reason("cat </etc/passwd", false)
+            .expect_err("redirection should be blocked with explicit structure policy");
+        assert_eq!(
+            violation.policy_id(),
+            "autonomy.shell_structure.redirection"
+        );
+        assert!(violation
+            .to_string()
+            .contains("allow_unsafe_shell_structures"));
+    }
+
+    #[test]
+    fn command_context_rules_block_when_allow_constraints_do_not_match() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            block_high_risk_commands: false,
+            allowed_commands: vec!["curl".into()],
+            command_context_rules: vec![crate::config::CommandContextRuleConfig {
+                command: "curl".into(),
+                action: crate::config::CommandContextRuleAction::Allow,
+                allowed_domains: vec!["api.example.com".into()],
+                allowed_path_prefixes: vec![],
+                denied_path_prefixes: vec![],
+                allow_high_risk: false,
+            }],
+            ..SecurityPolicy::default()
+        };
+
+        let violation = p
+            .validate_command_execution_with_reason("curl https://evil.example/data", true)
+            .expect_err("domain mismatch should be blocked by command_context_rules");
+        assert_eq!(violation.policy_id(), "autonomy.command_context_rules");
+        assert!(violation
+            .to_string()
+            .contains("no allow rule matched constraints"));
+        assert!(violation.to_string().contains("allow_rule_count=1"));
+        assert!(violation.to_string().contains("rule_action=allow"));
+        assert!(violation.to_string().contains("rule_command=curl"));
+    }
+
+    #[test]
+    fn command_context_rules_allow_high_risk_override_applies_when_rule_matches() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            block_high_risk_commands: true,
+            allowed_commands: vec!["curl".into()],
+            command_context_rules: vec![crate::config::CommandContextRuleConfig {
+                command: "curl".into(),
+                action: crate::config::CommandContextRuleAction::Allow,
+                allowed_domains: vec!["api.example.com".into()],
+                allowed_path_prefixes: vec![],
+                denied_path_prefixes: vec![],
+                allow_high_risk: true,
+            }],
+            ..SecurityPolicy::default()
+        };
+
+        let allowed = p.validate_command_execution("curl https://api.example.com/v1", true);
+        assert_eq!(allowed.unwrap(), CommandRiskLevel::High);
+    }
+
+    #[test]
+    fn command_context_rules_allow_can_override_global_allowlist() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            block_high_risk_commands: false,
+            allowed_commands: vec!["git".into()],
+            command_context_rules: vec![crate::config::CommandContextRuleConfig {
+                command: "curl".into(),
+                action: crate::config::CommandContextRuleAction::Allow,
+                allowed_domains: vec!["api.example.com".into()],
+                allowed_path_prefixes: vec![],
+                denied_path_prefixes: vec![],
+                allow_high_risk: false,
+            }],
+            ..SecurityPolicy::default()
+        };
+
+        let allowed = p
+            .validate_command_execution_with_reason("curl https://api.example.com/v1", true)
+            .expect("matching allow rule should override global allowlist");
+        assert_eq!(allowed, CommandRiskLevel::High);
+
+        let blocked = p
+            .validate_command_execution_with_reason("curl https://evil.example/v1", true)
+            .expect_err("non-matching context must remain blocked");
+        assert_eq!(blocked.policy_id(), "autonomy.command_context_rules");
+    }
+
+    #[test]
     fn enforce_tool_operation_read_allowed_in_readonly_mode() {
         let p = readonly_policy();
         assert!(p
@@ -1370,6 +2243,49 @@ mod tests {
         assert!(!p.is_command_allowed("wget http://evil.com"));
         assert!(!p.is_command_allowed("python3 exploit.py"));
         assert!(!p.is_command_allowed("node malicious.js"));
+    }
+
+    #[test]
+    fn is_command_allowed_respects_command_context_rules() {
+        let mut autonomy_config = crate::config::AutonomyConfig::default();
+        autonomy_config.level = AutonomyLevel::Full;
+        autonomy_config.allowed_commands = vec!["curl".into()];
+        autonomy_config.command_context_rules = vec![crate::config::CommandContextRuleConfig {
+            command: "curl".into(),
+            action: crate::config::CommandContextRuleAction::Deny,
+            allowed_domains: vec!["evil.example".into()],
+            allowed_path_prefixes: vec![],
+            denied_path_prefixes: vec![],
+            allow_high_risk: false,
+        }];
+
+        let workspace = std::env::temp_dir().join("zeroclaw_test_command_context_rules_is_allowed");
+        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+
+        assert!(policy.is_command_allowed("curl https://api.example.com/data"));
+        assert!(!policy.is_command_allowed("curl https://evil.example/data"));
+    }
+
+    #[test]
+    fn is_command_allowed_context_allow_rule_can_override_empty_global_allowlist() {
+        let mut autonomy_config = crate::config::AutonomyConfig::default();
+        autonomy_config.level = AutonomyLevel::Full;
+        autonomy_config.allowed_commands = vec![];
+        autonomy_config.command_context_rules = vec![crate::config::CommandContextRuleConfig {
+            command: "curl".into(),
+            action: crate::config::CommandContextRuleAction::Allow,
+            allowed_domains: vec!["api.example.com".into()],
+            allowed_path_prefixes: vec![],
+            denied_path_prefixes: vec![],
+            allow_high_risk: false,
+        }];
+
+        let workspace =
+            std::env::temp_dir().join("zeroclaw_test_is_allowed_context_override_allowlist");
+        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+
+        assert!(policy.is_command_allowed("curl https://api.example.com/data"));
+        assert!(!policy.is_command_allowed("curl https://evil.example/data"));
     }
 
     #[test]
@@ -1622,6 +2538,7 @@ mod tests {
             max_cost_per_day_cents: 1000,
             require_approval_for_medium_risk: false,
             block_high_risk_commands: false,
+            allow_unsafe_shell_structures: true,
             shell_env_passthrough: vec!["DATABASE_URL".into()],
             allow_sensitive_file_reads: true,
             allow_sensitive_file_writes: true,
@@ -1638,6 +2555,7 @@ mod tests {
         assert_eq!(policy.max_cost_per_day_cents, 1000);
         assert!(!policy.require_approval_for_medium_risk);
         assert!(!policy.block_high_risk_commands);
+        assert!(policy.allow_unsafe_shell_structures);
         assert_eq!(policy.shell_env_passthrough, vec!["DATABASE_URL"]);
         assert!(policy.allow_sensitive_file_reads);
         assert!(policy.allow_sensitive_file_writes);
@@ -1874,6 +2792,26 @@ mod tests {
         assert!(!p.is_command_allowed("ls >> /tmp/exfil.txt"));
         assert!(!p.is_command_allowed("cat </etc/passwd"));
         assert!(!p.is_command_allowed("cat</etc/passwd"));
+    }
+
+    #[test]
+    fn wildcard_allowlist_still_blocks_unsafe_shell_structures_by_default() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            ..SecurityPolicy::default()
+        };
+        assert!(!p.is_command_allowed("echo hello > output.txt"));
+        assert!(!p.is_command_allowed("echo $(date)"));
+    }
+
+    #[test]
+    fn allow_unsafe_shell_structures_opt_in_allows_redirection() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            allow_unsafe_shell_structures: true,
+            ..SecurityPolicy::default()
+        };
+        assert!(p.is_command_allowed("echo hello > output.txt"));
     }
 
     #[test]
@@ -2323,6 +3261,70 @@ mod tests {
         let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
         assert_eq!(policy.tracker.count(), 0);
         assert!(!policy.is_rate_limited());
+    }
+
+    #[test]
+    fn from_config_command_context_rules_apply_to_runtime_enforcement() {
+        let mut autonomy_config = crate::config::AutonomyConfig::default();
+        autonomy_config.level = AutonomyLevel::Full;
+        autonomy_config.block_high_risk_commands = false;
+        autonomy_config.allowed_commands = vec!["curl".into()];
+        autonomy_config.command_context_rules = vec![crate::config::CommandContextRuleConfig {
+            command: "curl".into(),
+            action: crate::config::CommandContextRuleAction::Deny,
+            allowed_domains: vec!["evil.example".into()],
+            allowed_path_prefixes: vec![],
+            denied_path_prefixes: vec![],
+            allow_high_risk: false,
+        }];
+
+        let workspace = std::env::temp_dir().join("zeroclaw_test_command_context_rules_runtime");
+        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+
+        let allowed = policy
+            .validate_command_execution_with_reason("curl https://api.example.com/data", true)
+            .expect("non-matching domain should remain allowed");
+        assert_eq!(allowed, CommandRiskLevel::High);
+
+        let violation = policy
+            .validate_command_execution_with_reason("curl https://evil.example/data", true)
+            .expect_err("matching deny rule domain should be blocked");
+        assert_eq!(violation.policy_id(), "autonomy.command_context_rules");
+        assert!(violation.to_string().contains("deny rule matched"));
+        assert!(violation.to_string().contains("rule_action=deny"));
+        assert!(violation.to_string().contains("rule_command=curl"));
+        assert!(violation.to_string().contains("allowed_domains=evil.example"));
+    }
+
+    #[test]
+    fn command_context_rules_runtime_allows_matched_command() {
+        let mut autonomy_config = crate::config::AutonomyConfig::default();
+        autonomy_config.level = AutonomyLevel::Full;
+        autonomy_config.allowed_commands = vec![];
+        autonomy_config.block_high_risk_commands = true;
+        autonomy_config.command_context_rules = vec![crate::config::CommandContextRuleConfig {
+            command: "curl".into(),
+            action: crate::config::CommandContextRuleAction::Allow,
+            allowed_domains: vec!["api.example.com".into()],
+            allowed_path_prefixes: vec![],
+            denied_path_prefixes: vec![],
+            allow_high_risk: true,
+        }];
+
+        let workspace =
+            std::env::temp_dir().join("zeroclaw_test_command_context_rules_runtime_allow_match");
+        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+
+        let allowed = policy
+            .validate_command_execution_with_reason("curl https://api.example.com/data", true)
+            .expect("matching allow rule should permit runtime command execution");
+        assert_eq!(allowed, CommandRiskLevel::High);
+
+        let blocked = policy
+            .validate_command_execution_with_reason("curl https://evil.example/data", true)
+            .expect_err("non-matching domain should remain blocked");
+        assert_eq!(blocked.policy_id(), "autonomy.command_context_rules");
+        assert!(blocked.to_string().contains("no allow rule matched constraints"));
     }
 
     // ── summary_for_heartbeat ──────────────────────────────

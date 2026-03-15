@@ -3435,6 +3435,15 @@ pub struct AutonomyConfig {
     #[serde(default = "default_true")]
     pub block_high_risk_commands: bool,
 
+    /// Allow shell structural features that are blocked by default for safety.
+    ///
+    /// When enabled, the shell policy no longer blocks command substitutions,
+    /// redirections, process substitutions, `tee`, or background chains.
+    /// Default remains `false`, so `allowed_commands = ["*"]` still keeps
+    /// structure-level guardrails unless explicitly opted in.
+    #[serde(default)]
+    pub allow_unsafe_shell_structures: bool,
+
     /// Additional environment variables allowed for shell tool subprocesses.
     ///
     /// These names are explicitly allowlisted and merged with the built-in safe
@@ -3613,6 +3622,7 @@ impl Default for AutonomyConfig {
             max_cost_per_day_cents: 1000,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
+            allow_unsafe_shell_structures: false,
             shell_env_passthrough: vec![],
             allow_sensitive_file_reads: false,
             allow_sensitive_file_writes: false,
@@ -5551,6 +5561,9 @@ pub struct LarkConfig {
     /// Maximum number of edits per draft message before stopping updates.
     #[serde(default = "default_lark_max_draft_edits")]
     pub max_draft_edits: u32,
+    /// Draft progress verbosity for streaming updates.
+    #[serde(default)]
+    pub progress_mode: ProgressMode,
 }
 
 impl ChannelConfig for LarkConfig {
@@ -5610,6 +5623,9 @@ pub struct FeishuConfig {
     /// Maximum number of draft edits per message before finalizing.
     #[serde(default = "default_lark_max_draft_edits")]
     pub max_draft_edits: u32,
+    /// Draft progress verbosity for streaming updates.
+    #[serde(default)]
+    pub progress_mode: ProgressMode,
 }
 
 impl ChannelConfig for FeishuConfig {
@@ -9751,6 +9767,7 @@ mod tests {
         assert_eq!(a.max_cost_per_day_cents, 1000);
         assert!(a.require_approval_for_medium_risk);
         assert!(a.block_high_risk_commands);
+        assert!(!a.allow_unsafe_shell_structures);
         assert!(a.shell_env_passthrough.is_empty());
         assert!(a.command_context_rules.is_empty());
         assert!(!a.allow_sensitive_file_reads);
@@ -9788,6 +9805,10 @@ allowed_roots = []
         assert!(
             parsed.command_context_rules.is_empty(),
             "Missing command_context_rules must default to empty"
+        );
+        assert!(
+            !parsed.allow_unsafe_shell_structures,
+            "Missing allow_unsafe_shell_structures must default to false"
         );
         assert!(parsed.non_cli_excluded_tools.contains(&"shell".to_string()));
         assert!(parsed
@@ -10033,6 +10054,7 @@ ws_url = "ws://127.0.0.1:3002"
                 max_cost_per_day_cents: 1000,
                 require_approval_for_medium_risk: false,
                 block_high_risk_commands: true,
+                allow_unsafe_shell_structures: false,
                 shell_env_passthrough: vec!["DATABASE_URL".into()],
                 allow_sensitive_file_reads: false,
                 allow_sensitive_file_writes: false,
@@ -13633,6 +13655,7 @@ default_model = "legacy-model"
             port: None,
             draft_update_interval_ms: default_lark_draft_update_interval_ms(),
             max_draft_edits: default_lark_max_draft_edits(),
+            progress_mode: ProgressMode::default(),
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -13659,6 +13682,7 @@ default_model = "legacy-model"
             port: Some(9898),
             draft_update_interval_ms: default_lark_draft_update_interval_ms(),
             max_draft_edits: default_lark_max_draft_edits(),
+            progress_mode: ProgressMode::default(),
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -13676,6 +13700,7 @@ default_model = "legacy-model"
         assert!(parsed.allowed_users.is_empty());
         assert!(!parsed.mention_only);
         assert!(!parsed.use_feishu);
+        assert_eq!(parsed.progress_mode, ProgressMode::Compact);
         assert_eq!(
             parsed.effective_group_reply_mode(),
             GroupReplyMode::AllMessages
@@ -13734,6 +13759,7 @@ default_model = "legacy-model"
             port: None,
             draft_update_interval_ms: default_lark_draft_update_interval_ms(),
             max_draft_edits: default_lark_max_draft_edits(),
+            progress_mode: ProgressMode::default(),
         };
         let json = serde_json::to_string(&fc).unwrap();
         let parsed: FeishuConfig = serde_json::from_str(&json).unwrap();
@@ -13757,6 +13783,7 @@ default_model = "legacy-model"
             port: Some(9898),
             draft_update_interval_ms: default_lark_draft_update_interval_ms(),
             max_draft_edits: default_lark_max_draft_edits(),
+            progress_mode: ProgressMode::default(),
         };
         let toml_str = toml::to_string(&fc).unwrap();
         let parsed: FeishuConfig = toml::from_str(&toml_str).unwrap();
@@ -13775,6 +13802,7 @@ default_model = "legacy-model"
         assert!(parsed.allowed_users.is_empty());
         assert_eq!(parsed.receive_mode, LarkReceiveMode::Websocket);
         assert!(parsed.port.is_none());
+        assert_eq!(parsed.progress_mode, ProgressMode::Compact);
         assert_eq!(
             parsed.effective_group_reply_mode(),
             GroupReplyMode::AllMessages
@@ -13834,6 +13862,7 @@ use_feishu = true
             port: None,
             draft_update_interval_ms: default_lark_draft_update_interval_ms(),
             max_draft_edits: default_lark_max_draft_edits(),
+            progress_mode: ProgressMode::default(),
         });
 
         apply_feishu_legacy_compat(&mut parsed, Some(true), true, true, true);
@@ -13865,6 +13894,7 @@ use_feishu = true
             port: None,
             draft_update_interval_ms: default_lark_draft_update_interval_ms(),
             max_draft_edits: default_lark_max_draft_edits(),
+            progress_mode: ProgressMode::default(),
         });
 
         apply_feishu_legacy_compat(&mut parsed, Some(true), false, true, false);
