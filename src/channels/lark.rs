@@ -1,5 +1,5 @@
 use super::ack_reaction::{select_ack_reaction, AckReactionContext, AckReactionContextChatType};
-use super::progress_event::is_high_priority_progress_update;
+use super::progress_event::should_force_draft_continuation;
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use base64::Engine;
@@ -534,12 +534,16 @@ impl LarkChannel {
         format!("{recipient}:{message_id}")
     }
 
-    fn draft_update_action(&self, state: &DraftEditState, text: &str) -> DraftUpdateAction {
-        if is_high_priority_progress_update(text) {
+    fn draft_update_action(&self, state: Option<&DraftEditState>, text: &str) -> DraftUpdateAction {
+        if should_force_draft_continuation(text) {
             return DraftUpdateAction::CreateContinuation(
                 DraftContinuationReason::HighPriorityProgress,
             );
         }
+
+        let Some(state) = state else {
+            return DraftUpdateAction::EditInPlace;
+        };
 
         if state.last_rendered_text == text {
             return DraftUpdateAction::SkipThrottled;
@@ -1624,25 +1628,23 @@ impl Channel for LarkChannel {
             return Ok(None);
         }
 
-        let is_high_priority = is_high_priority_progress_update(text);
         let draft_key = Self::draft_state_key(recipient, message_id);
         let mut active_message_id = message_id.to_string();
         let mut continuation_reason: Option<DraftContinuationReason> = None;
         {
             let draft_state = self.draft_state.lock().await;
-            if let Some(state) = draft_state.get(&draft_key) {
+            let state = draft_state.get(&draft_key);
+            if let Some(state) = state {
                 active_message_id = state.current_message_id.clone();
-                match self.draft_update_action(state, text) {
-                    DraftUpdateAction::SkipThrottled => {
-                        return Ok(None);
-                    }
-                    DraftUpdateAction::CreateContinuation(reason) => {
-                        continuation_reason = Some(reason);
-                    }
-                    DraftUpdateAction::EditInPlace => {}
+            }
+            match self.draft_update_action(state, text) {
+                DraftUpdateAction::SkipThrottled => {
+                    return Ok(None);
                 }
-            } else if is_high_priority {
-                continuation_reason = Some(DraftContinuationReason::HighPriorityProgress);
+                DraftUpdateAction::CreateContinuation(reason) => {
+                    continuation_reason = Some(reason);
+                }
+                DraftUpdateAction::EditInPlace => {}
             }
         }
 
@@ -2268,8 +2270,9 @@ fn should_respond_in_group(
 mod tests {
     use super::*;
     use crate::channels::progress_event::{
-        render_cron_policy_blocked_result, render_cron_result_announcement,
-        render_cron_start_announcements, render_execution_blocked,
+        build_cron_lifecycle_announcement_builder, render_execution_blocked,
+        render_tool_policy_block_progress_summary, CronLifecycleAnnouncementBuilder,
+        CronLifecycleDescriptor,
     };
     use axum::{extract::Path, extract::State, routing::patch, routing::post, Json, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2295,49 +2298,43 @@ mod tests {
         )
     }
 
-    fn cron_triggered_running(command: &str) -> [String; 2] {
-        render_cron_start_announcements(
+    fn cron_builder(command: &str) -> CronLifecycleAnnouncementBuilder<'_> {
+        build_cron_lifecycle_announcement_builder(
             "job1",
             "nightly",
-            "shell",
             "every(1000ms)",
-            "command",
-            command.to_string(),
-            "shell command is now executing",
+            CronLifecycleDescriptor::Shell { command },
         )
+    }
+
+    fn cron_triggered_running(command: &str) -> [String; 2] {
+        cron_builder(command).render_start_announcements(180)
     }
 
     fn cron_blocked(command: &str, reason: &str) -> String {
-        let structured_reason = format!(
-            "blocked by security policy: policy=autonomy.allowed_commands; command={command}; reason={reason}"
-        );
-        render_cron_policy_blocked_result(
-            "job1",
-            "nightly",
-            "shell",
-            Some("every(1000ms)"),
-            &structured_reason,
-            command,
-            96,
-            120,
-        )
-        .expect("cron blocked lifecycle message should render")
+        cron_builder(command)
+            .render_blocked_announcement(
+                "autonomy.allowed_commands",
+                reason,
+                Some(command),
+                96,
+                120,
+            )
+            .expect("cron blocked lifecycle message should render")
     }
 
     fn cron_completed(output_preview: &str) -> String {
-        render_cron_result_announcement(
-            "job1",
-            "nightly",
-            "shell",
-            "every(1000ms)",
-            true,
-            "",
-            output_preview.to_string(),
-            "echo ok",
-            96,
-            120,
-        )
-        .expect("cron completed lifecycle message should render")
+        cron_builder("echo ok")
+            .render_result_announcement(true, output_preview, 96, 96, 120)
+            .expect("cron completed lifecycle message should render")
+    }
+
+    fn shell_policy_block_progress_line(command: &str) -> String {
+        let reason = format!(
+            "blocked by security policy: policy=autonomy.allowed_commands; command={command}; reason=Command not allowed by security policy: {command}"
+        );
+        render_tool_policy_block_progress_summary("shell", &reason)
+            .expect("policy block progress summary should render")
     }
 
     #[test]
@@ -2965,11 +2962,7 @@ mod tests {
                     .map(str::to_string)
             })
             .unwrap_or_default();
-        state
-            .created_messages
-            .lock()
-            .await
-            .push((receive_id, text));
+        state.created_messages.lock().await.push((receive_id, text));
         let call = state.create_calls.fetch_add(1, Ordering::SeqCst);
         let message_id = if call == 0 {
             "msg-root"
@@ -3367,7 +3360,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lark_update_draft_high_priority_progress_without_cached_state_still_uses_continuation() {
+    async fn lark_update_draft_high_priority_progress_without_cached_state_still_uses_continuation()
+    {
         let state = Arc::new(MockDraftApiState::default());
         let app = Router::new()
             .route(
@@ -3645,7 +3639,7 @@ mod tests {
         assert_eq!(created_messages.len(), 3);
         for (target, text) in created_messages {
             assert_eq!(target, recipient);
-            assert!(is_high_priority_progress_update(&text));
+            assert!(should_force_draft_continuation(&text));
         }
 
         server.abort();
@@ -3976,8 +3970,8 @@ mod tests {
 
     #[test]
     fn lark_text_edit_payload_preserves_policy_block_progress_summary() {
-        let progress_line = "❌ shell (0.2s): security blocked (policy=autonomy.allowed_commands; command=cat /etc/passwd)";
-        let payload = LarkChannel::build_text_edit_payload(progress_line);
+        let progress_line = shell_policy_block_progress_line("cat /etc/passwd");
+        let payload = LarkChannel::build_text_edit_payload(&progress_line);
         let content = payload
             .get("content")
             .and_then(|value| value.as_str())

@@ -4,7 +4,8 @@ use crate::channels::LarkChannel;
 use crate::channels::MatrixChannel;
 use crate::channels::{
     progress_event::{
-        extract_embedded_security_block_message, CronLifecycleAnnouncementRenderContext,
+        build_cron_lifecycle_announcement_builder, extract_embedded_security_block_message,
+        CronLifecycleAnnouncementBuilder, CronLifecycleDescriptor,
     },
     Channel, DingTalkChannel, DiscordChannel, EmailChannel, MattermostChannel, NapcatChannel,
     QQChannel, SendMessage, SlackChannel, TelegramChannel, WhatsAppChannel,
@@ -14,9 +15,7 @@ use crate::cron::{
     due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
     update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
 };
-use crate::security::policy::{
-    action_command_preflight_with_approval_violation,
-};
+use crate::security::policy::action_command_preflight_with_approval_violation;
 use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -355,62 +354,10 @@ fn resolve_announce_target(job: &CronJob) -> Result<Option<(&str, &str)>> {
     Ok(Some((channel, target)))
 }
 
-struct CronLifecycleDetails<'a> {
-    kind: &'static str,
-    detail_label: &'static str,
-    detail_text: &'a str,
-    running_status: &'static str,
-    blocked_subject: &'a str,
-}
-
-fn cron_lifecycle_details(job: &CronJob) -> CronLifecycleDetails<'_> {
-    match job.job_type {
-        JobType::Agent => {
-            let prompt = job.prompt.as_deref().unwrap_or("");
-            let blocked_subject = if prompt.trim().is_empty() {
-                "<agent-task>"
-            } else {
-                prompt
-            };
-            CronLifecycleDetails {
-                kind: "agent",
-                detail_label: "agent_task",
-                detail_text: prompt,
-                running_status: "agent is now executing",
-                blocked_subject,
-            }
-        }
-        JobType::Shell => CronLifecycleDetails {
-            kind: "shell",
-            detail_label: "command",
-            detail_text: &job.command,
-            running_status: "shell command is now executing",
-            blocked_subject: &job.command,
-        },
-    }
-}
-
-fn cron_announcement_context<'a>(
-    job: &'a CronJob,
-    schedule: &'a str,
-    details: &'a CronLifecycleDetails<'a>,
-) -> CronLifecycleAnnouncementRenderContext<'a> {
-    CronLifecycleAnnouncementRenderContext {
-        id: &job.id,
-        name: job.name.as_deref().unwrap_or("cron-job"),
-        kind: details.kind,
-        schedule,
-        detail_label: details.detail_label,
-        running_status: details.running_status,
-        blocked_subject: details.blocked_subject,
-    }
-}
-
 fn build_start_announcements(job: &CronJob) -> [String; 2] {
-    let details = cron_lifecycle_details(job);
-    let schedule = describe_schedule(&job.schedule);
-    let detail = compact_preview(details.detail_text, START_ANNOUNCEMENT_PREVIEW_CHARS);
-    cron_announcement_context(job, &schedule, &details).render_start_announcements(detail)
+    with_cron_lifecycle_builder(job, |builder| {
+        builder.render_start_announcements(START_ANNOUNCEMENT_PREVIEW_CHARS)
+    })
 }
 
 fn build_job_result_announcement(job: &CronJob, success: bool, output: &str) -> String {
@@ -418,17 +365,45 @@ fn build_job_result_announcement(job: &CronJob, success: bool, output: &str) -> 
         return output.to_string();
     }
 
-    let details = cron_lifecycle_details(job);
+    with_cron_lifecycle_builder(job, |builder| {
+        builder
+            .render_result_announcement(
+                success,
+                output,
+                RESULT_ANNOUNCEMENT_PREVIEW_CHARS,
+                RESULT_ANNOUNCEMENT_PREVIEW_CHARS,
+                RESULT_ANNOUNCEMENT_PREVIEW_CHARS,
+            )
+            .unwrap_or_else(|| output.to_string())
+    })
+}
+
+fn with_cron_lifecycle_builder<T>(
+    job: &CronJob,
+    render: impl FnOnce(CronLifecycleAnnouncementBuilder<'_>) -> T,
+) -> T {
     let schedule = describe_schedule(&job.schedule);
-    cron_announcement_context(job, &schedule, &details)
-        .render_result_announcement(
-            success,
-            output,
-            compact_preview(output, RESULT_ANNOUNCEMENT_PREVIEW_CHARS),
-            RESULT_ANNOUNCEMENT_PREVIEW_CHARS,
-            RESULT_ANNOUNCEMENT_PREVIEW_CHARS,
-        )
-        .unwrap_or_else(|| output.to_string())
+    render(build_cron_lifecycle_builder(job, schedule.as_str()))
+}
+
+fn build_cron_lifecycle_builder<'a>(
+    job: &'a CronJob,
+    schedule: &'a str,
+) -> CronLifecycleAnnouncementBuilder<'a> {
+    let descriptor = match job.job_type {
+        JobType::Agent => CronLifecycleDescriptor::Agent {
+            prompt: job.prompt.as_deref(),
+        },
+        JobType::Shell => CronLifecycleDescriptor::Shell {
+            command: &job.command,
+        },
+    };
+    build_cron_lifecycle_announcement_builder(
+        &job.id,
+        job.name.as_deref().unwrap_or("cron-job"),
+        schedule,
+        descriptor,
+    )
 }
 
 fn describe_schedule(schedule: &Schedule) -> String {
@@ -442,20 +417,6 @@ fn describe_schedule(schedule: &Schedule) -> String {
         }
         Schedule::At { at } => format!("at({})", at.to_rfc3339()),
         Schedule::Every { every_ms } => format!("every({every_ms}ms)"),
-    }
-}
-
-fn compact_preview(raw: &str, max_chars: usize) -> String {
-    let compact = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.is_empty() {
-        return "<empty>".to_string();
-    }
-    let mut chars = compact.chars();
-    let preview: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{preview}...")
-    } else {
-        preview
     }
 }
 
@@ -821,11 +782,7 @@ mod tests {
                     .map(str::to_string)
             })
             .unwrap_or_default();
-        state
-            .created_messages
-            .lock()
-            .await
-            .push((receive_id, text));
+        state.created_messages.lock().await.push((receive_id, text));
         let call = state.create_calls.fetch_add(1, Ordering::SeqCst);
         axum::Json(serde_json::json!({
             "code": 0,

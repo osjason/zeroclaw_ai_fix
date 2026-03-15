@@ -313,6 +313,13 @@ pub(crate) fn parse_command_policy_block_event(
 
 pub(crate) fn policy_block_config_key(policy_id: &str) -> Option<&str> {
     let mapped = match policy_id {
+        COMMAND_CONTEXT_RULES_POLICY_ID => COMMAND_CONTEXT_RULES_POLICY_ID,
+        "runtime.channel.excluded_tools" => "autonomy.non_cli_excluded_tools",
+        "runtime.approval.user_decision"
+        | "runtime.approval.pending_request_not_found"
+        | "runtime.approval.pending_request_cancelled"
+        | "runtime.approval.pending_request_timeout"
+        | "runtime.approval.non_cli_context_required" => "autonomy.auto_approve",
         "autonomy.shell_structure.subshell"
         | "autonomy.shell_structure.redirection"
         | "autonomy.shell_structure.tee"
@@ -942,7 +949,8 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
 
 struct CommandContextSegmentEval<'a> {
     has_matching_rules: bool,
-    allow_rules: Vec<&'a crate::config::CommandContextRuleConfig>,
+    allow_rule_count: usize,
+    first_allow_rule: Option<&'a crate::config::CommandContextRuleConfig>,
     matched_allow: Option<&'a crate::config::CommandContextRuleConfig>,
     matched_deny: Option<&'a crate::config::CommandContextRuleConfig>,
 }
@@ -954,33 +962,40 @@ impl SecurityPolicy {
         base_cmd: &str,
         args: &[String],
     ) -> CommandContextSegmentEval<'a> {
-        let matching: Vec<&crate::config::CommandContextRuleConfig> = self
-            .command_context_rules
-            .iter()
-            .filter(|rule| Self::command_rule_matches_command(rule, executable, base_cmd))
-            .collect();
+        let mut has_matching_rules = false;
+        let mut allow_rule_count = 0usize;
+        let mut first_allow_rule = None;
+        let mut matched_allow = None;
+        let mut matched_deny = None;
 
-        let matched_deny = matching
-            .iter()
-            .copied()
-            .find(|rule| {
-                rule.action == crate::config::CommandContextRuleAction::Deny
-                    && self.command_rule_matches_context(rule, args)
-            });
-
-        let allow_rules: Vec<&crate::config::CommandContextRuleConfig> = matching
-            .iter()
-            .copied()
-            .filter(|rule| rule.action == crate::config::CommandContextRuleAction::Allow)
-            .collect();
-        let matched_allow = allow_rules
-            .iter()
-            .copied()
-            .find(|rule| self.command_rule_matches_context(rule, args));
+        for rule in &self.command_context_rules {
+            if !Self::command_rule_matches_command(rule, executable, base_cmd) {
+                continue;
+            }
+            has_matching_rules = true;
+            match rule.action {
+                crate::config::CommandContextRuleAction::Deny => {
+                    if self.command_rule_matches_context(rule, args) {
+                        matched_deny = Some(rule);
+                        break;
+                    }
+                }
+                crate::config::CommandContextRuleAction::Allow => {
+                    allow_rule_count += 1;
+                    if first_allow_rule.is_none() {
+                        first_allow_rule = Some(rule);
+                    }
+                    if matched_allow.is_none() && self.command_rule_matches_context(rule, args) {
+                        matched_allow = Some(rule);
+                    }
+                }
+            }
+        }
 
         CommandContextSegmentEval {
-            has_matching_rules: !matching.is_empty(),
-            allow_rules,
+            has_matching_rules,
+            allow_rule_count,
+            first_allow_rule,
             matched_allow,
             matched_deny,
         }
@@ -992,6 +1007,17 @@ impl SecurityPolicy {
             .skip(1)
             .map(|token| strip_wrapping_quotes(token).trim().to_string())
             .filter(|token| !token.is_empty())
+            .collect()
+    }
+
+    fn collect_command_segments(command: &str) -> Vec<(String, String, Vec<String>)> {
+        split_unquoted_segments(command)
+            .into_iter()
+            .filter_map(|segment| {
+                let (executable, base_cmd) = Self::segment_command_parts(&segment)?;
+                let args = Self::normalize_segment_args(&segment);
+                Some((executable, base_cmd, args))
+            })
             .collect()
     }
 
@@ -1183,7 +1209,10 @@ impl SecurityPolicy {
         ));
         parts.push(format!("rule_command={}", rule.command.trim()));
         if !rule.allowed_domains.is_empty() {
-            parts.push(format!("allowed_domains={}", rule.allowed_domains.join(",")));
+            parts.push(format!(
+                "allowed_domains={}",
+                rule.allowed_domains.join(",")
+            ));
         }
         if !rule.allowed_path_prefixes.is_empty() {
             parts.push(format!(
@@ -1203,6 +1232,133 @@ impl SecurityPolicy {
         parts.join("; ")
     }
 
+    fn command_context_rule_index(
+        &self,
+        target: &crate::config::CommandContextRuleConfig,
+    ) -> Option<usize> {
+        self.command_context_rules
+            .iter()
+            .position(|rule| std::ptr::eq(rule, target))
+    }
+
+    fn command_context_rule_detail(
+        &self,
+        rule: &crate::config::CommandContextRuleConfig,
+    ) -> String {
+        let summary = Self::command_context_rule_constraint_summary(rule);
+        match self.command_context_rule_index(rule) {
+            Some(index) => format!("rule_index={index}; {summary}"),
+            None => summary,
+        }
+    }
+
+    fn command_context_observed_summary(&self, args: &[String]) -> String {
+        let mut hosts: Vec<String> = args
+            .iter()
+            .filter_map(|arg| {
+                let parsed = reqwest::Url::parse(arg).ok()?;
+                parsed.host_str().map(|h| h.to_ascii_lowercase())
+            })
+            .collect();
+        hosts.sort();
+        hosts.dedup();
+
+        let mut paths: Vec<String> = args
+            .iter()
+            .filter_map(|arg| self.resolve_arg_path(arg))
+            .map(|raw| {
+                let expanded = expand_user_path(raw.as_ref());
+                if expanded.is_absolute() {
+                    expanded
+                } else {
+                    self.workspace_dir.join(expanded)
+                }
+            })
+            .map(|path| path.display().to_string())
+            .collect();
+        paths.sort();
+        paths.dedup();
+
+        let hosts = if hosts.is_empty() {
+            "none".to_string()
+        } else {
+            hosts.join(",")
+        };
+        let paths = if paths.is_empty() {
+            "none".to_string()
+        } else {
+            paths.join(",")
+        };
+
+        format!("observed_hosts={hosts}; observed_paths={paths}")
+    }
+
+    fn command_context_rules_block_violation(
+        &self,
+        reason: impl Into<String>,
+        command: &str,
+    ) -> CommandPolicyViolation {
+        CommandPolicyViolation::new(COMMAND_CONTEXT_RULES_POLICY_ID, reason, command)
+    }
+
+    fn command_context_reason_context_suffix(&self, rule_detail: &str, args: &[String]) -> String {
+        format!(
+            "command_context={rule_detail}; observed_context={}",
+            self.command_context_observed_summary(args)
+        )
+    }
+
+    fn command_context_rules_block_reason(
+        &self,
+        headline: &str,
+        base_cmd: &str,
+        rule_detail: &str,
+        extra_fields: Option<&str>,
+        args: &[String],
+    ) -> String {
+        let context_suffix = self.command_context_reason_context_suffix(rule_detail, args);
+        match extra_fields {
+            Some(extra) => format!(
+                "Command blocked by command_context_rules: {headline}; segment_command={base_cmd}; {extra}; {context_suffix}",
+            ),
+            None => format!(
+                "Command blocked by command_context_rules: {headline}; segment_command={base_cmd}; {context_suffix}",
+            ),
+        }
+    }
+
+    fn command_context_rules_deny_reason(
+        &self,
+        rule: &crate::config::CommandContextRuleConfig,
+        base_cmd: &str,
+        args: &[String],
+    ) -> String {
+        let rule_detail = self.command_context_rule_detail(rule);
+        let headline = format!("deny rule matched for '{}'", rule.command.trim());
+        self.command_context_rules_block_reason(&headline, base_cmd, &rule_detail, None, args)
+    }
+
+    fn command_context_rules_allow_miss_reason(
+        &self,
+        base_cmd: &str,
+        allow_rule_count: usize,
+        first_allow_rule: &crate::config::CommandContextRuleConfig,
+        args: &[String],
+    ) -> String {
+        let first_rule_detail = self.command_context_rule_detail(first_allow_rule);
+        let headline = format!("no allow rule matched constraints for '{}'", base_cmd);
+        let extra_fields = format!(
+            "allow_rule_count={allow_rule_count}; first_allow_rule={first_rule_detail}"
+        );
+        self.command_context_rules_block_reason(
+            &headline,
+            base_cmd,
+            &first_rule_detail,
+            Some(&extra_fields),
+            args,
+        )
+    }
+
     fn command_context_rules_violation(
         &self,
         command: &str,
@@ -1213,37 +1369,28 @@ impl SecurityPolicy {
 
         let mut allow_high_risk = false;
 
-        for segment in split_unquoted_segments(command) {
-            let Some((executable, base_cmd)) = Self::segment_command_parts(&segment) else {
-                continue;
-            };
-            let args = Self::normalize_segment_args(&segment);
+        for (executable, base_cmd, args) in Self::collect_command_segments(command) {
             let eval = self.evaluate_command_context_segment(&executable, &base_cmd, &args);
             if !eval.has_matching_rules {
                 continue;
             }
 
             if let Some(rule) = eval.matched_deny {
-                return Err(CommandPolicyViolation::new(
-                    COMMAND_CONTEXT_RULES_POLICY_ID,
-                    format!(
-                        "Command blocked by command_context_rules: deny rule matched for '{}'; {}",
-                        rule.command.trim(),
-                        Self::command_context_rule_constraint_summary(rule),
-                    ),
+                return Err(self.command_context_rules_block_violation(
+                    self.command_context_rules_deny_reason(rule, &base_cmd, &args),
                     command,
                 ));
             }
 
-            if !eval.allow_rules.is_empty() {
+            if eval.allow_rule_count > 0 {
                 let Some(rule) = eval.matched_allow else {
-                    return Err(CommandPolicyViolation::new(
-                        COMMAND_CONTEXT_RULES_POLICY_ID,
-                        format!(
-                            "Command blocked by command_context_rules: no allow rule matched constraints for '{}'; allow_rule_count={}; first_allow_rule={}",
-                            base_cmd,
-                            eval.allow_rules.len(),
-                            Self::command_context_rule_constraint_summary(eval.allow_rules[0]),
+                    return Err(self.command_context_rules_block_violation(
+                        self.command_context_rules_allow_miss_reason(
+                            &base_cmd,
+                            eval.allow_rule_count,
+                            eval.first_allow_rule
+                                .expect("first_allow_rule must exist when allow_rule_count > 0"),
+                            &args,
                         ),
                         command,
                     ));
@@ -1487,17 +1634,12 @@ impl SecurityPolicy {
             return false;
         }
 
-        let segments = split_unquoted_segments(command);
-        let mut has_cmd = false;
+        let segments = Self::collect_command_segments(command);
+        let has_cmd = !segments.is_empty();
 
-        for segment in &segments {
-            let Some((executable, base_cmd)) = Self::segment_command_parts(segment) else {
-                continue;
-            };
-            has_cmd = true;
-
-            let args = Self::normalize_segment_args(segment);
-            let lowered_args: Vec<String> = args.iter().map(|arg| arg.to_ascii_lowercase()).collect();
+        for (executable, base_cmd, args) in segments {
+            let lowered_args: Vec<String> =
+                args.iter().map(|arg| arg.to_ascii_lowercase()).collect();
             if !self.is_args_safe(&base_cmd, &lowered_args) {
                 return false;
             }
@@ -1506,11 +1648,16 @@ impl SecurityPolicy {
                 .allowed_commands
                 .iter()
                 .any(|allowed| is_allowlist_entry_match(allowed, &executable, &base_cmd));
+            let eval = self.evaluate_command_context_segment(&executable, &base_cmd, &args);
+            if eval.matched_deny.is_some() {
+                return false;
+            }
+            if eval.allow_rule_count > 0 && eval.matched_allow.is_none() {
+                return false;
+            }
             if allowlisted {
                 continue;
             }
-
-            let eval = self.evaluate_command_context_segment(&executable, &base_cmd, &args);
             if eval.matched_allow.is_none() {
                 return false;
             }
@@ -1542,9 +1689,6 @@ impl SecurityPolicy {
             return false;
         }
 
-        if self.command_context_rules_violation(command).is_err() {
-            return false;
-        }
         self.is_command_allowed_with_context_override(command)
     }
 
@@ -2088,6 +2232,20 @@ mod tests {
         let key = policy_block_config_key("autonomy.shell_structure.redirection")
             .expect("shell structure policy should map to config key");
         assert_eq!(key, "autonomy.allow_unsafe_shell_structures");
+    }
+
+    #[test]
+    fn policy_block_config_key_maps_command_context_rules_policy() {
+        let key = policy_block_config_key(COMMAND_CONTEXT_RULES_POLICY_ID)
+            .expect("command_context_rules policy should map to config key");
+        assert_eq!(key, COMMAND_CONTEXT_RULES_POLICY_ID);
+    }
+
+    #[test]
+    fn policy_block_config_key_maps_runtime_approval_policy() {
+        let key = policy_block_config_key("runtime.approval.non_cli_context_required")
+            .expect("runtime approval policy should map to config key");
+        assert_eq!(key, "autonomy.auto_approve");
     }
 
     #[test]
@@ -3293,7 +3451,9 @@ mod tests {
         assert!(violation.to_string().contains("deny rule matched"));
         assert!(violation.to_string().contains("rule_action=deny"));
         assert!(violation.to_string().contains("rule_command=curl"));
-        assert!(violation.to_string().contains("allowed_domains=evil.example"));
+        assert!(violation
+            .to_string()
+            .contains("allowed_domains=evil.example"));
     }
 
     #[test]
@@ -3324,7 +3484,75 @@ mod tests {
             .validate_command_execution_with_reason("curl https://evil.example/data", true)
             .expect_err("non-matching domain should remain blocked");
         assert_eq!(blocked.policy_id(), "autonomy.command_context_rules");
+        assert!(blocked
+            .to_string()
+            .contains("no allow rule matched constraints"));
+        assert!(blocked.to_string().contains("command_context="));
+        assert!(blocked.to_string().contains("observed_hosts=evil.example"));
+    }
+
+    #[test]
+    fn command_context_rules_runtime_blocks_before_global_allowlist() {
+        let mut autonomy_config = crate::config::AutonomyConfig::default();
+        autonomy_config.level = AutonomyLevel::Full;
+        autonomy_config.allowed_commands = vec!["curl".into()];
+        autonomy_config.block_high_risk_commands = false;
+        autonomy_config.command_context_rules = vec![crate::config::CommandContextRuleConfig {
+            command: "curl".into(),
+            action: crate::config::CommandContextRuleAction::Allow,
+            allowed_domains: vec!["api.example.com".into()],
+            allowed_path_prefixes: vec![],
+            denied_path_prefixes: vec![],
+            allow_high_risk: false,
+        }];
+
+        let workspace =
+            std::env::temp_dir().join("zeroclaw_test_command_context_rules_allowlist_priority");
+        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+
+        let blocked = policy
+            .validate_command_execution_with_reason("curl https://evil.example/data", true)
+            .expect_err("context rule constraints must block even when command is globally allowlisted");
+
+        assert_eq!(blocked.policy_id(), "autonomy.command_context_rules");
         assert!(blocked.to_string().contains("no allow rule matched constraints"));
+        assert!(blocked.to_string().contains("rule_command=curl"));
+        assert!(blocked.to_string().contains("observed_hosts=evil.example"));
+    }
+
+    #[test]
+    fn command_context_rules_preflight_reports_structured_block_event() {
+        let mut autonomy_config = crate::config::AutonomyConfig::default();
+        autonomy_config.level = AutonomyLevel::Full;
+        autonomy_config.allowed_commands = vec![];
+        autonomy_config.block_high_risk_commands = true;
+        autonomy_config.command_context_rules = vec![crate::config::CommandContextRuleConfig {
+            command: "curl".into(),
+            action: crate::config::CommandContextRuleAction::Allow,
+            allowed_domains: vec!["api.example.com".into()],
+            allowed_path_prefixes: vec![],
+            denied_path_prefixes: vec![],
+            allow_high_risk: true,
+        }];
+
+        let workspace =
+            std::env::temp_dir().join("zeroclaw_test_command_context_rules_preflight_event");
+        let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
+
+        let blocked = action_command_preflight_with_approval_violation(
+            &policy,
+            "shell command execution",
+            Some("curl https://evil.example/data"),
+            true,
+        )
+        .expect("non-matching allow constraints must be blocked during preflight");
+
+        assert_eq!(blocked.policy_id(), "autonomy.command_context_rules");
+        assert_eq!(blocked.command_fragment(), "curl https://evil.example/data");
+        assert!(blocked
+            .to_string()
+            .contains("no allow rule matched constraints"));
+        assert!(blocked.to_string().contains("allow_rule_count=1"));
     }
 
     // ── summary_for_heartbeat ──────────────────────────────
