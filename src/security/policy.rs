@@ -62,6 +62,73 @@ pub(crate) struct PolicyBlockEvent<'a> {
 
 pub(crate) type CommandPolicyBlockEvent<'a> = PolicyBlockEvent<'a>;
 
+impl<'a> PolicyBlockEvent<'a> {
+    fn from_detail(detail: BlockEventDetail<'a>) -> Self {
+        Self {
+            policy_id: detail.policy_id,
+            command_fragment: detail.command_fragment,
+            reason: detail.reason,
+        }
+    }
+
+    pub(crate) fn config_key(&self) -> Option<&'a str> {
+        policy_block_config_key(self.policy_id)
+    }
+
+    fn summary(&self, max_command_chars: usize) -> String {
+        let command = truncate_chars(self.command_fragment, max_command_chars.max(16));
+        match self.config_key() {
+            Some(config_key) => format!(
+                "policy={}; command={command}; config_key={config_key}",
+                self.policy_id
+            ),
+            None => format!("policy={}; command={command}", self.policy_id),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PolicyBlockMetadata {
+    pub policy_id: String,
+    pub command_preview: String,
+    pub config_key: String,
+    pub reason_preview: String,
+    pub command_context: Option<String>,
+    pub rule_index: Option<String>,
+    pub segment_command: Option<String>,
+}
+
+impl PolicyBlockMetadata {
+    pub(crate) fn from_message(
+        message: &str,
+        command_max_chars: usize,
+        reason_max_chars: usize,
+    ) -> Option<Self> {
+        let event = parse_security_policy_block_event(message.trim())?;
+        Some(Self::from_event(event, command_max_chars, reason_max_chars))
+    }
+
+    fn from_event(
+        event: PolicyBlockEvent<'_>,
+        command_max_chars: usize,
+        reason_max_chars: usize,
+    ) -> Self {
+        Self {
+            policy_id: event.policy_id.to_string(),
+            command_preview: truncate_chars(event.command_fragment, command_max_chars.max(16)),
+            config_key: policy_block_config_key(event.policy_id)
+                .unwrap_or(event.policy_id)
+                .to_string(),
+            reason_preview: truncate_chars(event.reason, reason_max_chars.max(16)),
+            command_context: extract_policy_field(event.reason, "command_context")
+                .map(str::to_string),
+            rule_index: extract_policy_field(event.reason, "rule_index").map(str::to_string),
+            segment_command: extract_policy_field(event.reason, "segment_command")
+                .map(|value| truncate_chars(value, command_max_chars.max(16))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ShellStructureBlock {
     policy_id: &'static str,
@@ -296,13 +363,7 @@ pub(crate) fn is_command_policy_block_message(message: &str) -> bool {
 
 pub(crate) fn parse_security_policy_block_event(message: &str) -> Option<PolicyBlockEvent<'_>> {
     let detail = strip_security_block_prefix(message)?;
-    let detail = parse_block_event_detail(detail)?;
-
-    Some(PolicyBlockEvent {
-        policy_id: detail.policy_id,
-        command_fragment: detail.command_fragment,
-        reason: detail.reason,
-    })
+    parse_block_event_detail(detail).map(PolicyBlockEvent::from_detail)
 }
 
 pub(crate) fn parse_command_policy_block_event(
@@ -339,22 +400,32 @@ pub(crate) fn summarize_command_policy_block(
     message: &str,
     max_command_chars: usize,
 ) -> Option<String> {
-    let detail = strip_security_block_prefix(message)?;
-    if let Some(event) = parse_block_event_detail(detail) {
-        let command = truncate_chars(event.command_fragment, max_command_chars.max(16));
-        if let Some(config_key) = policy_block_config_key(event.policy_id) {
-            return Some(format!(
-                "policy={}; command={command}; config_key={config_key}",
-                event.policy_id
-            ));
-        }
-        return Some(format!("policy={}; command={command}", event.policy_id));
+    if let Some(event) = parse_security_policy_block_event(message) {
+        return Some(event.summary(max_command_chars));
     }
 
+    let detail = strip_security_block_prefix(message)?;
     Some(truncate_chars(
         detail,
         max_command_chars.saturating_add(40).max(40),
     ))
+}
+
+fn extract_policy_field<'a>(reason: &'a str, key: &str) -> Option<&'a str> {
+    reason
+        .split(';')
+        .map(str::trim)
+        .filter_map(|segment| segment.split_once('='))
+        .find_map(|(segment_key, segment_value)| {
+            if segment_key.trim() != key {
+                return None;
+            }
+            let value = segment_value.trim();
+            if value.is_empty() {
+                return None;
+            }
+            Some(value)
+        })
 }
 
 fn strip_tool_error_prefix(message: &str) -> &str {
@@ -955,6 +1026,22 @@ struct CommandContextSegmentEval<'a> {
     matched_deny: Option<&'a crate::config::CommandContextRuleConfig>,
 }
 
+impl<'a> CommandContextSegmentEval<'a> {
+    fn has_matched_deny(&self) -> bool {
+        self.matched_deny.is_some()
+    }
+
+    fn has_allow_miss(&self) -> bool {
+        self.allow_rule_count > 0 && self.matched_allow.is_none()
+    }
+
+    fn blocks_command_gate(&self) -> bool {
+        self.has_matched_deny() || self.has_allow_miss()
+    }
+}
+
+type CommandSegment = (String, String, Vec<String>);
+
 impl SecurityPolicy {
     fn evaluate_command_context_segment<'a>(
         &'a self,
@@ -1001,6 +1088,18 @@ impl SecurityPolicy {
         }
     }
 
+    fn evaluate_command_context_segments<'a>(
+        &'a self,
+        segments: &'a [CommandSegment],
+    ) -> Vec<CommandContextSegmentEval<'a>> {
+        segments
+            .iter()
+            .map(|(executable, base_cmd, args)| {
+                self.evaluate_command_context_segment(executable, base_cmd, args)
+            })
+            .collect()
+    }
+
     fn normalize_segment_args(segment: &str) -> Vec<String> {
         skip_env_assignments(segment)
             .split_whitespace()
@@ -1010,7 +1109,7 @@ impl SecurityPolicy {
             .collect()
     }
 
-    fn collect_command_segments(command: &str) -> Vec<(String, String, Vec<String>)> {
+    fn collect_command_segments(command: &str) -> Vec<CommandSegment> {
         split_unquoted_segments(command)
             .into_iter()
             .filter_map(|segment| {
@@ -1347,9 +1446,8 @@ impl SecurityPolicy {
     ) -> String {
         let first_rule_detail = self.command_context_rule_detail(first_allow_rule);
         let headline = format!("no allow rule matched constraints for '{}'", base_cmd);
-        let extra_fields = format!(
-            "allow_rule_count={allow_rule_count}; first_allow_rule={first_rule_detail}"
-        );
+        let extra_fields =
+            format!("allow_rule_count={allow_rule_count}; first_allow_rule={first_rule_detail}");
         self.command_context_rules_block_reason(
             &headline,
             base_cmd,
@@ -1363,38 +1461,57 @@ impl SecurityPolicy {
         &self,
         command: &str,
     ) -> Result<bool, CommandPolicyViolation> {
+        let segments = Self::collect_command_segments(command);
+        self.command_context_rules_violation_for_segments(command, &segments)
+    }
+
+    fn command_context_rules_violation_for_segments(
+        &self,
+        command: &str,
+        segments: &[CommandSegment],
+    ) -> Result<bool, CommandPolicyViolation> {
         if self.command_context_rules.is_empty() {
             return Ok(false);
         }
 
+        let evals = self.evaluate_command_context_segments(segments);
+        self.command_context_rules_violation_with_evals(command, segments, &evals)
+    }
+
+    fn command_context_rules_violation_with_evals(
+        &self,
+        command: &str,
+        segments: &[CommandSegment],
+        evals: &[CommandContextSegmentEval<'_>],
+    ) -> Result<bool, CommandPolicyViolation> {
         let mut allow_high_risk = false;
 
-        for (executable, base_cmd, args) in Self::collect_command_segments(command) {
-            let eval = self.evaluate_command_context_segment(&executable, &base_cmd, &args);
+        for ((_, base_cmd, args), eval) in segments.iter().zip(evals.iter()) {
             if !eval.has_matching_rules {
                 continue;
             }
 
             if let Some(rule) = eval.matched_deny {
                 return Err(self.command_context_rules_block_violation(
-                    self.command_context_rules_deny_reason(rule, &base_cmd, &args),
+                    self.command_context_rules_deny_reason(rule, base_cmd, args),
                     command,
                 ));
             }
 
-            if eval.allow_rule_count > 0 {
-                let Some(rule) = eval.matched_allow else {
-                    return Err(self.command_context_rules_block_violation(
-                        self.command_context_rules_allow_miss_reason(
-                            &base_cmd,
-                            eval.allow_rule_count,
-                            eval.first_allow_rule
-                                .expect("first_allow_rule must exist when allow_rule_count > 0"),
-                            &args,
-                        ),
-                        command,
-                    ));
-                };
+            if eval.has_allow_miss() {
+                return Err(self.command_context_rules_block_violation(
+                    self.command_context_rules_allow_miss_reason(
+                        base_cmd,
+                        eval.allow_rule_count,
+                        eval.first_allow_rule
+                            .expect("first_allow_rule must exist when allow_rule_count > 0"),
+                        args,
+                    ),
+                    command,
+                ));
+            }
+
+            if let Some(rule) = eval.matched_allow {
                 if rule.allow_high_risk {
                     allow_high_risk = true;
                 }
@@ -1402,6 +1519,74 @@ impl SecurityPolicy {
         }
 
         Ok(allow_high_risk)
+    }
+
+    fn segment_is_allowlisted_or_context_allowed(
+        &self,
+        executable: &str,
+        base_cmd: &str,
+        eval: &CommandContextSegmentEval<'_>,
+    ) -> bool {
+        let allowlisted = self
+            .allowed_commands
+            .iter()
+            .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd));
+        if eval.blocks_command_gate() {
+            return false;
+        }
+        allowlisted || eval.matched_allow.is_some()
+    }
+
+    fn first_allowlist_blocked_segment<'a>(
+        &self,
+        segments: &'a [CommandSegment],
+        evals: Option<&[CommandContextSegmentEval<'_>]>,
+    ) -> Option<(&'a str, &'a str)> {
+        match evals {
+            Some(evals) => segments
+                .iter()
+                .zip(evals.iter())
+                .find(|((executable, base_cmd, args), eval)| {
+                    let lowered_args: Vec<String> =
+                        args.iter().map(|arg| arg.to_ascii_lowercase()).collect();
+                    self.is_args_safe(base_cmd, &lowered_args)
+                        && !self
+                            .segment_is_allowlisted_or_context_allowed(executable, base_cmd, eval)
+                })
+                .map(|((executable, base_cmd, _), _)| (executable.as_str(), base_cmd.as_str())),
+            None => segments
+                .iter()
+                .find(|(executable, base_cmd, args)| {
+                    let lowered_args: Vec<String> =
+                        args.iter().map(|arg| arg.to_ascii_lowercase()).collect();
+                    self.is_args_safe(base_cmd, &lowered_args)
+                        && !self
+                            .allowed_commands
+                            .iter()
+                            .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
+                })
+                .map(|(executable, base_cmd, _)| (executable.as_str(), base_cmd.as_str())),
+        }
+    }
+
+    fn allowed_commands_block_reason(
+        &self,
+        command: &str,
+        segments: &[CommandSegment],
+        evals: Option<&[CommandContextSegmentEval<'_>]>,
+    ) -> String {
+        let (executable, segment_command) = self
+            .first_allowlist_blocked_segment(segments, evals)
+            .unwrap_or((NO_COMMAND_FRAGMENT, NO_COMMAND_FRAGMENT));
+        let context_override = if self.command_context_rules.is_empty() {
+            "none"
+        } else {
+            COMMAND_CONTEXT_RULES_POLICY_ID
+        };
+
+        format!(
+            "Command blocked by allowed_commands: no entry in autonomy.allowed_commands matched executable={executable}; segment_command={segment_command}; context_override={context_override}; full_command={command}"
+        )
     }
 
     // ── Risk Classification ──────────────────────────────────────────────
@@ -1542,6 +1727,20 @@ impl SecurityPolicy {
         command: &str,
         approved: bool,
     ) -> Result<CommandRiskLevel, CommandPolicyViolation> {
+        let segments = Self::collect_command_segments(command);
+        self.validate_command_execution_precheck(command)?;
+        let allow_high_risk_by_context =
+            self.validate_command_context_and_allowlist(command, &segments)?;
+        self.validate_command_path_policy(command)?;
+        let risk = self.command_risk_level(command);
+        self.validate_command_risk_policy(command, approved, risk, allow_high_risk_by_context)?;
+        Ok(risk)
+    }
+
+    fn validate_command_execution_precheck(
+        &self,
+        command: &str,
+    ) -> Result<(), CommandPolicyViolation> {
         if self.autonomy == AutonomyLevel::ReadOnly {
             return Err(CommandPolicyViolation::new(
                 "autonomy.read_only",
@@ -1558,16 +1757,44 @@ impl SecurityPolicy {
             }
         }
 
-        let allow_high_risk_by_context = self.command_context_rules_violation(command)?;
+        Ok(())
+    }
 
-        if !self.is_command_allowed_with_context_override(command) {
+    fn validate_command_context_and_allowlist(
+        &self,
+        command: &str,
+        segments: &[CommandSegment],
+    ) -> Result<bool, CommandPolicyViolation> {
+        let evals = if self.command_context_rules.is_empty() {
+            None
+        } else {
+            Some(self.evaluate_command_context_segments(segments))
+        };
+
+        let allow_high_risk_by_context = if let Some(evals) = evals.as_ref() {
+            self.command_context_rules_violation_with_evals(command, segments, evals)?
+        } else {
+            false
+        };
+
+        let is_allowed = if let Some(evals) = evals.as_ref() {
+            self.is_command_allowed_with_context_override_segments_with_evals(segments, evals)
+        } else {
+            self.is_command_allowed_with_context_override_segments(segments)
+        };
+
+        if !is_allowed {
             return Err(CommandPolicyViolation::new(
                 "autonomy.allowed_commands",
-                format!("Command not allowed by security policy: {command}"),
+                self.allowed_commands_block_reason(command, segments, evals.as_deref()),
                 command,
             ));
         }
 
+        Ok(allow_high_risk_by_context)
+    }
+
+    fn validate_command_path_policy(&self, command: &str) -> Result<(), CommandPolicyViolation> {
         if let Some(path) = self.forbidden_path_argument(command) {
             return Err(CommandPolicyViolation::new(
                 "autonomy.workspace_path_guard",
@@ -1576,31 +1803,22 @@ impl SecurityPolicy {
             ));
         }
 
-        let risk = self.command_risk_level(command);
+        Ok(())
+    }
 
+    fn validate_command_risk_policy(
+        &self,
+        command: &str,
+        approved: bool,
+        risk: CommandRiskLevel,
+        allow_high_risk_by_context: bool,
+    ) -> Result<(), CommandPolicyViolation> {
         if risk == CommandRiskLevel::High {
-            if self.block_high_risk_commands && !allow_high_risk_by_context {
-                let lower = command.to_ascii_lowercase();
-                if lower.contains("curl") || lower.contains("wget") {
-                    return Err(CommandPolicyViolation::new(
-                        "autonomy.block_high_risk_commands",
-                        "Command blocked: high-risk command is disallowed by policy. Shell curl/wget are blocked; use `http_request` or `web_fetch` with configured allowed_domains.",
-                        command,
-                    ));
-                }
-                return Err(CommandPolicyViolation::new(
-                    "autonomy.block_high_risk_commands",
-                    "Command blocked: high-risk command is disallowed by policy",
-                    command,
-                ));
-            }
-            if self.autonomy == AutonomyLevel::Supervised && !approved {
-                return Err(CommandPolicyViolation::new(
-                    "autonomy.require_approval_for_high_risk",
-                    "Command requires explicit approval (approved=true): high-risk operation",
-                    command,
-                ));
-            }
+            return self.validate_high_risk_command_policy(
+                command,
+                approved,
+                allow_high_risk_by_context,
+            );
         }
 
         if risk == CommandRiskLevel::Medium
@@ -1615,7 +1833,40 @@ impl SecurityPolicy {
             ));
         }
 
-        Ok(risk)
+        Ok(())
+    }
+
+    fn validate_high_risk_command_policy(
+        &self,
+        command: &str,
+        approved: bool,
+        allow_high_risk_by_context: bool,
+    ) -> Result<(), CommandPolicyViolation> {
+        if self.block_high_risk_commands && !allow_high_risk_by_context {
+            let lower = command.to_ascii_lowercase();
+            if lower.contains("curl") || lower.contains("wget") {
+                return Err(CommandPolicyViolation::new(
+                    "autonomy.block_high_risk_commands",
+                    "Command blocked: high-risk command is disallowed by policy. Shell curl/wget are blocked; use `http_request` or `web_fetch` with configured allowed_domains.",
+                    command,
+                ));
+            }
+            return Err(CommandPolicyViolation::new(
+                "autonomy.block_high_risk_commands",
+                "Command blocked: high-risk command is disallowed by policy",
+                command,
+            ));
+        }
+
+        if self.autonomy == AutonomyLevel::Supervised && !approved {
+            return Err(CommandPolicyViolation::new(
+                "autonomy.require_approval_for_high_risk",
+                "Command requires explicit approval (approved=true): high-risk operation",
+                command,
+            ));
+        }
+
+        Ok(())
     }
 
     /// Check whether a command is allowed by the global allowlist, with
@@ -1635,30 +1886,51 @@ impl SecurityPolicy {
         }
 
         let segments = Self::collect_command_segments(command);
+        self.is_command_allowed_with_context_override_segments(&segments)
+    }
+
+    fn is_command_allowed_with_context_override_segments(
+        &self,
+        segments: &[CommandSegment],
+    ) -> bool {
+        if self.command_context_rules.is_empty() {
+            let has_cmd = !segments.is_empty();
+            for (executable, base_cmd, args) in segments {
+                let lowered_args: Vec<String> =
+                    args.iter().map(|arg| arg.to_ascii_lowercase()).collect();
+                if !self.is_args_safe(base_cmd, &lowered_args) {
+                    return false;
+                }
+                let allowlisted = self
+                    .allowed_commands
+                    .iter()
+                    .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd));
+                if !allowlisted {
+                    return false;
+                }
+            }
+            return has_cmd;
+        }
+
+        let evals = self.evaluate_command_context_segments(segments);
+        self.is_command_allowed_with_context_override_segments_with_evals(segments, &evals)
+    }
+
+    fn is_command_allowed_with_context_override_segments_with_evals(
+        &self,
+        segments: &[CommandSegment],
+        evals: &[CommandContextSegmentEval<'_>],
+    ) -> bool {
         let has_cmd = !segments.is_empty();
 
-        for (executable, base_cmd, args) in segments {
+        for ((executable, base_cmd, args), eval) in segments.iter().zip(evals.iter()) {
             let lowered_args: Vec<String> =
                 args.iter().map(|arg| arg.to_ascii_lowercase()).collect();
-            if !self.is_args_safe(&base_cmd, &lowered_args) {
+            if !self.is_args_safe(base_cmd, &lowered_args) {
                 return false;
             }
 
-            let allowlisted = self
-                .allowed_commands
-                .iter()
-                .any(|allowed| is_allowlist_entry_match(allowed, &executable, &base_cmd));
-            let eval = self.evaluate_command_context_segment(&executable, &base_cmd, &args);
-            if eval.matched_deny.is_some() {
-                return false;
-            }
-            if eval.allow_rule_count > 0 && eval.matched_allow.is_none() {
-                return false;
-            }
-            if allowlisted {
-                continue;
-            }
-            if eval.matched_allow.is_none() {
+            if !self.segment_is_allowlisted_or_context_allowed(executable, base_cmd, eval) {
                 return false;
             }
         }
@@ -1681,14 +1953,6 @@ impl SecurityPolicy {
     /// - Blocks shell redirections (`<`, `>`, `>>`) that can bypass path policy
     /// - Blocks dangerous arguments (e.g. `find -exec`, `git config`)
     pub fn is_command_allowed(&self, command: &str) -> bool {
-        if self.autonomy == AutonomyLevel::ReadOnly {
-            return false;
-        }
-
-        if !self.allow_unsafe_shell_structures && detect_shell_structure_block(command).is_some() {
-            return false;
-        }
-
         self.is_command_allowed_with_context_override(command)
     }
 
@@ -2190,7 +2454,7 @@ mod tests {
     fn summarize_command_policy_block_extracts_policy_and_command() {
         let violation = CommandPolicyViolation::new(
             "autonomy.allowed_commands",
-            "Command not allowed by security policy: curl https://evil.example",
+            "Command blocked by allowed_commands: no entry in autonomy.allowed_commands matched executable=curl; segment_command=curl; context_override=none; full_command=curl https://evil.example",
             "curl https://evil.example",
         );
         let summary = summarize_command_policy_block(&violation.format_block_message(), 64)
@@ -2203,21 +2467,21 @@ mod tests {
 
     #[test]
     fn parse_command_policy_block_event_extracts_fields() {
-        let message = "blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example";
+        let message = "blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command blocked by allowed_commands: no entry in autonomy.allowed_commands matched executable=curl; segment_command=curl; context_override=none; full_command=curl https://evil.example";
         let parsed = parse_command_policy_block_event(message)
             .expect("formatted block message should parse into structured event");
         assert_eq!(parsed.policy_id, "autonomy.allowed_commands");
         assert_eq!(parsed.command_fragment, "curl https://evil.example");
         assert_eq!(
             parsed.reason,
-            "Command not allowed by security policy: curl https://evil.example"
+            "Command blocked by allowed_commands: no entry in autonomy.allowed_commands matched executable=curl; segment_command=curl; context_override=none; full_command=curl https://evil.example"
         );
     }
 
     #[test]
     fn is_command_policy_block_message_accepts_error_prefixed_payload() {
         let message =
-            "Error: blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example";
+            "Error: blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command blocked by allowed_commands: no entry in autonomy.allowed_commands matched executable=curl; segment_command=curl; context_override=none; full_command=curl https://evil.example";
         assert!(is_command_policy_block_message(message));
         let summary = summarize_command_policy_block(message, 64)
             .expect("error-prefixed block message should still summarize");
@@ -2401,6 +2665,21 @@ mod tests {
         assert!(!p.is_command_allowed("wget http://evil.com"));
         assert!(!p.is_command_allowed("python3 exploit.py"));
         assert!(!p.is_command_allowed("node malicious.js"));
+    }
+
+    #[test]
+    fn validate_command_execution_reports_allowed_commands_config_surface() {
+        let policy = default_policy();
+        let violation = policy
+            .validate_command_execution_with_reason("curl https://evil.example", false)
+            .expect_err("curl must remain blocked by the global allowlist");
+        assert_eq!(violation.policy_id(), "autonomy.allowed_commands");
+        assert!(violation
+            .to_string()
+            .contains("Command blocked by allowed_commands"));
+        assert!(violation.to_string().contains("autonomy.allowed_commands"));
+        assert!(violation.to_string().contains("segment_command=curl"));
+        assert!(violation.to_string().contains("context_override=none"));
     }
 
     #[test]
@@ -3512,10 +3791,14 @@ mod tests {
 
         let blocked = policy
             .validate_command_execution_with_reason("curl https://evil.example/data", true)
-            .expect_err("context rule constraints must block even when command is globally allowlisted");
+            .expect_err(
+                "context rule constraints must block even when command is globally allowlisted",
+            );
 
         assert_eq!(blocked.policy_id(), "autonomy.command_context_rules");
-        assert!(blocked.to_string().contains("no allow rule matched constraints"));
+        assert!(blocked
+            .to_string()
+            .contains("no allow rule matched constraints"));
         assert!(blocked.to_string().contains("rule_command=curl"));
         assert!(blocked.to_string().contains("observed_hosts=evil.example"));
     }

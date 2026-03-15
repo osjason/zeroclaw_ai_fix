@@ -186,6 +186,9 @@ async fn run_agent_job(
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
+    #[cfg(test)]
+    record_test_agent_execution_start(&job.id).await;
+
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
             Box::pin(crate::agent::run(
@@ -355,55 +358,78 @@ fn resolve_announce_target(job: &CronJob) -> Result<Option<(&str, &str)>> {
 }
 
 fn build_start_announcements(job: &CronJob) -> [String; 2] {
-    with_cron_lifecycle_builder(job, |builder| {
-        builder.render_start_announcements(START_ANNOUNCEMENT_PREVIEW_CHARS)
-    })
+    CronLifecycleAnnouncementRenderer::for_job(job)
+        .render_start_announcements(START_ANNOUNCEMENT_PREVIEW_CHARS)
 }
 
 fn build_job_result_announcement(job: &CronJob, success: bool, output: &str) -> String {
-    if is_no_reply_sentinel(output) {
-        return output.to_string();
+    CronLifecycleAnnouncementRenderer::for_job(job).render_result_announcement_or_output(
+        success,
+        output,
+        RESULT_ANNOUNCEMENT_PREVIEW_CHARS,
+        RESULT_ANNOUNCEMENT_PREVIEW_CHARS,
+        RESULT_ANNOUNCEMENT_PREVIEW_CHARS,
+        is_no_reply_sentinel,
+    )
+}
+
+struct CronLifecycleAnnouncementRenderer<'a> {
+    id: &'a str,
+    name: &'a str,
+    schedule: String,
+    descriptor: CronLifecycleDescriptor<'a>,
+}
+
+impl<'a> CronLifecycleAnnouncementRenderer<'a> {
+    fn for_job(job: &'a CronJob) -> Self {
+        let descriptor = match job.job_type {
+            JobType::Agent => CronLifecycleDescriptor::Agent {
+                prompt: job.prompt.as_deref(),
+            },
+            JobType::Shell => CronLifecycleDescriptor::Shell {
+                command: &job.command,
+            },
+        };
+
+        Self {
+            id: &job.id,
+            name: job.name.as_deref().unwrap_or("cron-job"),
+            schedule: describe_schedule(&job.schedule),
+            descriptor,
+        }
     }
 
-    with_cron_lifecycle_builder(job, |builder| {
-        builder
-            .render_result_announcement(
-                success,
-                output,
-                RESULT_ANNOUNCEMENT_PREVIEW_CHARS,
-                RESULT_ANNOUNCEMENT_PREVIEW_CHARS,
-                RESULT_ANNOUNCEMENT_PREVIEW_CHARS,
-            )
-            .unwrap_or_else(|| output.to_string())
-    })
-}
+    fn builder(&self) -> CronLifecycleAnnouncementBuilder<'_> {
+        build_cron_lifecycle_announcement_builder(
+            self.id,
+            self.name,
+            self.schedule.as_str(),
+            self.descriptor,
+        )
+    }
 
-fn with_cron_lifecycle_builder<T>(
-    job: &CronJob,
-    render: impl FnOnce(CronLifecycleAnnouncementBuilder<'_>) -> T,
-) -> T {
-    let schedule = describe_schedule(&job.schedule);
-    render(build_cron_lifecycle_builder(job, schedule.as_str()))
-}
+    fn render_start_announcements(&self, detail_max_chars: usize) -> [String; 2] {
+        self.builder().render_start_announcements(detail_max_chars)
+    }
 
-fn build_cron_lifecycle_builder<'a>(
-    job: &'a CronJob,
-    schedule: &'a str,
-) -> CronLifecycleAnnouncementBuilder<'a> {
-    let descriptor = match job.job_type {
-        JobType::Agent => CronLifecycleDescriptor::Agent {
-            prompt: job.prompt.as_deref(),
-        },
-        JobType::Shell => CronLifecycleDescriptor::Shell {
-            command: &job.command,
-        },
-    };
-    build_cron_lifecycle_announcement_builder(
-        &job.id,
-        job.name.as_deref().unwrap_or("cron-job"),
-        schedule,
-        descriptor,
-    )
+    fn render_result_announcement_or_output(
+        &self,
+        success: bool,
+        output: &str,
+        output_preview_max_chars: usize,
+        command_max_chars: usize,
+        reason_max_chars: usize,
+        is_no_reply_sentinel: impl Fn(&str) -> bool,
+    ) -> String {
+        self.builder().render_result_announcement_or_output(
+            success,
+            output,
+            output_preview_max_chars,
+            command_max_chars,
+            reason_max_chars,
+            is_no_reply_sentinel,
+        )
+    }
 }
 
 fn describe_schedule(schedule: &Schedule) -> String {
@@ -420,6 +446,75 @@ fn describe_schedule(schedule: &Schedule) -> String {
     }
 }
 
+#[cfg(feature = "channel-lark")]
+fn lark_delivery_channel_name(channel: &str) -> Option<&'static str> {
+    if channel.eq_ignore_ascii_case("lark") {
+        Some("lark")
+    } else if channel.eq_ignore_ascii_case("feishu") {
+        Some("feishu")
+    } else {
+        None
+    }
+}
+
+#[cfg(feature = "channel-lark")]
+fn build_lark_delivery_channel(config: &Config, channel: &str) -> Result<LarkChannel> {
+    let channel = lark_delivery_channel_name(channel)
+        .ok_or_else(|| anyhow::anyhow!("unsupported Lark-family channel: {channel}"))?;
+    let lark_channel = match channel {
+        "lark" => {
+            let lark = config
+                .channels_config
+                .lark
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
+            LarkChannel::from_lark_config(lark)
+        }
+        "feishu" => {
+            if let Some(feishu) = config.channels_config.feishu.as_ref() {
+                LarkChannel::from_feishu_config(feishu)
+            } else if let Some(legacy_lark) = config
+                .channels_config
+                .lark
+                .as_ref()
+                .filter(|cfg| cfg.use_feishu)
+            {
+                tracing::warn!(
+                    "Using legacy [channels_config.lark].use_feishu=true compatibility path for cron feishu delivery; prefer [channels_config.feishu]."
+                );
+                LarkChannel::from_config(legacy_lark)
+            } else {
+                anyhow::bail!(
+                    "feishu channel not configured (set [channels_config.feishu] or legacy [channels_config.lark].use_feishu=true)"
+                );
+            }
+        }
+        _ => unreachable!("unsupported Lark-family channel already normalized"),
+    };
+
+    Ok(with_lark_delivery_test_api_base(channel, lark_channel))
+}
+
+#[cfg(feature = "channel-lark")]
+#[cfg(not(test))]
+fn with_lark_delivery_test_api_base(_channel: &str, lark_channel: LarkChannel) -> LarkChannel {
+    lark_channel
+}
+
+#[cfg(all(feature = "channel-lark", test))]
+fn with_lark_delivery_test_api_base(channel: &str, lark_channel: LarkChannel) -> LarkChannel {
+    let api_base_env = match channel {
+        "lark" => "ZEROCLAW_TEST_LARK_API_BASE",
+        "feishu" => "ZEROCLAW_TEST_FEISHU_API_BASE",
+        _ => unreachable!("unsupported Lark-family channel already rejected"),
+    };
+    if let Ok(api_base) = std::env::var(api_base_env) {
+        lark_channel.with_api_base_override(api_base)
+    } else {
+        lark_channel
+    }
+}
+
 #[cfg(test)]
 type TestAnnouncement = (String, String, String);
 
@@ -431,12 +526,31 @@ fn test_announcements_store() -> &'static tokio::sync::Mutex<Vec<TestAnnouncemen
 }
 
 #[cfg(test)]
+type TestAgentExecutionStart = (String, usize);
+
+#[cfg(test)]
+fn test_agent_execution_start_store() -> &'static tokio::sync::Mutex<Vec<TestAgentExecutionStart>> {
+    static STORE: std::sync::OnceLock<tokio::sync::Mutex<Vec<TestAgentExecutionStart>>> =
+        std::sync::OnceLock::new();
+    STORE.get_or_init(|| tokio::sync::Mutex::new(Vec::new()))
+}
+
+#[cfg(test)]
 async fn push_test_announcement(channel: &str, target: &str, output: &str) {
     test_announcements_store().lock().await.push((
         channel.to_string(),
         target.to_string(),
         output.to_string(),
     ));
+}
+
+#[cfg(test)]
+async fn record_test_agent_execution_start(job_id: &str) {
+    let announcement_count = test_announcements_store().lock().await.len();
+    test_agent_execution_start_store()
+        .lock()
+        .await
+        .push((job_id.to_string(), announcement_count));
 }
 
 pub(crate) async fn deliver_announcement(
@@ -576,55 +690,18 @@ pub(crate) async fn deliver_announcement(
                 );
             }
         }
-        "lark" => {
+        "lark" | "feishu" => {
             #[cfg(feature = "channel-lark")]
             {
-                let lark = config
-                    .channels_config
-                    .lark
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
-                let mut channel = LarkChannel::from_lark_config(lark);
-                #[cfg(test)]
-                if let Ok(api_base) = std::env::var("ZEROCLAW_TEST_LARK_API_BASE") {
-                    channel = channel.with_api_base_override(api_base);
-                }
+                let channel = build_lark_delivery_channel(config, normalized.as_str())?;
                 channel.send(&SendMessage::new(output, target)).await?;
             }
             #[cfg(not(feature = "channel-lark"))]
             {
-                anyhow::bail!("lark delivery channel requires `channel-lark` feature");
-            }
-        }
-        "feishu" => {
-            #[cfg(feature = "channel-lark")]
-            {
-                let mut channel = if let Some(feishu) = config.channels_config.feishu.as_ref() {
-                    LarkChannel::from_feishu_config(feishu)
-                } else if let Some(legacy_lark) = config
-                    .channels_config
-                    .lark
-                    .as_ref()
-                    .filter(|cfg| cfg.use_feishu)
-                {
-                    tracing::warn!(
-                        "Using legacy [channels_config.lark].use_feishu=true compatibility path for cron feishu delivery; prefer [channels_config.feishu]."
-                    );
-                    LarkChannel::from_config(legacy_lark)
-                } else {
-                    anyhow::bail!(
-                        "feishu channel not configured (set [channels_config.feishu] or legacy [channels_config.lark].use_feishu=true)"
-                    );
-                };
-                #[cfg(test)]
-                if let Ok(api_base) = std::env::var("ZEROCLAW_TEST_FEISHU_API_BASE") {
-                    channel = channel.with_api_base_override(api_base);
-                }
-                channel.send(&SendMessage::new(output, target)).await?;
-            }
-            #[cfg(not(feature = "channel-lark"))]
-            {
-                anyhow::bail!("feishu delivery channel requires `channel-lark` feature");
+                anyhow::bail!(
+                    "{} delivery channel requires `channel-lark` feature",
+                    normalized
+                );
             }
         }
         "email" => {
@@ -874,8 +951,10 @@ mod tests {
             .expect("expected structured security policy block event");
         assert_eq!(event.policy_id, expected_policy_id);
         assert_eq!(event.command_fragment, expected_command_fragment);
+        let normalized_reason = event.reason.to_ascii_lowercase();
+        let normalized_expected = expected_reason_fragment.to_ascii_lowercase();
         assert!(
-            event.reason.contains(expected_reason_fragment),
+            normalized_reason.contains(&normalized_expected),
             "expected reason to contain `{expected_reason_fragment}`, got `{}`",
             event.reason
         );
@@ -897,6 +976,14 @@ mod tests {
 
     async fn snapshot_test_announcements() -> Vec<TestAnnouncement> {
         test_announcements_store().lock().await.clone()
+    }
+
+    async fn clear_test_agent_execution_starts() {
+        test_agent_execution_start_store().lock().await.clear();
+    }
+
+    async fn snapshot_test_agent_execution_starts() -> Vec<TestAgentExecutionStart> {
+        test_agent_execution_start_store().lock().await.clone()
     }
 
     #[tokio::test]
@@ -949,14 +1036,12 @@ mod tests {
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
-        let event = parse_security_policy_block_event(&output)
-            .expect("expected structured security policy block event");
-        assert_eq!(event.policy_id, "autonomy.allowed_commands");
-        assert_eq!(event.command_fragment, "curl https://evil.example");
-        assert!(event
-            .reason
-            .to_ascii_lowercase()
-            .contains("command not allowed"));
+        assert_security_policy_block(
+            &output,
+            "autonomy.allowed_commands",
+            "curl https://evil.example",
+            "command not allowed",
+        );
     }
 
     #[tokio::test]
@@ -1059,11 +1144,12 @@ mod tests {
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
-        let event = parse_security_policy_block_event(&output)
-            .expect("expected structured security policy block event");
-        assert_eq!(event.policy_id, "autonomy.read_only");
-        assert_eq!(event.command_fragment, "echo should-not-run");
-        assert!(event.reason.contains("read-only"));
+        assert_security_policy_block(
+            &output,
+            "autonomy.read_only",
+            "echo should-not-run",
+            "read-only",
+        );
     }
 
     #[tokio::test]
@@ -1076,11 +1162,12 @@ mod tests {
 
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
-        let event = parse_security_policy_block_event(&output)
-            .expect("expected structured security policy block event");
-        assert_eq!(event.policy_id, "autonomy.max_actions_per_hour");
-        assert_eq!(event.command_fragment, "echo should-not-run");
-        assert!(event.reason.contains("Rate limit exceeded"));
+        assert_security_policy_block(
+            &output,
+            "autonomy.max_actions_per_hour",
+            "echo should-not-run",
+            "Rate limit exceeded",
+        );
     }
 
     #[tokio::test]
@@ -1279,8 +1366,10 @@ mod tests {
         };
 
         clear_test_announcements().await;
+        clear_test_agent_execution_starts().await;
         process_due_jobs(&config, &security, vec![job], &component).await;
         let announcements = snapshot_test_announcements().await;
+        let agent_execution_starts = snapshot_test_agent_execution_starts().await;
 
         assert_eq!(announcements.len(), 3);
         assert_eq!(announcements[0].0, "__test__");
@@ -1289,6 +1378,10 @@ mod tests {
         assert!(announcements[0].2.contains("type=agent"));
         assert!(announcements[1].2.contains("Cron running: id=test-job"));
         assert!(announcements[1].2.contains("status=agent is now executing"));
+        assert!(!agent_execution_starts.is_empty());
+        assert!(agent_execution_starts
+            .iter()
+            .all(|(job_id, announcement_count)| job_id == "test-job" && *announcement_count == 2));
         assert_eq!(announcements[2].0, "__test__");
         assert_eq!(announcements[2].1, "chat-due-agent-order");
         assert!(announcements[2].2.contains("agent job failed:"));
@@ -1818,9 +1911,11 @@ mod tests {
         };
 
         clear_test_announcements().await;
+        clear_test_agent_execution_starts().await;
         let (_job_id, success, output) =
             execute_and_persist_job(&config, &security, &job, "scheduler-test").await;
         let announcements = snapshot_test_announcements().await;
+        let agent_execution_starts = snapshot_test_agent_execution_starts().await;
 
         assert!(!success);
         assert!(output.contains("agent job failed:"));
@@ -1831,6 +1926,10 @@ mod tests {
         assert!(announcements[0].2.contains("type=agent"));
         assert!(announcements[1].2.contains("Cron running: id=test-job"));
         assert!(announcements[1].2.contains("status=agent is now executing"));
+        assert!(!agent_execution_starts.is_empty());
+        assert!(agent_execution_starts
+            .iter()
+            .all(|(job_id, announcement_count)| job_id == "test-job" && *announcement_count == 2));
         assert_eq!(announcements[2].0, "__test__");
         assert_eq!(announcements[2].1, "chat-agent-42");
         assert!(announcements[2].2.contains("agent job failed:"));
@@ -1925,6 +2024,23 @@ mod tests {
         assert!(announcement.contains("policy=autonomy.allowed_commands"));
         assert!(announcement.contains("command=curl https://evil.example"));
         assert!(announcement.contains("reason=Command not allowed by security policy"));
+    }
+
+    #[test]
+    fn build_job_result_announcement_command_context_block_preserves_shared_context_fields() {
+        let job = test_job("curl https://evil.example");
+        let announcement = build_job_result_announcement(
+            &job,
+            false,
+            "blocked by security policy: policy=autonomy.command_context_rules; command=curl https://evil.example; reason=Command blocked by command_context_rules: no allow rule matched; segment_command=curl https://evil.example; rule_index=0; command_context=action=allow, commands=curl, allowed_domains=api.internal",
+        );
+
+        assert!(announcement.contains("status=blocked_by_security_policy"));
+        assert!(announcement.contains("policy=autonomy.command_context_rules"));
+        assert!(announcement.contains("command=curl https://evil.example"));
+        assert!(announcement.contains("rule_index=0"));
+        assert!(announcement
+            .contains("command_context=action=allow, commands=curl, allowed_domains=api.internal"));
     }
 
     #[test]

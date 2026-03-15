@@ -1,10 +1,11 @@
 /// Unified execution progress signal for channel-visible status updates.
 use crate::security::policy::{
-    parse_security_policy_block_event, policy_block_config_key, summarize_command_policy_block,
-    CommandPolicyViolation,
+    parse_security_policy_block_event, summarize_command_policy_block, CommandPolicyViolation,
+    PolicyBlockMetadata,
 };
 use crate::util::truncate_with_ellipsis;
 use serde_json::Value;
+use std::fmt::Write;
 
 #[derive(Debug)]
 pub(crate) enum ExecutionSignal {
@@ -129,6 +130,31 @@ pub(crate) fn should_force_draft_continuation(text: &str) -> bool {
     is_high_priority_progress_update(text)
 }
 
+pub(crate) fn upsert_progress_section(
+    accumulated: &mut String,
+    block: &str,
+    start_marker: &str,
+    end_marker: &str,
+) {
+    let section = format!("{start_marker}{block}{end_marker}");
+    if let Some(start) = accumulated.find(start_marker) {
+        if let Some(end_offset) = accumulated[start..].find(end_marker) {
+            let end = start + end_offset + end_marker.len();
+            accumulated.replace_range(start..end, &section);
+            return;
+        }
+    }
+    accumulated.push_str(&section);
+}
+
+pub(crate) fn strip_progress_section_markers(
+    text: &str,
+    start_marker: &str,
+    end_marker: &str,
+) -> String {
+    text.replace(start_marker, "").replace(end_marker, "")
+}
+
 pub(crate) fn is_structured_lifecycle_or_policy_line(line: &str) -> bool {
     let lower = line.trim().to_ascii_lowercase();
     if lower.is_empty() {
@@ -184,6 +210,34 @@ fn is_tool_running_progress_line(line: &str) -> bool {
     line.trim_start()
         .strip_prefix('⏳')
         .is_some_and(|body| !body.trim().is_empty())
+}
+
+pub(crate) fn render_tool_progress_running_line(tool_name: &str, hint: &str) -> String {
+    let mut line = String::new();
+    let _ = write!(line, "⏳ {tool_name}");
+    if !hint.is_empty() {
+        let _ = write!(line, ": {hint}");
+    }
+    line
+}
+
+pub(crate) fn render_tool_progress_completed_line(
+    tool_name: &str,
+    secs: u64,
+    success: bool,
+    detail: Option<&str>,
+) -> String {
+    let mut line = String::new();
+    let mark = if success { "✅" } else { "❌" };
+    let _ = write!(line, "{mark} {tool_name} ({secs}s)");
+    if !success {
+        if let Some(detail) = detail {
+            if !detail.is_empty() {
+                let _ = write!(line, ": {detail}");
+            }
+        }
+    }
+    line
 }
 
 pub(crate) fn render_execution_event(event: ExecutionEvent<'_>) -> String {
@@ -357,18 +411,17 @@ pub(crate) fn render_policy_blocked_execution_event(
         return None;
     }
 
-    if let Some(event) = parse_security_policy_block_event(trimmed) {
-        let reason = if event.reason.trim().is_empty() {
+    if let Some(metadata) =
+        PolicyBlockMetadata::from_message(trimmed, input.command_max_chars, input.reason_max_chars)
+    {
+        let reason = if metadata.reason_preview.trim().is_empty() {
             input.default_reason.to_string()
         } else {
-            truncate_with_ellipsis(event.reason, input.reason_max_chars)
+            metadata.reason_preview
         };
         return Some(context.render_blocked(
-            Some(event.policy_id.to_string()),
-            Some(truncate_with_ellipsis(
-                event.command_fragment,
-                input.command_max_chars,
-            )),
+            Some(metadata.policy_id),
+            Some(metadata.command_preview),
             reason,
         ));
     }
@@ -421,35 +474,6 @@ pub(crate) fn render_tool_policy_block_progress_detail(
     )
 }
 
-fn extract_summary_field<'a>(summary: &'a str, key: &str) -> Option<&'a str> {
-    let marker = format!("{key}=");
-    let start = summary.find(&marker)?;
-    let value_start = start + marker.len();
-    let value = summary[value_start..]
-        .split(';')
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    Some(value)
-}
-
-fn extract_reason_field<'a>(reason: &'a str, key: &str) -> Option<&'a str> {
-    reason
-        .split(';')
-        .map(str::trim)
-        .filter_map(|segment| segment.split_once('='))
-        .find_map(|(segment_key, segment_value)| {
-            if segment_key.trim() != key {
-                return None;
-            }
-            let value = segment_value.trim();
-            if value.is_empty() {
-                return None;
-            }
-            Some(value)
-        })
-}
-
 fn append_detail_field_if_missing(detail: &mut String, key: &str, value: &str) {
     let expected = format!("{key}={value}");
     if detail.contains(&expected) {
@@ -467,24 +491,54 @@ fn append_detail_field_if_missing(detail: &mut String, key: &str, value: &str) {
     detail.push_str(expected.as_str());
 }
 
-pub(crate) fn render_tool_policy_block_progress_summary(
+fn parse_policy_block_metadata(reason: &str, command_max_chars: usize) -> Option<PolicyBlockMetadata> {
+    PolicyBlockMetadata::from_message(reason, command_max_chars, 120)
+}
+
+fn append_policy_block_metadata_detail(detail: &mut String, metadata: &PolicyBlockMetadata) {
+    append_detail_field_if_missing(detail, "policy", &metadata.policy_id);
+    append_detail_field_if_missing(detail, "command", &metadata.command_preview);
+    append_detail_field_if_missing(detail, "config_key", &metadata.config_key);
+    if let Some(rule_index) = metadata.rule_index.as_deref() {
+        append_detail_field_if_missing(detail, "rule_index", rule_index);
+    }
+    if let Some(segment_command) = metadata.segment_command.as_deref() {
+        append_detail_field_if_missing(detail, "segment_command", segment_command);
+    }
+    if let Some(command_context) = metadata.command_context.as_deref() {
+        append_detail_field_if_missing(detail, "command_context", command_context);
+    }
+}
+
+fn append_policy_block_command_context_guidance(
+    guidance: &mut String,
+    metadata: &PolicyBlockMetadata,
+    max_context_chars: usize,
+) {
+    let Some(command_context) = metadata.command_context.as_deref() else {
+        return;
+    };
+    let compact_context = truncate_with_ellipsis(command_context, max_context_chars);
+    if compact_context.is_empty() || guidance.contains("command_context=") {
+        return;
+    }
+
+    if let Some((summary, guidance_suffix)) = guidance.split_once(" Guidance:") {
+        *guidance = format!("{summary}; command_context={compact_context} Guidance:{guidance_suffix}");
+    } else {
+        guidance.push_str("; command_context=");
+        guidance.push_str(&compact_context);
+    }
+}
+
+fn render_tool_policy_block_progress_summary_with_metadata(
     tool_name: &str,
     reason: &str,
+    metadata: Option<&PolicyBlockMetadata>,
 ) -> Option<String> {
     let mut detail = render_tool_policy_block_progress_detail(tool_name, reason)?;
-    if let Some(summary) = summarize_command_policy_block(reason, 72) {
-        for key in ["policy", "command", "config_key"] {
-            if let Some(value) = extract_summary_field(&summary, key) {
-                append_detail_field_if_missing(&mut detail, key, value);
-            }
-        }
-    }
-    if let Some(event) = parse_security_policy_block_event(reason) {
-        for key in ["rule_index", "segment_command", "command_context"] {
-            if let Some(value) = extract_reason_field(event.reason, key) {
-                append_detail_field_if_missing(&mut detail, key, value);
-            }
-        }
+    if let Some(metadata) = metadata {
+        append_policy_block_metadata_detail(&mut detail, metadata);
     }
 
     if !detail.contains("policy=") {
@@ -499,6 +553,14 @@ pub(crate) fn render_tool_policy_block_progress_summary(
     }
 
     Some(detail)
+}
+
+pub(crate) fn render_tool_policy_block_progress_summary(
+    tool_name: &str,
+    reason: &str,
+) -> Option<String> {
+    let metadata = parse_policy_block_metadata(reason, 72);
+    render_tool_policy_block_progress_summary_with_metadata(tool_name, reason, metadata.as_ref())
 }
 
 pub(crate) fn summarize_tool_policy_block_progress(
@@ -529,6 +591,52 @@ where
     None
 }
 
+fn summarize_structured_tool_policy_block_progress_from_reasons<'a, I>(
+    tool_name: &str,
+    reasons: I,
+) -> Option<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    summarize_tool_policy_block_progress_from_reasons(
+        tool_name,
+        reasons
+            .into_iter()
+            .filter(|reason| parse_security_policy_block_event(reason.trim()).is_some()),
+    )
+}
+
+pub(crate) fn policy_block_reason_candidates_from_outcome_fields<'a>(
+    error_reason: Option<&'a str>,
+    output: &'a str,
+) -> Vec<&'a str> {
+    let mut reasons = Vec::new();
+
+    if let Some(reason) = error_reason {
+        let trimmed = reason.trim();
+        if !trimmed.is_empty() {
+            reasons.push(trimmed);
+        }
+    }
+
+    let trimmed_output = output.trim();
+    if !trimmed_output.is_empty()
+        && render_policy_block_constraint_summary_with_config_key(trimmed_output, 48).is_some()
+        && !reasons.contains(&trimmed_output)
+    {
+        reasons.push(trimmed_output);
+    }
+
+    if let Some(embedded) = extract_embedded_security_block_message(output) {
+        let trimmed = embedded.trim();
+        if !trimmed.is_empty() && !reasons.contains(&trimmed) {
+            reasons.push(trimmed);
+        }
+    }
+
+    reasons
+}
+
 pub(crate) fn summarize_tool_policy_block_progress_from_outcome_fields(
     tool_name: &str,
     error_reason: Option<&str>,
@@ -536,7 +644,7 @@ pub(crate) fn summarize_tool_policy_block_progress_from_outcome_fields(
 ) -> Option<String> {
     summarize_tool_policy_block_progress_from_reasons(
         tool_name,
-        [error_reason.unwrap_or_default(), output],
+        policy_block_reason_candidates_from_outcome_fields(error_reason, output),
     )
 }
 
@@ -545,22 +653,16 @@ pub(crate) fn summarize_tool_policy_block_progress_from_outcome(
     error_reason: Option<&str>,
     output: &str,
 ) -> Option<String> {
-    let structured_error_reason = error_reason.and_then(|reason| {
-        let trimmed = reason.trim();
-        if parse_security_policy_block_event(trimmed).is_none() {
-            return None;
-        }
-        summarize_tool_policy_block_progress(tool_name, Some(trimmed))
-    });
-    if structured_error_reason.is_some() {
-        return structured_error_reason;
-    }
-
-    if let Some(embedded) = extract_embedded_security_block_message(output) {
-        let trimmed = embedded.trim();
-        if parse_security_policy_block_event(trimmed).is_some() {
-            return summarize_tool_policy_block_progress(tool_name, Some(trimmed));
-        }
+    if let Some(detail) = summarize_structured_tool_policy_block_progress_from_reasons(
+        tool_name,
+        [
+            error_reason,
+            extract_embedded_security_block_message(output),
+        ]
+        .into_iter()
+        .flatten(),
+    ) {
+        return Some(detail);
     }
 
     summarize_tool_policy_block_progress_from_outcome_fields(tool_name, error_reason, output)
@@ -578,6 +680,16 @@ pub(crate) fn format_tool_policy_block_event_message(
         .map(|hint| format!("{tool_name} {hint}"))
         .unwrap_or_else(|| tool_name.to_string());
     format_policy_block_event_message(policy_id, reason, Some(&command_fragment))
+}
+
+pub(crate) fn render_tool_policy_block_progress_summary_from_parts(
+    policy_id: &'static str,
+    reason: impl Into<String>,
+    tool_name: &str,
+    tool_hint: Option<&str>,
+) -> Option<String> {
+    let blocked = format_tool_policy_block_event_message(policy_id, reason, tool_name, tool_hint);
+    render_tool_policy_block_progress_summary(tool_name, &blocked)
 }
 
 pub(crate) fn truncate_tool_args_for_progress(
@@ -674,6 +786,57 @@ pub(crate) fn format_tool_policy_block_event_from_args_with_context(
         tool_args,
         hint_max_chars,
     )
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ToolPolicyBlockTrace {
+    pub blocked: String,
+    pub progress_summary: Option<String>,
+    pub policy_id: String,
+    pub command: String,
+    pub config_key: String,
+    pub command_context: Option<String>,
+}
+
+pub(crate) fn format_tool_policy_block_event_from_args_with_context_and_trace(
+    policy_id: &'static str,
+    reason: impl Into<String>,
+    tool_name: &str,
+    tool_args: &Value,
+    hint_max_chars: usize,
+) -> ToolPolicyBlockTrace {
+    let blocked = format_tool_policy_block_event_from_args_with_context(
+        policy_id,
+        reason,
+        tool_name,
+        tool_args,
+        hint_max_chars,
+    );
+    let metadata = parse_policy_block_metadata(&blocked, hint_max_chars);
+    let progress_summary = render_tool_policy_block_progress_summary_with_metadata(
+        tool_name,
+        &blocked,
+        metadata.as_ref(),
+    );
+    if let Some(metadata) = metadata {
+        return ToolPolicyBlockTrace {
+            blocked,
+            progress_summary,
+            policy_id: metadata.policy_id,
+            command: metadata.command_preview,
+            config_key: metadata.config_key,
+            command_context: metadata.command_context,
+        };
+    }
+
+    ToolPolicyBlockTrace {
+        blocked,
+        progress_summary,
+        policy_id: "unknown".to_string(),
+        command: "unknown".to_string(),
+        config_key: "unknown".to_string(),
+        command_context: None,
+    }
 }
 
 pub(crate) fn render_cron_policy_blocked_result(
@@ -867,6 +1030,59 @@ pub(crate) fn render_cron_result_announcement_with_preset(
     )
 }
 
+pub(crate) fn render_cron_start_announcements_with_descriptor(
+    id: &str,
+    name: &str,
+    schedule: &str,
+    descriptor: CronLifecycleDescriptor<'_>,
+    detail_max_chars: usize,
+) -> [String; 2] {
+    build_cron_lifecycle_announcement_builder(id, name, schedule, descriptor)
+        .render_start_announcements(detail_max_chars)
+}
+
+pub(crate) fn render_cron_result_announcement_with_descriptor(
+    id: &str,
+    name: &str,
+    schedule: &str,
+    descriptor: CronLifecycleDescriptor<'_>,
+    success: bool,
+    output: &str,
+    output_preview_max_chars: usize,
+    command_max_chars: usize,
+    reason_max_chars: usize,
+) -> Option<String> {
+    build_cron_lifecycle_announcement_builder(id, name, schedule, descriptor)
+        .render_result_announcement(
+            success,
+            output,
+            output_preview_max_chars,
+            command_max_chars,
+            reason_max_chars,
+        )
+}
+
+pub(crate) fn render_cron_blocked_announcement_with_descriptor(
+    id: &str,
+    name: &str,
+    schedule: &str,
+    descriptor: CronLifecycleDescriptor<'_>,
+    policy_id: &'static str,
+    reason: impl Into<String>,
+    command_fragment: Option<&str>,
+    command_max_chars: usize,
+    reason_max_chars: usize,
+) -> Option<String> {
+    build_cron_lifecycle_announcement_builder(id, name, schedule, descriptor)
+        .render_blocked_announcement(
+            policy_id,
+            reason,
+            command_fragment,
+            command_max_chars,
+            reason_max_chars,
+        )
+}
+
 pub(crate) fn render_cron_blocked_announcement_with_preset(
     id: &str,
     name: &str,
@@ -878,15 +1094,11 @@ pub(crate) fn render_cron_blocked_announcement_with_preset(
     command_max_chars: usize,
     reason_max_chars: usize,
 ) -> Option<String> {
-    let structured_reason = format_policy_block_event_message(policy_id, reason, command_fragment);
-    render_cron_result_announcement_with_preset(
-        id,
-        name,
-        schedule,
-        preset,
-        false,
-        &structured_reason,
-        reason_max_chars,
+    let (context, _) = build_cron_lifecycle_render_context_with_preset(id, name, schedule, preset);
+    context.render_blocked_announcement(
+        policy_id,
+        reason,
+        command_fragment,
         command_max_chars,
         reason_max_chars,
     )
@@ -944,6 +1156,29 @@ impl<'a> CronLifecycleAnnouncementBuilder<'a> {
             command_max_chars,
             reason_max_chars,
         )
+    }
+
+    pub(crate) fn render_result_announcement_or_output(
+        self,
+        success: bool,
+        output: &str,
+        output_preview_max_chars: usize,
+        command_max_chars: usize,
+        reason_max_chars: usize,
+        preserve_output: impl FnOnce(&str) -> bool,
+    ) -> String {
+        if preserve_output(output) {
+            return output.to_string();
+        }
+
+        self.render_result_announcement(
+            success,
+            output,
+            output_preview_max_chars,
+            command_max_chars,
+            reason_max_chars,
+        )
+        .unwrap_or_else(|| output.to_string())
     }
 
     pub(crate) fn render_blocked_announcement(
@@ -1014,14 +1249,60 @@ impl<'a> CronLifecycleAnnouncementRenderContext<'a> {
         command_max_chars: usize,
         reason_max_chars: usize,
     ) -> Option<String> {
-        render_cron_result_announcement(
-            self.id,
-            self.name,
-            self.kind,
-            self.schedule,
+        self.render_output_announcement(
             success,
             output,
             output_preview,
+            command_max_chars,
+            reason_max_chars,
+        )
+    }
+
+    pub(crate) fn render_blocked_announcement(
+        self,
+        policy_id: &'static str,
+        reason: impl Into<String>,
+        command_fragment: Option<&str>,
+        command_max_chars: usize,
+        reason_max_chars: usize,
+    ) -> Option<String> {
+        let structured_reason =
+            format_policy_block_event_message(policy_id, reason, command_fragment);
+        self.render_output_announcement(
+            false,
+            &structured_reason,
+            compact_progress_preview(&structured_reason, reason_max_chars),
+            command_max_chars,
+            reason_max_chars,
+        )
+    }
+
+    fn render_output_announcement(
+        self,
+        success: bool,
+        output: &str,
+        output_preview: String,
+        command_max_chars: usize,
+        reason_max_chars: usize,
+    ) -> Option<String> {
+        if success {
+            return Some(render_execution_completed(
+                "Cron",
+                self.id,
+                self.name,
+                self.kind,
+                Some(self.schedule),
+                output_preview,
+            ));
+        }
+
+        let block_message = extract_embedded_security_block_message(output)?;
+        render_cron_policy_blocked_result(
+            self.id,
+            self.name,
+            self.kind,
+            Some(self.schedule),
+            block_message,
             self.blocked_subject,
             command_max_chars,
             reason_max_chars,
@@ -1041,25 +1322,19 @@ pub(crate) fn render_cron_result_announcement(
     command_max_chars: usize,
     reason_max_chars: usize,
 ) -> Option<String> {
-    if success {
-        return Some(render_execution_completed(
-            "Cron",
-            id,
-            name,
-            kind,
-            Some(schedule),
-            output_preview,
-        ));
-    }
-
-    let block_message = extract_embedded_security_block_message(output)?;
-    render_cron_policy_blocked_result(
+    CronLifecycleAnnouncementRenderContext {
         id,
         name,
         kind,
-        Some(schedule),
-        block_message,
+        schedule,
+        detail_label: "command",
+        running_status: "shell command is now executing",
         blocked_subject,
+    }
+    .render_output_announcement(
+        success,
+        output,
+        output_preview,
         command_max_chars,
         reason_max_chars,
     )
@@ -1087,12 +1362,10 @@ pub(crate) fn render_policy_block_constraint_summary_with_config_key(
         return None;
     }
 
-    if let Some(event) = parse_security_policy_block_event(trimmed) {
-        let command = truncate_with_ellipsis(event.command_fragment, max_command_chars);
-        let config_key = policy_block_config_key(event.policy_id).unwrap_or(event.policy_id);
+    if let Some(metadata) = parse_policy_block_metadata(trimmed, max_command_chars) {
         return Some(format!(
-            "security blocked (policy={}; command={command}; config_key={config_key})",
-            event.policy_id
+            "security blocked (policy={}; command={}; config_key={})",
+            metadata.policy_id, metadata.command_preview, metadata.config_key
         ));
     }
 
@@ -1124,20 +1397,8 @@ pub(crate) fn render_policy_block_constraint_guidance_with_context(
 
     let mut guidance = render_policy_block_constraint_guidance(trimmed, max_command_chars)?;
 
-    if let Some(event) = parse_security_policy_block_event(trimmed) {
-        if let Some(command_context) = extract_reason_field(event.reason, "command_context") {
-            let compact_context = truncate_with_ellipsis(command_context, max_context_chars);
-            if !compact_context.is_empty() && !guidance.contains("command_context=") {
-                if let Some((summary, guidance_suffix)) = guidance.split_once(" Guidance:") {
-                    guidance = format!(
-                        "{summary}; command_context={compact_context} Guidance:{guidance_suffix}"
-                    );
-                } else {
-                    guidance.push_str("; command_context=");
-                    guidance.push_str(&compact_context);
-                }
-            }
-        }
+    if let Some(metadata) = parse_policy_block_metadata(trimmed, max_command_chars) {
+        append_policy_block_command_context_guidance(&mut guidance, &metadata, max_context_chars);
     }
 
     Some(guidance)
@@ -1165,9 +1426,13 @@ pub(crate) fn format_policy_block_event_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_embedded_security_block_message, is_high_priority_progress_update,
-        render_policy_block_constraint_summary, summarize_tool_policy_block_progress,
+        extract_embedded_security_block_message,
+        format_tool_policy_block_event_from_args_with_context_and_trace,
+        is_high_priority_progress_update, render_policy_block_constraint_summary,
+        strip_progress_section_markers, summarize_tool_policy_block_progress,
+        upsert_progress_section,
     };
+    use serde_json::json;
 
     #[test]
     fn high_priority_progress_detects_policy_block_summary() {
@@ -1271,5 +1536,33 @@ mod tests {
         assert!(summary.contains("segment_command=curl https://evil.example"));
         assert!(summary
             .contains("command_context=action=allow, commands=curl, allowed_domains=api.internal"));
+    }
+
+    #[test]
+    fn tool_policy_block_trace_carries_precomputed_progress_summary() {
+        let trace = format_tool_policy_block_event_from_args_with_context_and_trace(
+            "autonomy.command_context_rules",
+            "Command blocked by command_context_rules: no allow rule matched constraints for 'curl'; segment_command=curl https://evil.example; rule_index=0",
+            "shell",
+            &json!({"command": "curl https://evil.example"}),
+            72,
+        );
+        let summary = trace
+            .progress_summary
+            .as_deref()
+            .expect("progress summary should be precomputed");
+        assert!(summary.contains("policy=autonomy.command_context_rules"));
+        assert!(summary.contains("command=curl https://evil.example"));
+        assert!(summary.contains("rule_index=0"));
+    }
+
+    #[test]
+    fn upsert_progress_section_replaces_existing_block() {
+        let mut text = String::new();
+        upsert_progress_section(&mut text, "⏳ shell: ls\n", "<start>", "<end>");
+        upsert_progress_section(&mut text, "✅ shell (1s)\n", "<start>", "<end>");
+        let stripped = strip_progress_section_markers(&text, "<start>", "<end>");
+        assert!(!stripped.contains("⏳ shell: ls"));
+        assert!(stripped.contains("✅ shell (1s)"));
     }
 }

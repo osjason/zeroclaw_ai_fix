@@ -3411,7 +3411,12 @@ pub struct AutonomyConfig {
     /// Restrict absolute filesystem paths to workspace-relative references. Default: `true`.
     /// Resolved paths outside the workspace still require `allowed_roots`.
     pub workspace_only: bool,
-    /// Allowlist of executable names permitted for shell execution.
+    /// Allowlist of executable matchers permitted for shell execution.
+    ///
+    /// Entries may be plain executable names (`git`), explicit executable paths
+    /// (`/usr/bin/git`, `C:\tools\git.exe`), or `*` to admit any executable
+    /// name/path. Shell structures still remain gated by
+    /// `allow_unsafe_shell_structures`.
     pub allowed_commands: Vec<String>,
 
     /// Context-aware shell command allow/deny rules.
@@ -3570,6 +3575,72 @@ fn is_valid_env_var_name(name: &str) -> bool {
         _ => return false,
     }
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn is_valid_command_matcher_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '/' | '.' | '*' | ':' | '\\' | '~')
+}
+
+fn validate_command_matcher(
+    value: &str,
+    field_name: &str,
+    allow_path_like_matcher: bool,
+) -> Result<()> {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        anyhow::bail!("{field_name} must not be empty");
+    }
+    if normalized.chars().any(char::is_whitespace) {
+        anyhow::bail!("{field_name} must not contain whitespace");
+    }
+    if normalized.contains('\0') {
+        anyhow::bail!("{field_name} must not contain null bytes");
+    }
+    if !allow_path_like_matcher && normalized.contains(['/', '\\', ':']) {
+        anyhow::bail!("{field_name} must be a command matcher, not a path: {normalized}");
+    }
+    if !normalized.chars().all(is_valid_command_matcher_char) {
+        anyhow::bail!("{field_name} contains invalid characters: {normalized}");
+    }
+    Ok(())
+}
+
+fn validate_command_context_domains(rule_index: usize, domains: &[String]) -> Result<()> {
+    for (domain_index, domain) in domains.iter().enumerate() {
+        let normalized = domain.trim();
+        if normalized.is_empty() {
+            anyhow::bail!(
+                "autonomy.command_context_rules[{rule_index}].allowed_domains[{domain_index}] must not be empty"
+            );
+        }
+        if normalized.chars().any(char::is_whitespace) {
+            anyhow::bail!(
+                "autonomy.command_context_rules[{rule_index}].allowed_domains[{domain_index}] must not contain whitespace"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_command_context_path_prefixes(
+    rule_index: usize,
+    field_name: &str,
+    prefixes: &[String],
+) -> Result<()> {
+    for (prefix_index, prefix) in prefixes.iter().enumerate() {
+        let normalized = prefix.trim();
+        if normalized.is_empty() {
+            anyhow::bail!(
+                "autonomy.command_context_rules[{rule_index}].{field_name}[{prefix_index}] must not be empty"
+            );
+        }
+        if normalized.contains('\0') {
+            anyhow::bail!(
+                "autonomy.command_context_rules[{rule_index}].{field_name}[{prefix_index}] must not contain null bytes"
+            );
+        }
+    }
+    Ok(())
 }
 
 impl Default for AutonomyConfig {
@@ -4869,6 +4940,19 @@ fn clone_group_reply_allowed_sender_ids(group_reply: Option<&GroupReplyConfig>) 
         .unwrap_or_default()
 }
 
+fn effective_group_reply_mode_with_mention_only(
+    group_reply: Option<&GroupReplyConfig>,
+    mention_only: bool,
+) -> GroupReplyMode {
+    resolve_group_reply_mode(group_reply, Some(mention_only), GroupReplyMode::AllMessages)
+}
+
+fn effective_group_reply_mode_all_messages(
+    group_reply: Option<&GroupReplyConfig>,
+) -> GroupReplyMode {
+    resolve_group_reply_mode(group_reply, None, GroupReplyMode::AllMessages)
+}
+
 /// Telegram bot channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TelegramConfig {
@@ -4919,11 +5003,7 @@ impl ChannelConfig for TelegramConfig {
 impl TelegramConfig {
     #[must_use]
     pub fn effective_group_reply_mode(&self) -> GroupReplyMode {
-        resolve_group_reply_mode(
-            self.group_reply.as_ref(),
-            Some(self.mention_only),
-            GroupReplyMode::AllMessages,
-        )
+        effective_group_reply_mode_with_mention_only(self.group_reply.as_ref(), self.mention_only)
     }
 
     #[must_use]
@@ -4967,11 +5047,7 @@ impl ChannelConfig for DiscordConfig {
 impl DiscordConfig {
     #[must_use]
     pub fn effective_group_reply_mode(&self) -> GroupReplyMode {
-        resolve_group_reply_mode(
-            self.group_reply.as_ref(),
-            Some(self.mention_only),
-            GroupReplyMode::AllMessages,
-        )
+        effective_group_reply_mode_with_mention_only(self.group_reply.as_ref(), self.mention_only)
     }
 
     #[must_use]
@@ -5015,7 +5091,7 @@ impl ChannelConfig for SlackConfig {
 impl SlackConfig {
     #[must_use]
     pub fn effective_group_reply_mode(&self) -> GroupReplyMode {
-        resolve_group_reply_mode(self.group_reply.as_ref(), None, GroupReplyMode::AllMessages)
+        effective_group_reply_mode_all_messages(self.group_reply.as_ref())
     }
 
     #[must_use]
@@ -5061,10 +5137,9 @@ impl ChannelConfig for MattermostConfig {
 impl MattermostConfig {
     #[must_use]
     pub fn effective_group_reply_mode(&self) -> GroupReplyMode {
-        resolve_group_reply_mode(
+        effective_group_reply_mode_with_mention_only(
             self.group_reply.as_ref(),
-            Some(self.mention_only.unwrap_or(false)),
-            GroupReplyMode::AllMessages,
+            self.mention_only.unwrap_or(false),
         )
     }
 
@@ -5578,11 +5653,7 @@ impl ChannelConfig for LarkConfig {
 impl LarkConfig {
     #[must_use]
     pub fn effective_group_reply_mode(&self) -> GroupReplyMode {
-        resolve_group_reply_mode(
-            self.group_reply.as_ref(),
-            Some(self.mention_only),
-            GroupReplyMode::AllMessages,
-        )
+        effective_group_reply_mode_with_mention_only(self.group_reply.as_ref(), self.mention_only)
     }
 
     #[must_use]
@@ -5640,7 +5711,7 @@ impl ChannelConfig for FeishuConfig {
 impl FeishuConfig {
     #[must_use]
     pub fn effective_group_reply_mode(&self) -> GroupReplyMode {
-        resolve_group_reply_mode(self.group_reply.as_ref(), None, GroupReplyMode::AllMessages)
+        effective_group_reply_mode_all_messages(self.group_reply.as_ref())
     }
 
     #[must_use]
@@ -7884,24 +7955,31 @@ impl Config {
         }
     }
 
-    /// Validate configuration values that would cause runtime failures.
-    ///
-    /// Called after TOML deserialization and env-override application to catch
-    /// obviously invalid values early instead of failing at arbitrary runtime points.
-    pub fn validate(&self) -> Result<()> {
-        if let Some(acp) = &self.channels_config.acp {
-            acp.validate()?;
-        }
-
-        // Gateway
-        if self.gateway.host.trim().is_empty() {
-            anyhow::bail!("gateway.host must not be empty");
-        }
-
-        // Autonomy
+    fn validate_autonomy_config(&self) -> Result<()> {
         if self.autonomy.max_actions_per_hour == 0 {
             anyhow::bail!("autonomy.max_actions_per_hour must be greater than 0");
         }
+
+        self.validate_allowed_commands()?;
+        self.validate_shell_env_passthrough()?;
+        self.validate_command_context_rules()?;
+        self.validate_non_cli_excluded_tools()?;
+        Ok(())
+    }
+
+    fn validate_allowed_commands(&self) -> Result<()> {
+        let mut seen_allowed_commands = std::collections::HashSet::new();
+        for (i, command) in self.autonomy.allowed_commands.iter().enumerate() {
+            validate_command_matcher(command, &format!("autonomy.allowed_commands[{i}]"), true)?;
+            let normalized = command.trim().to_ascii_lowercase();
+            if !seen_allowed_commands.insert(normalized.clone()) {
+                anyhow::bail!("autonomy.allowed_commands contains duplicate entry: {normalized}");
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_shell_env_passthrough(&self) -> Result<()> {
         for (i, env_name) in self.autonomy.shell_env_passthrough.iter().enumerate() {
             if !is_valid_env_var_name(env_name) {
                 anyhow::bail!(
@@ -7909,61 +7987,32 @@ impl Config {
                 );
             }
         }
+        Ok(())
+    }
+
+    fn validate_command_context_rules(&self) -> Result<()> {
         for (i, rule) in self.autonomy.command_context_rules.iter().enumerate() {
-            let command = rule.command.trim();
-            if command.is_empty() {
-                anyhow::bail!("autonomy.command_context_rules[{i}].command must not be empty");
-            }
-            if !command
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '/' | '.' | '*'))
-            {
-                anyhow::bail!(
-                    "autonomy.command_context_rules[{i}].command contains invalid characters: {command}"
-                );
-            }
-
-            for (j, domain) in rule.allowed_domains.iter().enumerate() {
-                let normalized = domain.trim();
-                if normalized.is_empty() {
-                    anyhow::bail!(
-                        "autonomy.command_context_rules[{i}].allowed_domains[{j}] must not be empty"
-                    );
-                }
-                if normalized.chars().any(char::is_whitespace) {
-                    anyhow::bail!(
-                        "autonomy.command_context_rules[{i}].allowed_domains[{j}] must not contain whitespace"
-                    );
-                }
-            }
-
-            for (j, prefix) in rule.allowed_path_prefixes.iter().enumerate() {
-                let normalized = prefix.trim();
-                if normalized.is_empty() {
-                    anyhow::bail!(
-                        "autonomy.command_context_rules[{i}].allowed_path_prefixes[{j}] must not be empty"
-                    );
-                }
-                if normalized.contains('\0') {
-                    anyhow::bail!(
-                        "autonomy.command_context_rules[{i}].allowed_path_prefixes[{j}] must not contain null bytes"
-                    );
-                }
-            }
-            for (j, prefix) in rule.denied_path_prefixes.iter().enumerate() {
-                let normalized = prefix.trim();
-                if normalized.is_empty() {
-                    anyhow::bail!(
-                        "autonomy.command_context_rules[{i}].denied_path_prefixes[{j}] must not be empty"
-                    );
-                }
-                if normalized.contains('\0') {
-                    anyhow::bail!(
-                        "autonomy.command_context_rules[{i}].denied_path_prefixes[{j}] must not contain null bytes"
-                    );
-                }
-            }
+            validate_command_matcher(
+                &rule.command,
+                &format!("autonomy.command_context_rules[{i}].command"),
+                false,
+            )?;
+            validate_command_context_domains(i, &rule.allowed_domains)?;
+            validate_command_context_path_prefixes(
+                i,
+                "allowed_path_prefixes",
+                &rule.allowed_path_prefixes,
+            )?;
+            validate_command_context_path_prefixes(
+                i,
+                "denied_path_prefixes",
+                &rule.denied_path_prefixes,
+            )?;
         }
+        Ok(())
+    }
+
+    fn validate_non_cli_excluded_tools(&self) -> Result<()> {
         let mut seen_non_cli_excluded = std::collections::HashSet::new();
         for (i, tool_name) in self.autonomy.non_cli_excluded_tools.iter().enumerate() {
             let normalized = tool_name.trim();
@@ -7984,6 +8033,25 @@ impl Config {
                 );
             }
         }
+        Ok(())
+    }
+
+    /// Validate configuration values that would cause runtime failures.
+    ///
+    /// Called after TOML deserialization and env-override application to catch
+    /// obviously invalid values early instead of failing at arbitrary runtime points.
+    pub fn validate(&self) -> Result<()> {
+        if let Some(acp) = &self.channels_config.acp {
+            acp.validate()?;
+        }
+
+        // Gateway
+        if self.gateway.host.trim().is_empty() {
+            anyhow::bail!("gateway.host must not be empty");
+        }
+
+        // Autonomy
+        self.validate_autonomy_config()?;
 
         // Security OTP / estop
         if self.security.otp.token_ttl_secs == 0 {
@@ -9834,6 +9902,34 @@ allowed_roots = []
         assert!(err
             .to_string()
             .contains("autonomy.command_context_rules[0].command"));
+    }
+
+    #[test]
+    async fn config_validate_rejects_allowed_command_with_whitespace() {
+        let mut cfg = Config::default();
+        cfg.autonomy.allowed_commands = vec!["git status".into()];
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("autonomy.allowed_commands[0] must not contain whitespace"));
+    }
+
+    #[test]
+    async fn config_validate_rejects_duplicate_allowed_commands() {
+        let mut cfg = Config::default();
+        cfg.autonomy.allowed_commands = vec!["git".into(), " Git ".into()];
+        let err = cfg.validate().unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("autonomy.allowed_commands contains duplicate entry"));
+    }
+
+    #[test]
+    async fn config_validate_allows_path_like_allowed_command_matcher() {
+        let mut cfg = Config::default();
+        cfg.autonomy.allowed_commands = vec!["/usr/bin/git".into(), "*".into()];
+        cfg.validate()
+            .expect("path-like allowed_commands entries should validate");
     }
 
     #[test]
@@ -13640,9 +13736,8 @@ default_model = "legacy-model"
         assert_eq!(parsed.boards[0].path.as_deref(), Some("/dev/ttyACM0"));
     }
 
-    #[test]
-    async fn lark_config_serde() {
-        let lc = LarkConfig {
+    fn test_lark_config() -> LarkConfig {
+        LarkConfig {
             app_id: "cli_123456".into(),
             app_secret: "secret_abc".into(),
             encrypt_key: Some("encrypt_key".into()),
@@ -13650,13 +13745,35 @@ default_model = "legacy-model"
             allowed_users: vec!["user_123".into(), "user_456".into()],
             mention_only: false,
             group_reply: None,
-            use_feishu: true,
+            use_feishu: false,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             draft_update_interval_ms: default_lark_draft_update_interval_ms(),
             max_draft_edits: default_lark_max_draft_edits(),
             progress_mode: ProgressMode::default(),
-        };
+        }
+    }
+
+    fn test_feishu_config() -> FeishuConfig {
+        FeishuConfig {
+            app_id: "cli_feishu_123".into(),
+            app_secret: "secret_abc".into(),
+            encrypt_key: Some("encrypt_key".into()),
+            verification_token: Some("verify_token".into()),
+            allowed_users: vec!["user_123".into(), "user_456".into()],
+            group_reply: None,
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
+            max_draft_edits: default_lark_max_draft_edits(),
+            progress_mode: ProgressMode::default(),
+        }
+    }
+
+    #[test]
+    async fn lark_config_serde() {
+        let mut lc = test_lark_config();
+        lc.use_feishu = true;
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.app_id, "cli_123456");
@@ -13669,21 +13786,10 @@ default_model = "legacy-model"
 
     #[test]
     async fn lark_config_toml_roundtrip() {
-        let lc = LarkConfig {
-            app_id: "cli_123456".into(),
-            app_secret: "secret_abc".into(),
-            encrypt_key: Some("encrypt_key".into()),
-            verification_token: Some("verify_token".into()),
-            allowed_users: vec!["*".into()],
-            mention_only: false,
-            group_reply: None,
-            use_feishu: false,
-            receive_mode: LarkReceiveMode::Webhook,
-            port: Some(9898),
-            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
-            max_draft_edits: default_lark_max_draft_edits(),
-            progress_mode: ProgressMode::default(),
-        };
+        let mut lc = test_lark_config();
+        lc.allowed_users = vec!["*".into()];
+        lc.receive_mode = LarkReceiveMode::Webhook;
+        lc.port = Some(9898);
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.app_id, "cli_123456");
@@ -13748,19 +13854,7 @@ default_model = "legacy-model"
 
     #[test]
     async fn feishu_config_serde() {
-        let fc = FeishuConfig {
-            app_id: "cli_feishu_123".into(),
-            app_secret: "secret_abc".into(),
-            encrypt_key: Some("encrypt_key".into()),
-            verification_token: Some("verify_token".into()),
-            allowed_users: vec!["user_123".into(), "user_456".into()],
-            group_reply: None,
-            receive_mode: LarkReceiveMode::Websocket,
-            port: None,
-            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
-            max_draft_edits: default_lark_max_draft_edits(),
-            progress_mode: ProgressMode::default(),
-        };
+        let fc = test_feishu_config();
         let json = serde_json::to_string(&fc).unwrap();
         let parsed: FeishuConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.app_id, "cli_feishu_123");
@@ -13772,19 +13866,10 @@ default_model = "legacy-model"
 
     #[test]
     async fn feishu_config_toml_roundtrip() {
-        let fc = FeishuConfig {
-            app_id: "cli_feishu_123".into(),
-            app_secret: "secret_abc".into(),
-            encrypt_key: Some("encrypt_key".into()),
-            verification_token: Some("verify_token".into()),
-            allowed_users: vec!["*".into()],
-            group_reply: None,
-            receive_mode: LarkReceiveMode::Webhook,
-            port: Some(9898),
-            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
-            max_draft_edits: default_lark_max_draft_edits(),
-            progress_mode: ProgressMode::default(),
-        };
+        let mut fc = test_feishu_config();
+        fc.allowed_users = vec!["*".into()];
+        fc.receive_mode = LarkReceiveMode::Webhook;
+        fc.port = Some(9898);
         let toml_str = toml::to_string(&fc).unwrap();
         let parsed: FeishuConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.app_id, "cli_feishu_123");
@@ -13851,19 +13936,13 @@ use_feishu = true
     #[test]
     async fn feishu_legacy_mention_only_maps_to_group_reply_mode() {
         let mut parsed = Config::default();
-        parsed.channels_config.feishu = Some(FeishuConfig {
-            app_id: "cli_123".into(),
-            app_secret: "secret".into(),
-            encrypt_key: None,
-            verification_token: None,
-            allowed_users: vec![],
-            group_reply: None,
-            receive_mode: LarkReceiveMode::Websocket,
-            port: None,
-            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
-            max_draft_edits: default_lark_max_draft_edits(),
-            progress_mode: ProgressMode::default(),
-        });
+        let mut feishu = test_feishu_config();
+        feishu.app_id = "cli_123".into();
+        feishu.app_secret = "secret".into();
+        feishu.encrypt_key = None;
+        feishu.verification_token = None;
+        feishu.allowed_users.clear();
+        parsed.channels_config.feishu = Some(feishu);
 
         apply_feishu_legacy_compat(&mut parsed, Some(true), true, true, true);
 
@@ -13880,22 +13959,17 @@ use_feishu = true
     #[test]
     async fn feishu_legacy_mention_only_does_not_override_group_reply() {
         let mut parsed = Config::default();
-        parsed.channels_config.feishu = Some(FeishuConfig {
-            app_id: "cli_123".into(),
-            app_secret: "secret".into(),
-            encrypt_key: None,
-            verification_token: None,
-            allowed_users: vec![],
-            group_reply: Some(GroupReplyConfig {
-                mode: Some(GroupReplyMode::AllMessages),
-                allowed_sender_ids: vec![],
-            }),
-            receive_mode: LarkReceiveMode::Websocket,
-            port: None,
-            draft_update_interval_ms: default_lark_draft_update_interval_ms(),
-            max_draft_edits: default_lark_max_draft_edits(),
-            progress_mode: ProgressMode::default(),
+        let mut feishu = test_feishu_config();
+        feishu.app_id = "cli_123".into();
+        feishu.app_secret = "secret".into();
+        feishu.encrypt_key = None;
+        feishu.verification_token = None;
+        feishu.allowed_users.clear();
+        feishu.group_reply = Some(GroupReplyConfig {
+            mode: Some(GroupReplyMode::AllMessages),
+            allowed_sender_ids: vec![],
         });
+        parsed.channels_config.feishu = Some(feishu);
 
         apply_feishu_legacy_compat(&mut parsed, Some(true), false, true, false);
 

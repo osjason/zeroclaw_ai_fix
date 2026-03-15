@@ -1,11 +1,12 @@
 use crate::agent::prompt::build_post_action_verification_retry_prompt;
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::channels::progress_event::{
-    extract_embedded_security_block_message, format_tool_policy_block_event_from_args_with_context,
+    format_tool_policy_block_event_from_args_with_context_and_trace,
+    policy_block_reason_candidates_from_outcome_fields,
     render_policy_block_constraint_guidance_with_context,
-    render_policy_block_constraint_summary_with_config_key,
-    summarize_tool_policy_block_progress, summarize_tool_policy_block_progress_from_outcome,
-    truncate_tool_args_for_progress,
+    render_policy_block_constraint_summary_with_config_key, render_tool_progress_completed_line,
+    render_tool_progress_running_line, summarize_tool_policy_block_progress_from_outcome,
+    truncate_tool_args_for_progress, ToolPolicyBlockTrace,
 };
 use crate::config::schema::{CostEnforcementMode, ModelPricing};
 use crate::config::{Config, ProgressMode};
@@ -17,7 +18,7 @@ use crate::providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
 };
 use crate::runtime;
-use crate::security::{policy::parse_command_policy_block_event, SecurityPolicy};
+use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -45,6 +46,10 @@ mod execution;
 mod history;
 pub(crate) mod parsing;
 
+#[cfg(test)]
+use crate::channels::progress_event::summarize_tool_policy_block_progress;
+#[cfg(test)]
+use crate::security::policy::parse_command_policy_block_event;
 use context::{build_context, build_hardware_context};
 use detection::{DetectionVerdict, LoopDetectionConfig, LoopDetector};
 use execution::{
@@ -485,49 +490,6 @@ struct ProgressEntry {
     completion: Option<(bool, u64, Option<String>)>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ToolProgressSignal<'a> {
-    Running {
-        tool_name: &'a str,
-        hint: &'a str,
-    },
-    Completed {
-        tool_name: &'a str,
-        secs: u64,
-        success: bool,
-        detail: Option<&'a str>,
-    },
-}
-
-fn render_tool_progress_signal(signal: ToolProgressSignal<'_>) -> String {
-    let mut line = String::new();
-    match signal {
-        ToolProgressSignal::Running { tool_name, hint } => {
-            let _ = write!(line, "\u{23f3} {tool_name}");
-            if !hint.is_empty() {
-                let _ = write!(line, ": {hint}");
-            }
-        }
-        ToolProgressSignal::Completed {
-            tool_name,
-            secs,
-            success,
-            detail,
-        } => {
-            let mark = if success { "\u{2705}" } else { "\u{274c}" };
-            let _ = write!(line, "{mark} {tool_name} ({secs}s)");
-            if !success {
-                if let Some(detail) = detail {
-                    if !detail.is_empty() {
-                        let _ = write!(line, ": {detail}");
-                    }
-                }
-            }
-        }
-    }
-    line
-}
-
 #[derive(Debug, Default)]
 struct ProgressTracker {
     entries: Vec<ProgressEntry>,
@@ -554,18 +516,13 @@ impl ProgressTracker {
         let mut out = String::from(DRAFT_PROGRESS_BLOCK_SENTINEL);
         for entry in &self.entries {
             let line = match &entry.completion {
-                None => render_tool_progress_signal(ToolProgressSignal::Running {
-                    tool_name: &entry.name,
-                    hint: &entry.hint,
-                }),
-                Some((success, secs, detail)) => {
-                    render_tool_progress_signal(ToolProgressSignal::Completed {
-                        tool_name: &entry.name,
-                        secs: *secs,
-                        success: *success,
-                        detail: detail.as_deref(),
-                    })
-                }
+                None => render_tool_progress_running_line(&entry.name, &entry.hint),
+                Some((success, secs, detail)) => render_tool_progress_completed_line(
+                    &entry.name,
+                    *secs,
+                    *success,
+                    detail.as_deref(),
+                ),
             };
             out.push_str(&line);
             out.push('\n');
@@ -580,25 +537,34 @@ async fn emit_policy_block_progress_detail_delta(
     detail: Option<&str>,
 ) {
     if let (Some(tx), Some(detail)) = (on_delta, detail) {
-        let line = render_tool_progress_signal(ToolProgressSignal::Completed {
-            tool_name,
-            secs,
-            success: false,
-            detail: Some(detail),
-        });
+        let line = render_tool_progress_completed_line(tool_name, secs, false, Some(detail));
         let line = format!("{DRAFT_PROGRESS_SENTINEL}{line}\n");
         let _ = tx.send(line).await;
     }
 }
 
-async fn emit_policy_block_progress_from_outcome(
+async fn complete_tool_progress_and_emit_delta(
+    progress_tracker: &mut ProgressTracker,
+    progress_idx: Option<usize>,
+    progress_mode: ProgressMode,
     on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
     tool_name: &str,
+    success: bool,
     secs: u64,
-    outcome: &ToolExecutionOutcome,
+    detail: Option<&str>,
 ) {
-    let detail = summarize_policy_block_progress_from_outcome(tool_name, outcome);
-    emit_policy_block_progress_detail_delta(on_delta, tool_name, secs, detail.as_deref()).await;
+    if let Some(idx) = progress_idx {
+        progress_tracker.complete(idx, success, secs, detail);
+        if let Some(tx) = on_delta {
+            tracing::debug!(tool = %tool_name, secs, "Sending progress complete to draft");
+            let _ = tx.send(progress_tracker.render_delta()).await;
+        }
+        return;
+    }
+
+    if progress_mode == ProgressMode::Off {
+        emit_policy_block_progress_detail_delta(on_delta, tool_name, secs, detail).await;
+    }
 }
 
 async fn store_blocked_outcome_and_emit_progress(
@@ -607,74 +573,183 @@ async fn store_blocked_outcome_and_emit_progress(
     tool_name: String,
     tool_call_id: Option<String>,
     outcome: ToolExecutionOutcome,
+    blocked_detail: Option<String>,
     on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
 ) {
     ordered_results[idx] = Some((tool_name.clone(), tool_call_id, outcome));
-    if let Some((_, _, stored_outcome)) = ordered_results[idx].as_ref() {
-        emit_policy_block_progress_from_outcome(on_delta, &tool_name, 0, stored_outcome).await;
+    let detail = match blocked_detail {
+        Some(detail) => Some(detail),
+        None => ordered_results[idx]
+            .as_ref()
+            .and_then(|(stored_tool_name, _, stored_outcome)| {
+                summarize_runtime_constraint_outcome(stored_tool_name, stored_outcome)
+            }),
+    };
+    if let Some(detail) = detail.as_deref() {
+        emit_policy_block_progress_detail_delta(on_delta, &tool_name, 0, Some(detail)).await;
     }
 }
 
-fn summarize_policy_block_progress_from_outcome(
+struct ToolLoopTraceContext<'a> {
+    channel_name: &'a str,
+    provider_name: &'a str,
+    active_model: &'a str,
+    turn_id: &'a str,
+    iteration: usize,
+}
+
+struct ToolPolicyBlockRecord {
+    trace: ToolPolicyBlockTrace,
+    outcome: ToolExecutionOutcome,
+}
+
+impl ToolPolicyBlockRecord {
+    fn new(
+        policy_id: &'static str,
+        reason: impl Into<String>,
+        tool_name: &str,
+        tool_args: &serde_json::Value,
+    ) -> Self {
+        let trace = format_tool_policy_block_event_from_args_with_context_and_trace(
+            policy_id,
+            reason,
+            tool_name,
+            tool_args,
+            TOOL_POLICY_BLOCK_HINT_MAX_CHARS,
+        );
+        let outcome = ToolExecutionOutcome {
+            output: trace.blocked.clone(),
+            success: false,
+            error_reason: Some(trace.blocked.clone()),
+            duration: Duration::ZERO,
+        };
+        Self { trace, outcome }
+    }
+
+    fn progress_detail(&self) -> Option<String> {
+        self.trace.progress_summary.clone()
+    }
+
+    fn runtime_trace_metadata(
+        &self,
+        trace: &ToolLoopTraceContext<'_>,
+        tool_name: &str,
+        tool_args: &serde_json::Value,
+        blocked_by_channel_policy: bool,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "iteration": trace.iteration + 1,
+            "tool": tool_name,
+            "arguments": scrub_credentials(&tool_args.to_string()),
+            "blocked_by_channel_policy": blocked_by_channel_policy,
+            "blocked_policy_id": self.trace.policy_id,
+            "blocked_command": self.trace.command,
+            "blocked_config_key": self.trace.config_key,
+            "blocked_command_context": self.trace.command_context,
+        })
+    }
+
+    fn record_runtime_trace(
+        &self,
+        trace: &ToolLoopTraceContext<'_>,
+        tool_name: &str,
+        tool_args: &serde_json::Value,
+        blocked_by_channel_policy: bool,
+    ) {
+        runtime_trace::record_event(
+            "tool_call_result",
+            Some(trace.channel_name),
+            Some(trace.provider_name),
+            Some(trace.active_model),
+            Some(trace.turn_id),
+            Some(false),
+            Some(&self.trace.blocked),
+            self.runtime_trace_metadata(trace, tool_name, tool_args, blocked_by_channel_policy),
+        );
+    }
+
+    async fn store(
+        self,
+        ordered_results: &mut [Option<(String, Option<String>, ToolExecutionOutcome)>],
+        idx: usize,
+        tool_name: &str,
+        tool_call_id: Option<String>,
+        on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
+    ) {
+        let blocked_detail = self.progress_detail();
+        let outcome = self.outcome;
+        store_blocked_outcome_and_emit_progress(
+            ordered_results,
+            idx,
+            tool_name.to_string(),
+            tool_call_id,
+            outcome,
+            blocked_detail,
+            on_delta,
+        )
+        .await;
+    }
+}
+
+async fn build_record_and_store_tool_policy_block(
+    ordered_results: &mut [Option<(String, Option<String>, ToolExecutionOutcome)>],
+    idx: usize,
+    policy_id: &'static str,
+    reason: impl Into<String>,
     tool_name: &str,
-    outcome: &ToolExecutionOutcome,
-) -> Option<String> {
-    summarize_tool_policy_block_progress_from_outcome(
-        tool_name,
-        outcome.error_reason.as_deref(),
-        outcome.output.as_str(),
-    )
+    tool_args: &serde_json::Value,
+    tool_call_id: Option<String>,
+    on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
+    trace: &ToolLoopTraceContext<'_>,
+    blocked_by_channel_policy: bool,
+) {
+    let blocked = ToolPolicyBlockRecord::new(policy_id, reason, tool_name, tool_args);
+    blocked.record_runtime_trace(trace, tool_name, tool_args, blocked_by_channel_policy);
+    blocked
+        .store(ordered_results, idx, tool_name, tool_call_id, on_delta)
+        .await;
 }
 
 fn runtime_constraint_reason_candidates_from_outcome<'a>(
     outcome: &'a ToolExecutionOutcome,
 ) -> Vec<&'a str> {
-    let mut reasons = Vec::new();
-
-    if let Some(reason) = outcome.error_reason.as_deref() {
-        let trimmed = reason.trim();
-        if !trimmed.is_empty() {
-            reasons.push(trimmed);
-        }
-    }
-
-    let output = outcome.output.trim();
-    if !output.is_empty() && parse_command_policy_block_event(output).is_some() {
-        if !reasons.iter().any(|candidate| *candidate == output) {
-            reasons.push(output);
-        }
-    }
-
-    if let Some(embedded) = extract_embedded_security_block_message(&outcome.output) {
-        let trimmed = embedded.trim();
-        if !trimmed.is_empty() && !reasons.iter().any(|candidate| *candidate == trimmed) {
-            reasons.push(trimmed);
-        }
-    }
-
-    reasons
+    policy_block_reason_candidates_from_outcome_fields(
+        outcome.error_reason.as_deref(),
+        outcome.output.as_str(),
+    )
 }
 
-fn build_tool_policy_blocked_result(
-    policy_id: &'static str,
-    reason: impl Into<String>,
+fn summarize_runtime_constraint_outcome(
     tool_name: &str,
-    tool_args: &serde_json::Value,
-) -> (String, ToolExecutionOutcome) {
-    let blocked = format_tool_policy_block_event_from_args_with_context(
-        policy_id,
-        reason,
+    outcome: &ToolExecutionOutcome,
+) -> Option<String> {
+    for reason in runtime_constraint_reason_candidates_from_outcome(outcome) {
+        let normalized = normalize_runtime_constraint_reason(reason);
+        if !normalized.is_empty() {
+            let normalized = truncate_with_ellipsis(&normalized, 280);
+            if !normalized.is_empty() {
+                return Some(normalized);
+            }
+        }
+    }
+
+    if let Some(summary) = summarize_tool_policy_block_progress_from_outcome(
         tool_name,
-        tool_args,
-        TOOL_POLICY_BLOCK_HINT_MAX_CHARS,
-    );
-    let outcome = ToolExecutionOutcome {
-        output: blocked.clone(),
-        success: false,
-        error_reason: Some(blocked.clone()),
-        duration: Duration::ZERO,
-    };
-    (blocked, outcome)
+        outcome.error_reason.as_deref(),
+        outcome.output.as_str(),
+    ) {
+        let summary = truncate_with_ellipsis(&summary, 280);
+        if !summary.is_empty() {
+            return Some(summary);
+        }
+    }
+
+    summarize_runtime_constraint_reasons(
+        runtime_constraint_reason_candidates_from_outcome(outcome),
+        1,
+    )
+    .into_iter()
+    .next()
 }
 
 pub(crate) fn looks_like_deferred_action_without_tool_call(text: &str) -> bool {
@@ -721,10 +796,6 @@ fn references_workspace_path_policy_knobs(lower_reason: &str) -> bool {
 }
 
 pub(crate) fn looks_like_runtime_constraint_reason(reason: &str) -> bool {
-    if parse_command_policy_block_event(reason).is_some() {
-        return true;
-    }
-
     if render_policy_block_constraint_summary_with_config_key(reason, 48).is_some() {
         return true;
     }
@@ -747,8 +818,7 @@ pub(crate) fn normalize_runtime_constraint_reason(reason: &str) -> String {
         return String::new();
     }
 
-    if let Some(guidance) = render_policy_block_constraint_guidance_with_context(trimmed, 72, 120)
-    {
+    if let Some(guidance) = render_policy_block_constraint_guidance_with_context(trimmed, 72, 120) {
         return guidance;
     }
 
@@ -804,6 +874,27 @@ where
             summaries.push(normalized);
             if summaries.len() >= max_items {
                 break;
+            }
+        }
+    }
+
+    summaries
+}
+
+fn summarize_runtime_constraint_outcomes<'a, I>(results: I, max_items: usize) -> Vec<String>
+where
+    I: IntoIterator<Item = (&'a str, &'a ToolExecutionOutcome)>,
+{
+    let mut summaries = Vec::new();
+    let mut seen = HashSet::new();
+
+    for (tool_name, outcome) in results {
+        if let Some(summary) = summarize_runtime_constraint_outcome(tool_name, outcome) {
+            if seen.insert(summary.clone()) {
+                summaries.push(summary);
+                if summaries.len() >= max_items {
+                    break;
+                }
             }
         }
     }
@@ -989,8 +1080,9 @@ impl ToolCallFollowthroughRequirement {
 
     fn progress_retry_line(&self, attempt: usize) -> String {
         match self {
-            Self::PostActionVerification { .. } => format!(
-                "{DRAFT_PROGRESS_SENTINEL}\u{21bb} Retrying to enforce post-action verification (attempt {attempt})\n"
+            Self::PostActionVerification { requirement } => format!(
+                "{DRAFT_PROGRESS_SENTINEL}\u{21bb} Retrying to enforce post-action verification for {} (attempt {attempt})\n",
+                truncate_with_ellipsis(requirement, 120)
             ),
             Self::RetryToolCall { .. } => format!(
                 "{DRAFT_PROGRESS_SENTINEL}\u{21bb} Retrying after malformed or incomplete tool call (attempt {attempt})\n"
@@ -1021,6 +1113,66 @@ fn determine_tool_call_followthrough_requirement(
         });
     }
     None
+}
+
+async fn queue_tool_call_followthrough_retry(
+    requirement: &ToolCallFollowthroughRequirement,
+    attempt: usize,
+    tools_available: bool,
+    progress_mode: ProgressMode,
+    on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
+    channel_name: &str,
+    provider_name: &str,
+    active_model: &str,
+    turn_id: &str,
+    iteration: usize,
+    display_text: &str,
+) -> Result<String> {
+    if let ToolCallFollowthroughRequirement::PostActionVerification { requirement } = requirement {
+        if !tools_available {
+            runtime_trace::record_event(
+                "post_action_verification_unavailable",
+                Some(channel_name),
+                Some(provider_name),
+                Some(active_model),
+                Some(turn_id),
+                Some(false),
+                Some("post-action verification required but no tools are available"),
+                serde_json::json!({
+                    "iteration": iteration + 1,
+                    "requirement": requirement,
+                }),
+            );
+            anyhow::bail!(
+                "Post-action verification required ({}) but no tools are available in current context",
+                requirement
+            );
+        }
+    }
+
+    runtime_trace::record_event(
+        "tool_call_followthrough_retry",
+        Some(channel_name),
+        Some(provider_name),
+        Some(active_model),
+        Some(turn_id),
+        Some(true),
+        Some("llm response implied follow-up action but emitted no tool call"),
+        serde_json::json!({
+            "iteration": iteration + 1,
+            "reason": requirement.reason(),
+            "attempt": attempt,
+            "response_excerpt": truncate_with_ellipsis(&scrub_credentials(display_text), 600),
+        }),
+    );
+
+    if should_emit_verbose_progress(progress_mode) {
+        if let Some(tx) = on_delta {
+            let _ = tx.send(requirement.progress_retry_line(attempt)).await;
+        }
+    }
+
+    Ok(requirement.retry_prompt(attempt))
 }
 
 #[derive(Default)]
@@ -2095,58 +2247,23 @@ pub(crate) async fn run_tool_call_loop(
                 !tool_specs.is_empty(),
             );
             if let Some(requirement) = followthrough_requirement {
-                if let ToolCallFollowthroughRequirement::PostActionVerification { requirement } =
-                    &requirement
-                {
-                    if tool_specs.is_empty() {
-                        runtime_trace::record_event(
-                            "post_action_verification_unavailable",
-                            Some(channel_name),
-                            Some(provider_name),
-                            Some(active_model.as_str()),
-                            Some(&turn_id),
-                            Some(false),
-                            Some("post-action verification required but no tools are available"),
-                            serde_json::json!({
-                                "iteration": iteration + 1,
-                                "requirement": requirement,
-                            }),
-                        );
-                        anyhow::bail!(
-                            "Post-action verification required ({}) but no tools are available in current context",
-                            requirement
-                        );
-                    }
-                }
-
                 missing_tool_call_retry_attempts += 1;
-                let retry_reason = requirement.reason();
-                missing_tool_call_retry_prompt =
-                    Some(requirement.retry_prompt(missing_tool_call_retry_attempts));
-
-                runtime_trace::record_event(
-                    "tool_call_followthrough_retry",
-                    Some(channel_name),
-                    Some(provider_name),
-                    Some(active_model.as_str()),
-                    Some(&turn_id),
-                    Some(true),
-                    Some("llm response implied follow-up action but emitted no tool call"),
-                    serde_json::json!({
-                        "iteration": iteration + 1,
-                        "reason": retry_reason,
-                        "attempt": missing_tool_call_retry_attempts,
-                        "response_excerpt": truncate_with_ellipsis(&scrub_credentials(&display_text), 600),
-                    }),
+                missing_tool_call_retry_prompt = Some(
+                    queue_tool_call_followthrough_retry(
+                        &requirement,
+                        missing_tool_call_retry_attempts,
+                        !tool_specs.is_empty(),
+                        progress_mode,
+                        on_delta.as_ref(),
+                        channel_name,
+                        provider_name,
+                        active_model.as_str(),
+                        &turn_id,
+                        iteration,
+                        &display_text,
+                    )
+                    .await?,
                 );
-
-                if should_emit_verbose_progress(progress_mode) {
-                    if let Some(ref tx) = on_delta {
-                        let retry_line =
-                            requirement.progress_retry_line(missing_tool_call_retry_attempts);
-                        let _ = tx.send(retry_line).await;
-                    }
-                }
 
                 continue;
             }
@@ -2220,6 +2337,13 @@ pub(crate) async fn run_tool_call_loop(
         let mut executable_indices: Vec<usize> = Vec::new();
         let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
         let mut progress_indices: Vec<Option<usize>> = Vec::new();
+        let trace_context = ToolLoopTraceContext {
+            channel_name,
+            provider_name,
+            active_model: active_model.as_str(),
+            turn_id: &turn_id,
+            iteration,
+        };
 
         for (idx, call) in tool_calls.iter().enumerate() {
             // ── Hook: before_tool_call (modifying) ──────────
@@ -2275,34 +2399,17 @@ pub(crate) async fn run_tool_call_loop(
 
             if excluded_tools.iter().any(|ex| ex == &tool_name) {
                 let reason = format!("Tool '{tool_name}' is not available in this channel.");
-                let (blocked, outcome) = build_tool_policy_blocked_result(
+                build_record_and_store_tool_policy_block(
+                    &mut ordered_results,
+                    idx,
                     "runtime.channel.excluded_tools",
                     reason,
                     &tool_name,
                     &tool_args,
-                );
-                runtime_trace::record_event(
-                    "tool_call_result",
-                    Some(channel_name),
-                    Some(provider_name),
-                    Some(active_model.as_str()),
-                    Some(&turn_id),
-                    Some(false),
-                    Some(&blocked),
-                    serde_json::json!({
-                        "iteration": iteration + 1,
-                        "tool": tool_name.clone(),
-                        "arguments": scrub_credentials(&tool_args.to_string()),
-                        "blocked_by_channel_policy": true,
-                    }),
-                );
-                store_blocked_outcome_and_emit_progress(
-                    &mut ordered_results,
-                    idx,
-                    tool_name.clone(),
                     call.tool_call_id.clone(),
-                    outcome,
                     on_delta.as_ref(),
+                    &trace_context,
+                    true,
                 )
                 .await;
                 continue;
@@ -2394,33 +2501,17 @@ pub(crate) async fn run_tool_call_loop(
                     mgr.record_decision(&tool_name, &tool_args, decision, channel_name);
 
                     if decision == ApprovalResponse::No {
-                        let (denied, outcome) = build_tool_policy_blocked_result(
+                        build_record_and_store_tool_policy_block(
+                            &mut ordered_results,
+                            idx,
                             denied_policy,
                             denied_reason,
                             &tool_name,
                             &tool_args,
-                        );
-                        runtime_trace::record_event(
-                            "tool_call_result",
-                            Some(channel_name),
-                            Some(provider_name),
-                            Some(active_model.as_str()),
-                            Some(&turn_id),
-                            Some(false),
-                            Some(&denied),
-                            serde_json::json!({
-                                "iteration": iteration + 1,
-                                "tool": tool_name.clone(),
-                                "arguments": scrub_credentials(&tool_args.to_string()),
-                            }),
-                        );
-                        store_blocked_outcome_and_emit_progress(
-                            &mut ordered_results,
-                            idx,
-                            tool_name.clone(),
                             call.tool_call_id.clone(),
-                            outcome,
                             on_delta.as_ref(),
+                            &trace_context,
+                            false,
                         )
                         .await;
                         continue;
@@ -2573,23 +2664,19 @@ pub(crate) async fn run_tool_call_loop(
             let failure_detail = if outcome.success {
                 None
             } else {
-                summarize_policy_block_progress_from_outcome(&call.name, &outcome)
+                summarize_runtime_constraint_outcome(&call.name, &outcome)
             };
-            if let Some(idx) = progress_idx {
-                progress_tracker.complete(*idx, outcome.success, secs, failure_detail.as_deref());
-                if let Some(ref tx) = on_delta {
-                    tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
-                    let _ = tx.send(progress_tracker.render_delta()).await;
-                }
-            } else if progress_mode == ProgressMode::Off {
-                emit_policy_block_progress_detail_delta(
-                    on_delta.as_ref(),
-                    &call.name,
-                    secs,
-                    failure_detail.as_deref(),
-                )
-                .await;
-            }
+            complete_tool_progress_and_emit_delta(
+                &mut progress_tracker,
+                *progress_idx,
+                progress_mode,
+                on_delta.as_ref(),
+                &call.name,
+                outcome.success,
+                secs,
+                failure_detail.as_deref(),
+            )
+            .await;
 
             // ── Loop detection: record call ──────────────────────
             {
@@ -2608,13 +2695,11 @@ pub(crate) async fn run_tool_call_loop(
 
         post_action_verification_turn.apply(&mut post_action_verification_requirement);
 
-        let runtime_constraint_reasons = summarize_runtime_constraint_reasons(
+        let runtime_constraint_reasons = summarize_runtime_constraint_outcomes(
             ordered_results
                 .iter()
                 .flatten()
-                .flat_map(|(_, _, outcome)| {
-                    runtime_constraint_reason_candidates_from_outcome(outcome).into_iter()
-                }),
+                .map(|(tool_name, _, outcome)| (tool_name.as_str(), outcome)),
             3,
         );
         runtime_constraint_prompt =
@@ -4508,7 +4593,7 @@ mod tests {
             ChatMessage::user("run shell"),
         ];
         let observer = NoopObserver;
-        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(32);
 
         let result = run_tool_call_loop_with_reply_target(
             &provider,
@@ -5386,9 +5471,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn post_action_verification_progress_retry_line_includes_requirement() {
+        let requirement = ToolCallFollowthroughRequirement::PostActionVerification {
+            requirement: "shell(command=touch /tmp/zeroclaw-progress.out)".to_string(),
+        };
+
+        let line = requirement.progress_retry_line(1);
+
+        assert!(line.contains("Retrying to enforce post-action verification for"));
+        assert!(line.contains("shell(command=touch /tmp/zeroclaw-progress.out)"));
+        assert!(line.contains("attempt 1"));
+    }
+
     #[tokio::test]
-    async fn run_tool_call_loop_requires_post_action_verification_for_file_edit_before_final_answer()
-    {
+    async fn run_tool_call_loop_requires_post_action_verification_for_file_edit_before_final_answer(
+    ) {
         let seen_requests = Arc::new(Mutex::new(Vec::<Vec<ChatMessage>>::new()));
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"<tool_call>
@@ -7547,8 +7645,12 @@ Let me check the result."#;
             duration: Duration::from_secs(0),
         };
 
-        let detail = summarize_policy_block_progress_from_outcome("shell", &outcome)
-            .expect("embedded structured policy block should still be summarized");
+        let detail = summarize_tool_policy_block_progress_from_outcome(
+            "shell",
+            outcome.error_reason.as_deref(),
+            outcome.output.as_str(),
+        )
+        .expect("embedded structured policy block should still be summarized");
         assert!(detail.contains("policy=autonomy.command_context_rules"));
         assert!(detail.contains("command=curl https://evil.example/data"));
         assert!(detail.contains("config_key=autonomy.command_context_rules"));
@@ -7632,5 +7734,28 @@ Let me check the result."#;
         assert!(reasons[0].contains("command=curl https://evil.example/data"));
         assert!(reasons[0].contains("config_key=autonomy.command_context_rules"));
         assert!(reasons[0].contains("command_context=action=allow, commands=curl"));
+    }
+
+    #[test]
+    fn summarize_runtime_constraint_outcomes_prefers_progress_summary_for_retry_prompt() {
+        let outcome = ToolExecutionOutcome {
+            output: "blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example".to_string(),
+            success: false,
+            error_reason: Some("Error: blocked by security policy: policy=autonomy.allowed_commands; command=curl https://evil.example; reason=Command not allowed by security policy: curl https://evil.example".to_string()),
+            duration: Duration::ZERO,
+        };
+
+        let reasons = summarize_runtime_constraint_outcomes([("shell", &outcome)], 3);
+        assert_eq!(reasons.len(), 1);
+        assert!(reasons[0].contains("policy=autonomy.allowed_commands"));
+        assert!(reasons[0].contains("command=curl https://evil.example"));
+        assert!(reasons[0].contains("config_key=autonomy.allowed_commands"));
+        assert!(reasons[0].contains("reason=Command not allowed by security policy"));
+
+        let prompt =
+            build_runtime_constraint_retry_prompt(&reasons).expect("retry prompt should exist");
+        assert!(prompt.contains("policy=autonomy.allowed_commands"));
+        assert!(prompt.contains("command=curl https://evil.example"));
+        assert!(prompt.contains("Do not retry the same blocked tool"));
     }
 }

@@ -249,6 +249,12 @@ enum DraftUpdateAction {
     CreateContinuation(DraftContinuationReason),
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct DraftUpdatePlan {
+    active_message_id: String,
+    action: DraftUpdateAction,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum DraftContinuationReason {
     HighPriorityProgress,
@@ -534,19 +540,40 @@ impl LarkChannel {
         format!("{recipient}:{message_id}")
     }
 
-    fn draft_update_action(&self, state: Option<&DraftEditState>, text: &str) -> DraftUpdateAction {
-        if should_force_draft_continuation(text) {
-            return DraftUpdateAction::CreateContinuation(
-                DraftContinuationReason::HighPriorityProgress,
-            );
-        }
+    async fn store_draft_state(
+        &self,
+        draft_key: String,
+        current_message_id: String,
+        last_rendered_text: &str,
+        edits_used: u32,
+    ) {
+        let mut draft_state = self.draft_state.lock().await;
+        let state = draft_state.entry(draft_key).or_insert(DraftEditState {
+            current_message_id: current_message_id.clone(),
+            last_edit_at: Instant::now(),
+            edits_used,
+            last_rendered_text: String::new(),
+        });
+        state.current_message_id = current_message_id;
+        state.last_edit_at = Instant::now();
+        state.edits_used = edits_used;
+        state.last_rendered_text = last_rendered_text.to_string();
+    }
 
+    fn draft_update_action(&self, state: Option<&DraftEditState>, text: &str) -> DraftUpdateAction {
         let Some(state) = state else {
-            return DraftUpdateAction::EditInPlace;
+            return self
+                .draft_continuation_reason(None, text)
+                .map(DraftUpdateAction::CreateContinuation)
+                .unwrap_or(DraftUpdateAction::EditInPlace);
         };
 
         if state.last_rendered_text == text {
             return DraftUpdateAction::SkipThrottled;
+        }
+
+        if let Some(reason) = self.draft_continuation_reason(Some(state), text) {
+            return DraftUpdateAction::CreateContinuation(reason);
         }
 
         let elapsed_ms =
@@ -554,10 +581,72 @@ impl LarkChannel {
         if elapsed_ms < self.draft_update_interval_ms {
             return DraftUpdateAction::SkipThrottled;
         }
-        if state.edits_used >= self.max_draft_edits {
-            return DraftUpdateAction::CreateContinuation(DraftContinuationReason::EditCapReached);
-        }
         DraftUpdateAction::EditInPlace
+    }
+
+    fn draft_continuation_reason(
+        &self,
+        state: Option<&DraftEditState>,
+        text: &str,
+    ) -> Option<DraftContinuationReason> {
+        if should_force_draft_continuation(text) {
+            return Some(DraftContinuationReason::HighPriorityProgress);
+        }
+
+        state
+            .filter(|state| state.edits_used >= self.max_draft_edits)
+            .map(|_| DraftContinuationReason::EditCapReached)
+    }
+
+    fn plan_draft_update(
+        &self,
+        state: Option<&DraftEditState>,
+        root_message_id: &str,
+        text: &str,
+    ) -> DraftUpdatePlan {
+        let active_message_id = state
+            .map(|state| state.current_message_id.clone())
+            .unwrap_or_else(|| root_message_id.to_string());
+
+        DraftUpdatePlan {
+            active_message_id,
+            action: self.draft_update_action(state, text),
+        }
+    }
+
+    async fn create_draft_continuation(
+        &self,
+        recipient: &str,
+        active_message_id: String,
+        text: &str,
+        reason: DraftContinuationReason,
+    ) -> anyhow::Result<String> {
+        tracing::debug!(
+            "Lark draft switching to continuation progress message for {active_message_id}; reason={}",
+            reason.as_str()
+        );
+
+        let next_message_id = self
+            .create_text_message(recipient, text)
+            .await?
+            .unwrap_or(active_message_id);
+        Ok(next_message_id)
+    }
+
+    async fn apply_draft_continuation(
+        &self,
+        draft_key: String,
+        recipient: &str,
+        active_message_id: String,
+        text: &str,
+        reason: DraftContinuationReason,
+    ) -> anyhow::Result<()> {
+        let active_message_id = self
+            .create_draft_continuation(recipient, active_message_id, text, reason)
+            .await?;
+        self.store_draft_state(draft_key, active_message_id, text, 0)
+            .await;
+        Ok(())
     }
 
     async fn remove_draft_state(
@@ -1604,15 +1693,13 @@ impl Channel for LarkChannel {
             .await?;
 
         if let Some(message_id) = message_id.as_deref() {
-            self.draft_state.lock().await.insert(
+            self.store_draft_state(
                 Self::draft_state_key(&message.recipient, message_id),
-                DraftEditState {
-                    current_message_id: message_id.to_string(),
-                    last_edit_at: Instant::now(),
-                    edits_used: 0,
-                    last_rendered_text: initial_text.to_string(),
-                },
-            );
+                message_id.to_string(),
+                initial_text,
+                0,
+            )
+            .await;
         }
 
         Ok(message_id)
@@ -1629,47 +1716,29 @@ impl Channel for LarkChannel {
         }
 
         let draft_key = Self::draft_state_key(recipient, message_id);
-        let mut active_message_id = message_id.to_string();
-        let mut continuation_reason: Option<DraftContinuationReason> = None;
-        {
+        let plan = {
             let draft_state = self.draft_state.lock().await;
             let state = draft_state.get(&draft_key);
-            if let Some(state) = state {
-                active_message_id = state.current_message_id.clone();
+            self.plan_draft_update(state, message_id, text)
+        };
+
+        match plan.action {
+            DraftUpdateAction::SkipThrottled => return Ok(None),
+            DraftUpdateAction::CreateContinuation(reason) => {
+                self.apply_draft_continuation(
+                    draft_key,
+                    recipient,
+                    plan.active_message_id,
+                    text,
+                    reason,
+                )
+                .await?;
+                return Ok(None);
             }
-            match self.draft_update_action(state, text) {
-                DraftUpdateAction::SkipThrottled => {
-                    return Ok(None);
-                }
-                DraftUpdateAction::CreateContinuation(reason) => {
-                    continuation_reason = Some(reason);
-                }
-                DraftUpdateAction::EditInPlace => {}
-            }
+            DraftUpdateAction::EditInPlace => {}
         }
 
-        if let Some(reason) = continuation_reason {
-            tracing::debug!(
-                "Lark draft switching to continuation progress message for {active_message_id}; reason={}",
-                reason.as_str()
-            );
-            if let Some(new_message_id) = self.create_text_message(recipient, text).await? {
-                active_message_id = new_message_id;
-            }
-            let mut draft_state = self.draft_state.lock().await;
-            let state = draft_state.entry(draft_key).or_insert(DraftEditState {
-                current_message_id: active_message_id.clone(),
-                last_edit_at: Instant::now(),
-                edits_used: 0,
-                last_rendered_text: String::new(),
-            });
-            state.current_message_id = active_message_id;
-            state.last_edit_at = Instant::now();
-            state.edits_used = 0;
-            state.last_rendered_text = text.to_string();
-            return Ok(None);
-        }
-
+        let mut active_message_id = plan.active_message_id;
         match self.update_text_message(&active_message_id, text).await {
             Ok(()) => {}
             Err(error) => {
@@ -1681,17 +1750,15 @@ impl Channel for LarkChannel {
                 }
             }
         }
-        let mut draft_state = self.draft_state.lock().await;
-        let state = draft_state.entry(draft_key).or_insert(DraftEditState {
-            current_message_id: active_message_id.clone(),
-            last_edit_at: Instant::now(),
-            edits_used: 0,
-            last_rendered_text: String::new(),
-        });
-        state.current_message_id = active_message_id;
-        state.last_edit_at = Instant::now();
-        state.edits_used = state.edits_used.saturating_add(1);
-        state.last_rendered_text = text.to_string();
+        let next_edits_used = {
+            let draft_state = self.draft_state.lock().await;
+            draft_state
+                .get(&draft_key)
+                .map_or(0, |state| state.edits_used)
+                .saturating_add(1)
+        };
+        self.store_draft_state(draft_key, active_message_id, text, next_edits_used)
+            .await;
         Ok(None)
     }
 
@@ -2270,9 +2337,10 @@ fn should_respond_in_group(
 mod tests {
     use super::*;
     use crate::channels::progress_event::{
-        build_cron_lifecycle_announcement_builder, render_execution_blocked,
-        render_tool_policy_block_progress_summary, CronLifecycleAnnouncementBuilder,
-        CronLifecycleDescriptor,
+        render_cron_blocked_announcement_with_descriptor,
+        render_cron_result_announcement_with_descriptor,
+        render_cron_start_announcements_with_descriptor,
+        render_tool_policy_block_progress_summary_from_parts, CronLifecycleDescriptor,
     };
     use axum::{extract::Path, extract::State, routing::patch, routing::post, Json, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2298,43 +2366,54 @@ mod tests {
         )
     }
 
-    fn cron_builder(command: &str) -> CronLifecycleAnnouncementBuilder<'_> {
-        build_cron_lifecycle_announcement_builder(
+    fn cron_triggered_running(command: &str) -> [String; 2] {
+        render_cron_start_announcements_with_descriptor(
             "job1",
             "nightly",
             "every(1000ms)",
             CronLifecycleDescriptor::Shell { command },
+            180,
         )
     }
 
-    fn cron_triggered_running(command: &str) -> [String; 2] {
-        cron_builder(command).render_start_announcements(180)
-    }
-
     fn cron_blocked(command: &str, reason: &str) -> String {
-        cron_builder(command)
-            .render_blocked_announcement(
-                "autonomy.allowed_commands",
-                reason,
-                Some(command),
-                96,
-                120,
-            )
-            .expect("cron blocked lifecycle message should render")
+        render_cron_blocked_announcement_with_descriptor(
+            "job1",
+            "nightly",
+            "every(1000ms)",
+            CronLifecycleDescriptor::Shell { command },
+            "autonomy.allowed_commands",
+            reason,
+            Some(command),
+            96,
+            120,
+        )
+        .expect("cron blocked lifecycle message should render")
     }
 
     fn cron_completed(output_preview: &str) -> String {
-        cron_builder("echo ok")
-            .render_result_announcement(true, output_preview, 96, 96, 120)
-            .expect("cron completed lifecycle message should render")
+        render_cron_result_announcement_with_descriptor(
+            "job1",
+            "nightly",
+            "every(1000ms)",
+            CronLifecycleDescriptor::Shell { command: "echo ok" },
+            true,
+            output_preview,
+            96,
+            96,
+            120,
+        )
+        .expect("cron completed lifecycle message should render")
     }
 
     fn shell_policy_block_progress_line(command: &str) -> String {
-        let reason = format!(
-            "blocked by security policy: policy=autonomy.allowed_commands; command={command}; reason=Command not allowed by security policy: {command}"
-        );
-        render_tool_policy_block_progress_summary("shell", &reason)
-            .expect("policy block progress summary should render")
+        render_tool_policy_block_progress_summary_from_parts(
+            "autonomy.allowed_commands",
+            format!("Command not allowed by security policy: {command}"),
+            "shell",
+            Some(command),
+        )
+        .expect("policy block progress summary should render")
     }
 
     #[test]
@@ -3182,16 +3261,7 @@ mod tests {
             .expect("draft id should exist");
         assert_eq!(draft_id, "msg-root");
 
-        let blocked = render_execution_blocked(
-            "Agent",
-            "shell",
-            "shell",
-            "tool",
-            None,
-            None,
-            None,
-            String::new(),
-        );
+        let blocked = shell_policy_block_progress_line("cat /etc/passwd");
         channel
             .update_draft(recipient, &draft_id, &blocked)
             .await

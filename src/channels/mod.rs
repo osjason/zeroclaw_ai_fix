@@ -95,7 +95,10 @@ use crate::security::{LeakDetector, LeakResult, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
-use progress_event::{is_high_priority_progress_update, is_structured_lifecycle_or_policy_line};
+use progress_event::{
+    is_high_priority_progress_update, is_structured_lifecycle_or_policy_line,
+    strip_progress_section_markers, upsert_progress_section,
+};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -192,12 +195,25 @@ fn set_runtime_channel_progress_modes(modes: HashMap<String, ProgressMode>) {
         .unwrap_or_else(|e| e.into_inner()) = normalized;
 }
 
+fn progress_mode_alias(channel_name: &str) -> Option<&'static str> {
+    if channel_name.eq_ignore_ascii_case("lark") {
+        Some("feishu")
+    } else if channel_name.eq_ignore_ascii_case("feishu") {
+        Some("lark")
+    } else {
+        None
+    }
+}
+
 fn runtime_channel_progress_mode(channel_name: &str) -> Option<ProgressMode> {
-    runtime_channel_progress_modes_store()
+    let store = runtime_channel_progress_modes_store()
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&channel_name.to_ascii_lowercase())
+        .unwrap_or_else(|e| e.into_inner());
+    let normalized = channel_name.to_ascii_lowercase();
+    store
+        .get(&normalized)
         .copied()
+        .or_else(|| progress_mode_alias(channel_name).and_then(|alias| store.get(alias).copied()))
 }
 
 fn configured_runtime_channel_progress_modes(config: &Config) -> HashMap<String, ProgressMode> {
@@ -792,46 +808,216 @@ fn default_progress_mode_for_channel(channel_name: &str) -> ProgressMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DraftProgressVisibility {
+    Hidden,
+    Visible,
+    ForceVisible,
+}
+
+fn draft_progress_visibility(mode: ProgressMode, delta: &str) -> DraftProgressVisibility {
+    if is_high_priority_progress_update(delta) {
+        DraftProgressVisibility::ForceVisible
+    } else if mode == ProgressMode::Off {
+        DraftProgressVisibility::Hidden
+    } else {
+        DraftProgressVisibility::Visible
+    }
+}
+
 fn should_show_progress_update(mode: ProgressMode, delta: &str) -> bool {
-    mode != ProgressMode::Off || is_high_priority_progress_update(delta)
+    draft_progress_visibility(mode, delta) != DraftProgressVisibility::Hidden
 }
 
 fn should_skip_internal_progress_line(mode: ProgressMode, delta: &str) -> bool {
-    let is_high_priority = is_high_priority_progress_update(delta);
-    if is_high_priority {
-        return false;
+    match draft_progress_visibility(mode, delta) {
+        DraftProgressVisibility::ForceVisible => false,
+        DraftProgressVisibility::Visible => mode == ProgressMode::Compact,
+        DraftProgressVisibility::Hidden => true,
     }
-
-    if mode == ProgressMode::Compact {
-        return true;
-    }
-
-    !should_show_progress_update(mode, delta)
 }
 
-fn upsert_progress_section(accumulated: &mut String, block: &str) {
-    let section = format!(
-        "{}{}{}",
-        crate::agent::loop_::DRAFT_PROGRESS_SECTION_START,
-        block,
-        crate::agent::loop_::DRAFT_PROGRESS_SECTION_END
-    );
-    if let Some(start) = accumulated.find(crate::agent::loop_::DRAFT_PROGRESS_SECTION_START) {
-        if let Some(end_offset) =
-            accumulated[start..].find(crate::agent::loop_::DRAFT_PROGRESS_SECTION_END)
-        {
-            let end = start + end_offset + crate::agent::loop_::DRAFT_PROGRESS_SECTION_END.len();
-            accumulated.replace_range(start..end, &section);
-            return;
+enum DraftStreamDelta<'a> {
+    Clear,
+    ProgressBlock(&'a str),
+    Append(&'a str),
+}
+
+fn classify_draft_stream_delta(mode: ProgressMode, delta: &str) -> Option<DraftStreamDelta<'_>> {
+    if delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL {
+        return Some(DraftStreamDelta::Clear);
+    }
+
+    if let Some(block) = delta.strip_prefix(crate::agent::loop_::DRAFT_PROGRESS_BLOCK_SENTINEL) {
+        return should_show_progress_update(mode, block)
+            .then_some(DraftStreamDelta::ProgressBlock(block));
+    }
+
+    let (is_internal_progress, visible_delta) = split_internal_progress_delta(delta);
+    if is_internal_progress && should_skip_internal_progress_line(mode, visible_delta) {
+        return None;
+    }
+
+    Some(DraftStreamDelta::Append(visible_delta))
+}
+
+fn apply_draft_stream_delta(
+    accumulated: &mut String,
+    mode: ProgressMode,
+    delta: &str,
+) -> Option<String> {
+    match classify_draft_stream_delta(mode, delta)? {
+        DraftStreamDelta::Clear => {
+            accumulated.clear();
+            return None;
+        }
+        DraftStreamDelta::ProgressBlock(block) => {
+            upsert_progress_section(
+                accumulated,
+                block,
+                crate::agent::loop_::DRAFT_PROGRESS_SECTION_START,
+                crate::agent::loop_::DRAFT_PROGRESS_SECTION_END,
+            );
+        }
+        DraftStreamDelta::Append(visible_delta) => {
+            accumulated.push_str(visible_delta);
         }
     }
-    accumulated.push_str(&section);
+
+    Some(strip_progress_section_markers(
+        accumulated,
+        crate::agent::loop_::DRAFT_PROGRESS_SECTION_START,
+        crate::agent::loop_::DRAFT_PROGRESS_SECTION_END,
+    ))
 }
 
-fn strip_progress_section_markers(text: &str) -> String {
-    text.replace(crate::agent::loop_::DRAFT_PROGRESS_SECTION_START, "")
-        .replace(crate::agent::loop_::DRAFT_PROGRESS_SECTION_END, "")
+struct DraftStreamingRuntime {
+    delta_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    draft_message_id: Option<String>,
+    updater: Option<tokio::task::JoinHandle<()>>,
 }
+
+async fn setup_draft_streaming_runtime(
+    target_channel: Option<&Arc<dyn Channel>>,
+    reply_target: &str,
+    thread_ts: Option<String>,
+    progress_mode: ProgressMode,
+) -> DraftStreamingRuntime {
+    let use_streaming = target_channel
+        .as_ref()
+        .is_some_and(|channel| channel.supports_draft_updates());
+
+    tracing::debug!(
+        has_target_channel = target_channel.is_some(),
+        use_streaming,
+        supports_draft = target_channel
+            .as_ref()
+            .map_or(false, |channel| channel.supports_draft_updates()),
+        "Draft streaming decision"
+    );
+
+    let (delta_tx, delta_rx) = if use_streaming {
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    let draft_message_id = if let Some(channel) = target_channel.filter(|_| use_streaming) {
+        match channel
+            .send_draft(&SendMessage::new("...", reply_target).in_thread(thread_ts.clone()))
+            .await
+        {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::debug!("Failed to send draft on {}: {error}", channel.name());
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let updater = if let (Some(mut rx), Some(draft_id_ref), Some(channel_ref)) =
+        (delta_rx, draft_message_id.as_deref(), target_channel)
+    {
+        let channel = Arc::clone(channel_ref);
+        let reply_target = reply_target.to_string();
+        let draft_id = draft_id_ref.to_string();
+        Some(tokio::spawn(async move {
+            let mut accumulated = String::new();
+            while let Some(delta) = rx.recv().await {
+                let Some(display_text) =
+                    apply_draft_stream_delta(&mut accumulated, progress_mode, &delta)
+                else {
+                    continue;
+                };
+                if let Err(error) = channel
+                    .update_draft(&reply_target, &draft_id, &display_text)
+                    .await
+                {
+                    tracing::debug!("Draft update failed: {error}");
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
+    DraftStreamingRuntime {
+        delta_tx,
+        draft_message_id,
+        updater,
+    }
+}
+
+async fn send_or_finalize_channel_reply(
+    channel: &Arc<dyn Channel>,
+    msg: &traits::ChannelMessage,
+    draft_message_id: Option<&str>,
+    text: &str,
+    fallback_to_fresh_send_on_finalize_failure: bool,
+) -> anyhow::Result<()> {
+    if let Some(draft_id) = draft_message_id {
+        match channel
+            .finalize_draft(&msg.reply_target, draft_id, text)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(err) if fallback_to_fresh_send_on_finalize_failure => {
+                tracing::warn!(
+                    "Failed to finalize draft on {}: {err}; sending as new message",
+                    channel.name()
+                );
+                channel
+                    .send(
+                        &SendMessage::new(text, &msg.reply_target).in_thread(msg.thread_ts.clone()),
+                    )
+                    .await
+            }
+            Err(err) => Err(err),
+        }
+    } else {
+        channel
+            .send(&SendMessage::new(text, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+            .await
+    }
+}
+
+async fn cancel_channel_draft(
+    channel: &Arc<dyn Channel>,
+    reply_target: &str,
+    draft_message_id: Option<&str>,
+) {
+    let Some(draft_id) = draft_message_id else {
+        return;
+    };
+
+    if let Err(err) = channel.cancel_draft(reply_target, draft_id).await {
+        tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
+    }
+}
+
 fn build_channel_system_prompt(
     base_prompt: &str,
     channel_name: &str,
@@ -3734,92 +3920,17 @@ or tune thresholds in config.",
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let _ = trim_channel_prompt_history(&mut history);
-    let use_streaming = target_channel
-        .as_ref()
-        .is_some_and(|ch| ch.supports_draft_updates());
-
-    tracing::debug!(
-        channel = %msg.channel,
-        has_target_channel = target_channel.is_some(),
-        use_streaming,
-        supports_draft = target_channel.as_ref().map_or(false, |ch| ch.supports_draft_updates()),
-        "Draft streaming decision"
-    );
-
-    let (delta_tx, delta_rx) = if use_streaming {
-        let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-
-    let draft_message_id = if use_streaming {
-        if let Some(channel) = target_channel.as_ref() {
-            match channel
-                .send_draft(
-                    &SendMessage::new("...", &msg.reply_target).in_thread(msg.thread_ts.clone()),
-                )
-                .await
-            {
-                Ok(id) => id,
-                Err(e) => {
-                    tracing::debug!("Failed to send draft on {}: {e}", channel.name());
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let draft_updater = if let (Some(mut rx), Some(draft_id_ref), Some(channel_ref)) = (
-        delta_rx,
-        draft_message_id.as_deref(),
+    let DraftStreamingRuntime {
+        delta_tx,
+        draft_message_id,
+        updater: draft_updater,
+    } = setup_draft_streaming_runtime(
         target_channel.as_ref(),
-    ) {
-        let channel = Arc::clone(channel_ref);
-        let reply_target = msg.reply_target.clone();
-        let draft_id = draft_id_ref.to_string();
-        let mode = progress_mode;
-        Some(tokio::spawn(async move {
-            let mut accumulated = String::new();
-            while let Some(delta) = rx.recv().await {
-                if delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL {
-                    accumulated.clear();
-                    continue;
-                }
-                if let Some(block) =
-                    delta.strip_prefix(crate::agent::loop_::DRAFT_PROGRESS_BLOCK_SENTINEL)
-                {
-                    if !should_show_progress_update(mode, block) {
-                        continue;
-                    }
-                    upsert_progress_section(&mut accumulated, block);
-                } else {
-                    let (is_internal_progress, visible_delta) =
-                        split_internal_progress_delta(&delta);
-                    if is_internal_progress
-                        && should_skip_internal_progress_line(mode, visible_delta)
-                    {
-                        continue;
-                    }
-
-                    accumulated.push_str(visible_delta);
-                }
-                let display_text = strip_progress_section_markers(&accumulated);
-                if let Err(e) = channel
-                    .update_draft(&reply_target, &draft_id, &display_text)
-                    .await
-                {
-                    tracing::debug!("Draft update failed: {e}");
-                }
-            }
-        }))
-    } else {
-        None
-    };
+        &msg.reply_target,
+        msg.thread_ts.clone(),
+        progress_mode,
+    )
+    .await;
 
     // React with 👀 to acknowledge the incoming message
     if let Some(channel) = target_channel.as_ref() {
@@ -3969,12 +4080,8 @@ or tune thresholds in config.",
                     "elapsed_ms": started_at.elapsed().as_millis(),
                 }),
             );
-            if let (Some(channel), Some(draft_id)) =
-                (target_channel.as_ref(), draft_message_id.as_deref())
-            {
-                if let Err(err) = channel.cancel_draft(&msg.reply_target, draft_id).await {
-                    tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
-                }
+            if let Some(channel) = target_channel.as_ref() {
+                cancel_channel_draft(channel, &msg.reply_target, draft_message_id.as_deref()).await;
             }
         }
         LlmExecutionResult::Completed(Ok(Ok(response))) => {
@@ -4117,25 +4224,14 @@ or tune thresholds in config.",
                 truncate_with_ellipsis(&delivered_response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
-                if let Some(ref draft_id) = draft_message_id {
-                    if let Err(e) = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
-                        .await
-                    {
-                        tracing::warn!("Failed to finalize draft: {e}; sending as new message");
-                        let _ = channel
-                            .send(
-                                &SendMessage::new(&delivered_response, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await;
-                    }
-                } else if let Err(e) = channel
-                    .send(
-                        &SendMessage::new(delivered_response, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone()),
-                    )
-                    .await
+                if let Err(e) = send_or_finalize_channel_reply(
+                    channel,
+                    &msg,
+                    draft_message_id.as_deref(),
+                    &delivered_response,
+                    true,
+                )
+                .await
                 {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                 }
@@ -4162,12 +4258,9 @@ or tune thresholds in config.",
                         "elapsed_ms": started_at.elapsed().as_millis(),
                     }),
                 );
-                if let (Some(channel), Some(draft_id)) =
-                    (target_channel.as_ref(), draft_message_id.as_deref())
-                {
-                    if let Err(err) = channel.cancel_draft(&msg.reply_target, draft_id).await {
-                        tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
-                    }
+                if let Some(channel) = target_channel.as_ref() {
+                    cancel_channel_draft(channel, &msg.reply_target, draft_message_id.as_deref())
+                        .await;
                 }
             } else if is_context_window_overflow_error(&e) {
                 let compacted = compact_sender_history(ctx.as_ref(), &history_key);
@@ -4196,18 +4289,14 @@ or tune thresholds in config.",
                     }),
                 );
                 if let Some(channel) = target_channel.as_ref() {
-                    if let Some(ref draft_id) = draft_message_id {
-                        let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, error_text)
-                            .await;
-                    } else {
-                        let _ = channel
-                            .send(
-                                &SendMessage::new(error_text, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await;
-                    }
+                    let _ = send_or_finalize_channel_reply(
+                        channel,
+                        &msg,
+                        draft_message_id.as_deref(),
+                        error_text,
+                        false,
+                    )
+                    .await;
                 }
             } else if is_tool_iteration_limit_error(&e) {
                 let limit = ctx.max_tool_iterations.max(1);
@@ -4237,18 +4326,14 @@ or tune thresholds in config.",
                     ChatMessage::assistant(&pause_text),
                 );
                 if let Some(channel) = target_channel.as_ref() {
-                    if let Some(ref draft_id) = draft_message_id {
-                        let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &pause_text)
-                            .await;
-                    } else {
-                        let _ = channel
-                            .send(
-                                &SendMessage::new(pause_text, &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await;
-                    }
+                    let _ = send_or_finalize_channel_reply(
+                        channel,
+                        &msg,
+                        draft_message_id.as_deref(),
+                        &pause_text,
+                        false,
+                    )
+                    .await;
                 }
             } else {
                 eprintln!(
@@ -4289,18 +4374,15 @@ or tune thresholds in config.",
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
-                    if let Some(ref draft_id) = draft_message_id {
-                        let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
-                            .await;
-                    } else {
-                        let _ = channel
-                            .send(
-                                &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
-                                    .in_thread(msg.thread_ts.clone()),
-                            )
-                            .await;
-                    }
+                    let error_text = format!("⚠️ Error: {e}");
+                    let _ = send_or_finalize_channel_reply(
+                        channel,
+                        &msg,
+                        draft_message_id.as_deref(),
+                        &error_text,
+                        false,
+                    )
+                    .await;
                 }
             }
         }
@@ -4337,18 +4419,14 @@ or tune thresholds in config.",
             if let Some(channel) = target_channel.as_ref() {
                 let error_text =
                     "⚠️ Request timed out while waiting for the model. Please try again.";
-                if let Some(ref draft_id) = draft_message_id {
-                    let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, error_text)
-                        .await;
-                } else {
-                    let _ = channel
-                        .send(
-                            &SendMessage::new(error_text, &msg.reply_target)
-                                .in_thread(msg.thread_ts.clone()),
-                        )
-                        .await;
-                }
+                let _ = send_or_finalize_channel_reply(
+                    channel,
+                    &msg,
+                    draft_message_id.as_deref(),
+                    error_text,
+                    false,
+                )
+                .await;
             }
         }
     }
@@ -11978,6 +12056,24 @@ Done reminder set for 1:38 AM."#;
     }
 
     #[test]
+    fn classify_draft_stream_delta_keeps_policy_blocks_visible_when_progress_mode_is_off() {
+        let blocked = format!(
+            "{}🚫 Shell blocked\npolicy=autonomy.allowed_commands; command=cat /etc/passwd\nstatus=blocked_by_security_policy",
+            crate::agent::loop_::DRAFT_PROGRESS_BLOCK_SENTINEL
+        );
+        let verbose = format!(
+            "{}Thinking about the next tool call...\n",
+            crate::agent::loop_::DRAFT_PROGRESS_SENTINEL
+        );
+
+        assert!(matches!(
+            classify_draft_stream_delta(ProgressMode::Off, &blocked),
+            Some(DraftStreamDelta::ProgressBlock(_))
+        ));
+        assert!(classify_draft_stream_delta(ProgressMode::Off, &verbose).is_none());
+    }
+
+    #[test]
     fn compact_mode_prioritizes_structured_status_even_if_verbose_prefixed() {
         let mixed = "↻ Retrying after malformed response\nstatus=triggered\nreason=cron scheduling completed";
         assert!(!should_skip_internal_progress_line(
@@ -12031,6 +12127,27 @@ Done reminder set for 1:38 AM."#;
         set_runtime_channel_progress_mode("lark", ProgressMode::Off);
     }
 
+    #[test]
+    fn effective_progress_mode_treats_lark_and_feishu_as_runtime_aliases() {
+        set_runtime_channel_progress_modes(HashMap::from([(
+            "feishu".to_string(),
+            ProgressMode::Verbose,
+        )]));
+        assert_eq!(
+            effective_progress_mode_for_message("lark", false),
+            ProgressMode::Verbose
+        );
+
+        set_runtime_channel_progress_modes(HashMap::from([(
+            "lark".to_string(),
+            ProgressMode::Off,
+        )]));
+        assert_eq!(
+            effective_progress_mode_for_message("feishu", false),
+            ProgressMode::Off
+        );
+    }
+
     #[cfg(feature = "channel-lark")]
     #[test]
     fn configured_runtime_channel_progress_modes_maps_legacy_lark_feishu_to_feishu() {
@@ -12056,16 +12173,6 @@ Done reminder set for 1:38 AM."#;
         let progress_modes = configured_runtime_channel_progress_modes(&config);
         assert_eq!(progress_modes.get("feishu"), Some(&ProgressMode::Compact));
         assert!(!progress_modes.contains_key("lark"));
-    }
-
-    #[test]
-    fn upsert_progress_section_replaces_existing_block() {
-        let mut text = String::new();
-        upsert_progress_section(&mut text, "⏳ shell: ls\n");
-        upsert_progress_section(&mut text, "✅ shell (1s)\n");
-        let stripped = strip_progress_section_markers(&text);
-        assert!(!stripped.contains("⏳ shell: ls"));
-        assert!(stripped.contains("✅ shell (1s)"));
     }
 
     #[test]

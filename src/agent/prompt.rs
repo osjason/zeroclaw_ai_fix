@@ -10,6 +10,8 @@ use std::path::Path;
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 pub(crate) const POST_ACTION_VERIFICATION_RULE: &str =
     "After any file modification or command execution, you must emit at least one verification <tool_call>...</tool_call>, wait for its result, and only then provide a final answer with cited verification evidence.";
+pub(crate) const SECURITY_BLOCK_REPORTING_RULE: &str =
+    "If any tool, shell command, or runtime action is blocked by policy, explicitly report the exact blocked command or tool, the policy_id, and the config key or approval gate when provided; do not silently retry the same blocked action unchanged.";
 
 pub(crate) fn build_post_action_verification_retry_prompt(
     requirement: &str,
@@ -180,7 +182,7 @@ impl PromptSection for SafetySection {
 
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
         Ok(format!(
-            "## Safety\n\n- Do not exfiltrate private data.\n- Do not run destructive commands without asking.\n- Do not bypass oversight or approval mechanisms.\n- Prefer `trash` over `rm`.\n- {POST_ACTION_VERIFICATION_RULE}\n- Do not claim success without verification evidence.\n- When in doubt, ask before acting externally."
+            "## Safety\n\n- Do not exfiltrate private data.\n- Do not run destructive commands without asking.\n- Do not bypass oversight or approval mechanisms.\n- Prefer `trash` over `rm`.\n- {POST_ACTION_VERIFICATION_RULE}\n- {SECURITY_BLOCK_REPORTING_RULE}\n- Do not claim success without verification evidence.\n- When in doubt, ask before acting externally."
         ))
     }
 }
@@ -661,6 +663,9 @@ mod tests {
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains(POST_ACTION_VERIFICATION_RULE));
+        assert!(prompt.contains(SECURITY_BLOCK_REPORTING_RULE));
+        assert!(prompt.contains("policy_id"));
+        assert!(prompt.contains("config key or approval gate"));
         assert!(prompt.contains("Do not claim success without verification evidence."));
     }
 
