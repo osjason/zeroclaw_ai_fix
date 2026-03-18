@@ -678,6 +678,17 @@ impl Agent {
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
                         final_text.clone(),
                     )));
+                if self.auto_save {
+                    let _ = self
+                        .memory
+                        .store(
+                            "assistant_resp",
+                            &final_text,
+                            MemoryCategory::Conversation,
+                            None,
+                        )
+                        .await;
+                }
                 self.trim_history();
 
                 return Ok(final_text);

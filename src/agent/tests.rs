@@ -649,7 +649,10 @@ async fn auto_save_stores_user_and_assistant_messages_in_memory() {
         true, // auto_save enabled
     );
 
-    let _ = agent.turn("Remember this fact").await.unwrap();
+    let _ = agent
+        .turn("Remember this important fact forever")
+        .await
+        .unwrap();
 
     // Auto-save persists both user input and assistant output for traceability.
     let count = mem.count().await.unwrap();
@@ -662,7 +665,7 @@ async fn auto_save_stores_user_and_assistant_messages_in_memory() {
     assert!(stored.is_some(), "Expected user_msg key to be present");
     assert_eq!(
         stored.unwrap().content,
-        "Remember this fact",
+        "Remember this important fact forever",
         "Stored memory should match the original user message"
     );
 

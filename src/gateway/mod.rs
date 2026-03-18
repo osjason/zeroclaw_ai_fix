@@ -2191,12 +2191,14 @@ mod tests {
         let parsed: Config = toml::from_str(&saved).unwrap();
         assert_eq!(parsed.gateway.paired_tokens.len(), 1);
         let persisted = &parsed.gateway.paired_tokens[0];
-        assert_eq!(persisted.len(), 64);
-        assert!(persisted.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(crate::security::SecretStore::is_encrypted(persisted));
 
         let in_memory = shared_config.lock();
         assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
-        assert_eq!(&in_memory.gateway.paired_tokens[0], persisted);
+        let runtime_token = &in_memory.gateway.paired_tokens[0];
+        assert_eq!(runtime_token.len(), 64);
+        assert!(runtime_token.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(runtime_token, persisted);
     }
 
     #[test]
