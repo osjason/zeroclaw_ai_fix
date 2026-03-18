@@ -2774,6 +2774,10 @@ impl Channel for TelegramChannel {
         self.stream_mode != StreamMode::Off
     }
 
+    fn finalize_draft_owns_visible_fallback(&self) -> bool {
+        true
+    }
+
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         if self.stream_mode == StreamMode::Off {
             return Ok(None);
@@ -3579,10 +3583,12 @@ mod tests {
     fn supports_draft_updates_respects_stream_mode() {
         let off = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
         assert!(!off.supports_draft_updates());
+        assert!(off.finalize_draft_owns_visible_fallback());
 
         let partial = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true)
             .with_streaming(StreamMode::Partial, 750);
         assert!(partial.supports_draft_updates());
+        assert!(partial.finalize_draft_owns_visible_fallback());
         assert_eq!(partial.draft_update_interval_ms, 750);
     }
 
@@ -3888,7 +3894,7 @@ mod tests {
         );
         assert_eq!(
             sanitize_attachment_filename(r"..\\..\\secrets\\token.env").as_deref(),
-            Some("..__..__secrets__token.env")
+            Some("token.env")
         );
         assert!(sanitize_attachment_filename("..").is_none());
         assert!(sanitize_attachment_filename("").is_none());

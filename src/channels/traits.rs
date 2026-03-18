@@ -1,4 +1,24 @@
 use async_trait::async_trait;
+use std::time::Duration;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DraftUpdateMode {
+    Accumulated,
+    Delta,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamingProgressDelivery {
+    None,
+    Draft,
+    DebouncedLogBatch { idle_timeout: Duration },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutboundMessageRole {
+    Agent,
+    Log,
+}
 
 /// A message received from or sent to a channel
 #[derive(Debug, Clone)]
@@ -89,12 +109,59 @@ pub trait Channel: Send + Sync {
         false
     }
 
+    /// How channel-visible progress updates should be delivered.
+    ///
+    /// By default, channels that support draft updates receive them through the
+    /// draft-edit flow. Channels can override this to suppress streaming
+    /// entirely or to surface progress out-of-band.
+    fn streaming_progress_delivery(&self) -> StreamingProgressDelivery {
+        if self.supports_draft_updates() {
+            StreamingProgressDelivery::Draft
+        } else {
+            StreamingProgressDelivery::None
+        }
+    }
+
+    /// Whether plain assistant text deltas should be surfaced during progress
+    /// streaming before the final reply is ready.
+    fn streams_assistant_text_in_progress(&self) -> bool {
+        true
+    }
+
+    /// How streaming draft updates should be forwarded to this channel.
+    ///
+    /// Most channels edit a single draft message in place and therefore expect
+    /// accumulated content. Channels that fall back to sending follow-up
+    /// messages for each update can opt into delta delivery to avoid repeated
+    /// `a`, `ab`, `abc` style transcripts.
+    fn draft_update_mode(&self) -> DraftUpdateMode {
+        DraftUpdateMode::Accumulated
+    }
+
+    /// Whether this channel implementation owns visible fallback behavior when
+    /// finalizing a draft reply.
+    ///
+    /// Channels that may edit the draft, delete it, or send a replacement
+    /// message internally should return `true` so the shared layer does not
+    /// perform a second fresh-send fallback after `finalize_draft` errors.
+    fn finalize_draft_owns_visible_fallback(&self) -> bool {
+        false
+    }
+
+    /// Format an outbound message for a role visible to end users.
+    fn format_outbound_message(&self, _role: OutboundMessageRole, text: &str) -> String {
+        text.to_string()
+    }
+
     /// Send an initial draft message. Returns a platform-specific message ID for later edits.
     async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
         Ok(None)
     }
 
-    /// Update a previously sent draft message with new accumulated content.
+    /// Update a previously sent draft message with new streamed content.
+    ///
+    /// The payload is either the full accumulated text or only the newest
+    /// delta, depending on [`Channel::draft_update_mode`].
     ///
     /// Returns `Ok(None)` to keep the current draft message ID, or
     /// `Ok(Some(new_id))` when a continuation message was created
@@ -260,12 +327,23 @@ mod tests {
         let channel = DummyChannel;
 
         assert!(!channel.supports_draft_updates());
+        assert_eq!(
+            channel.streaming_progress_delivery(),
+            StreamingProgressDelivery::None
+        );
+        assert!(channel.streams_assistant_text_in_progress());
+        assert!(!channel.finalize_draft_owns_visible_fallback());
+        assert_eq!(
+            channel.format_outbound_message(OutboundMessageRole::Agent, "final text"),
+            "final text"
+        );
         assert!(channel
             .send_draft(&SendMessage::new("draft", "bob"))
             .await
             .unwrap()
             .is_none());
         assert!(channel.update_draft("bob", "msg_1", "text").await.is_ok());
+        assert!(!channel.finalize_draft_owns_visible_fallback());
         assert!(channel
             .finalize_draft("bob", "msg_1", "final text")
             .await

@@ -49,6 +49,7 @@ pub mod whatsapp_storage;
 pub mod whatsapp_web;
 
 pub use acp::AcpChannel;
+#[allow(unused_imports)]
 pub use bluebubbles::BlueBubblesChannel;
 pub use clawdtalk::ClawdTalkChannel;
 pub use cli::CliChannel;
@@ -71,7 +72,9 @@ pub use qq::QQChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
-pub use traits::{Channel, SendMessage};
+pub use traits::{
+    Channel, DraftUpdateMode, OutboundMessageRole, SendMessage, StreamingProgressDelivery,
+};
 pub use wati::WatiChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
@@ -174,6 +177,47 @@ fn register_live_channels(channels_by_name: &HashMap<String, Arc<dyn Channel>>) 
 
 fn clear_live_channels() {
     live_channels_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+fn inbound_message_dedup_store() -> &'static Mutex<HashMap<String, Instant>> {
+    static STORE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn inbound_message_dedup_key(msg: &traits::ChannelMessage) -> Option<String> {
+    let message_id = msg.id.trim();
+    if message_id.is_empty() {
+        return None;
+    }
+
+    let canonical_channel = LarkRuntimeChannelIdentity::from_runtime_channel_name(&msg.channel)
+        .map(|identity| identity.canonical_channel_name().to_string())?;
+    Some(format!("{canonical_channel}:{message_id}"))
+}
+
+fn should_drop_duplicate_inbound_message(msg: &traits::ChannelMessage) -> bool {
+    let Some(key) = inbound_message_dedup_key(msg) else {
+        return false;
+    };
+
+    let now = Instant::now();
+    let mut store = inbound_message_dedup_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    store.retain(|_, timestamp| now.duration_since(*timestamp) < Duration::from_secs(30 * 60));
+    if store.contains_key(&key) {
+        return true;
+    }
+    store.insert(key, now);
+    false
+}
+
+#[cfg(test)]
+fn clear_inbound_message_dedup_store() {
+    inbound_message_dedup_store()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .clear();
@@ -835,11 +879,6 @@ impl ChannelProgressPolicy {
         }
     }
 
-    fn apply_draft_delta(self, accumulated: &mut String, delta: &str) -> Option<String> {
-        self.classify_draft_delta(delta)?
-            .apply_to_draft(accumulated)
-    }
-
     fn forwarded_delta(
         self,
         delta: ChannelWireDelta<'_>,
@@ -895,6 +934,7 @@ impl<'a> ChannelWireDelta<'a> {
     }
 }
 
+#[derive(Clone, Copy)]
 enum ChannelForwardedDelta<'a> {
     ProgressBlock(&'a str),
     Append(&'a str),
@@ -912,6 +952,13 @@ impl<'a> ChannelForwardedDelta<'a> {
             Self::Append(delta) => accumulated.push_str(delta),
         }
     }
+
+    fn into_delta_text(self) -> String {
+        match self {
+            Self::ProgressBlock(block) => block.to_string(),
+            Self::Append(delta) => delta.to_string(),
+        }
+    }
 }
 
 fn should_skip_internal_progress_line(mode: ProgressMode, delta: &str) -> bool {
@@ -924,21 +971,93 @@ enum DraftDelta<'a> {
 }
 
 impl<'a> DraftDelta<'a> {
-    fn apply_to_draft(self, accumulated: &mut String) -> Option<String> {
+    fn render_for_mode(self, accumulated: &mut String, mode: DraftUpdateMode) -> Option<String> {
         match self {
             Self::Clear => {
                 accumulated.clear();
                 None
             }
             Self::Forwarded(forwarded_delta) => {
-                forwarded_delta.apply_to_draft(accumulated);
-                Some(strip_progress_section_markers(
+                let previous_progress_block = extract_progress_section_text(
                     accumulated,
                     crate::agent::loop_::DRAFT_PROGRESS_SECTION_START,
                     crate::agent::loop_::DRAFT_PROGRESS_SECTION_END,
-                ))
+                )
+                .map(str::to_string);
+                let delta_text = forwarded_delta.into_delta_text();
+                forwarded_delta.apply_to_draft(accumulated);
+
+                match mode {
+                    DraftUpdateMode::Accumulated => Some(strip_progress_section_markers(
+                        accumulated,
+                        crate::agent::loop_::DRAFT_PROGRESS_SECTION_START,
+                        crate::agent::loop_::DRAFT_PROGRESS_SECTION_END,
+                    )),
+                    DraftUpdateMode::Delta => match forwarded_delta {
+                        ChannelForwardedDelta::Append(_) => {
+                            (!delta_text.is_empty()).then_some(delta_text)
+                        }
+                        ChannelForwardedDelta::ProgressBlock(_) => render_progress_block_delta(
+                            previous_progress_block.as_deref(),
+                            extract_progress_section_text(
+                                accumulated,
+                                crate::agent::loop_::DRAFT_PROGRESS_SECTION_START,
+                                crate::agent::loop_::DRAFT_PROGRESS_SECTION_END,
+                            ),
+                        ),
+                    },
+                }
             }
         }
+    }
+}
+
+fn extract_progress_section_text<'a>(
+    text: &'a str,
+    start_marker: &str,
+    end_marker: &str,
+) -> Option<&'a str> {
+    let start = text.find(start_marker)? + start_marker.len();
+    let end = text[start..].find(end_marker)?;
+    let section = text[start..start + end].trim();
+    (!section.is_empty()).then_some(section)
+}
+
+fn render_progress_block_delta(previous: Option<&str>, current: Option<&str>) -> Option<String> {
+    let current = current.map(str::trim).filter(|text| !text.is_empty())?;
+    let previous = previous.map(str::trim).filter(|text| !text.is_empty());
+
+    if previous.is_some_and(|text| text == current) {
+        return None;
+    }
+
+    let current_lines: Vec<&str> = current.lines().map(str::trim).collect();
+    if current_lines.is_empty() {
+        return None;
+    }
+
+    let previous_lines: Vec<&str> = previous
+        .map(|text| text.lines().map(str::trim).collect())
+        .unwrap_or_default();
+
+    let mut shared_prefix_len = 0usize;
+    while shared_prefix_len < previous_lines.len()
+        && shared_prefix_len < current_lines.len()
+        && previous_lines[shared_prefix_len] == current_lines[shared_prefix_len]
+    {
+        shared_prefix_len += 1;
+    }
+
+    let delta_lines = if shared_prefix_len == 0 {
+        &current_lines
+    } else {
+        &current_lines[shared_prefix_len..]
+    };
+
+    if delta_lines.is_empty() {
+        None
+    } else {
+        Some(delta_lines.join("\n"))
     }
 }
 
@@ -949,9 +1068,100 @@ fn classify_draft_stream_delta(mode: ProgressMode, delta: &str) -> Option<DraftD
 fn apply_draft_stream_delta(
     accumulated: &mut String,
     policy: ChannelProgressPolicy,
+    mode: DraftUpdateMode,
     delta: &str,
 ) -> Option<String> {
-    policy.apply_draft_delta(accumulated, delta)
+    policy
+        .classify_draft_delta(delta)?
+        .render_for_mode(accumulated, mode)
+}
+
+#[derive(Debug, Default)]
+struct VisibleDraftProgressState {
+    visible_terminal_tool_lines: HashMap<String, String>,
+}
+
+impl VisibleDraftProgressState {
+    fn filter_delta(&mut self, mode: DraftUpdateMode, display_text: &str) -> Option<String> {
+        if mode != DraftUpdateMode::Delta || display_text.is_empty() {
+            return (!display_text.is_empty()).then(|| display_text.to_string());
+        }
+
+        let mut saw_terminal_tool_line = false;
+        let mut visible_lines = Vec::new();
+        for line in display_text.lines() {
+            if let Some(tool_name) = parse_running_tool_progress_line(line) {
+                self.visible_terminal_tool_lines.remove(tool_name);
+                visible_lines.push(line);
+                continue;
+            }
+
+            let Some((tool_name, normalized_line)) = parse_terminal_tool_progress_line(line) else {
+                visible_lines.push(line);
+                continue;
+            };
+
+            saw_terminal_tool_line = true;
+            let tool_name = tool_name.to_string();
+            let normalized_line = normalized_line.to_string();
+            if self
+                .visible_terminal_tool_lines
+                .get(&tool_name)
+                .is_some_and(|visible| visible == &normalized_line)
+            {
+                continue;
+            }
+
+            self.visible_terminal_tool_lines
+                .insert(tool_name, normalized_line);
+            visible_lines.push(line);
+        }
+
+        if !saw_terminal_tool_line {
+            return Some(display_text.to_string());
+        }
+
+        let visible_lines: Vec<&str> = visible_lines
+            .into_iter()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        if visible_lines.is_empty() {
+            None
+        } else {
+            Some(visible_lines.join("\n"))
+        }
+    }
+}
+
+fn parse_terminal_tool_progress_line(line: &str) -> Option<(&str, &str)> {
+    let trimmed = line.trim();
+    let body = trimmed
+        .strip_prefix('✅')
+        .or_else(|| trimmed.strip_prefix('❌'))?
+        .trim_start();
+    let open_paren = body.find('(')?;
+    let tool_name = body[..open_paren].trim_end();
+    if tool_name.is_empty() {
+        return None;
+    }
+
+    let suffix = body[open_paren..].trim_start();
+    if suffix.contains("s)") || suffix.contains("s):") {
+        Some((tool_name, trimmed))
+    } else {
+        None
+    }
+}
+
+fn parse_running_tool_progress_line(line: &str) -> Option<&str> {
+    let trimmed = line.trim();
+    let body = trimmed.strip_prefix('⏳')?.trim_start();
+    let tool_name = body
+        .split_once(':')
+        .map(|(tool_name, _)| tool_name)
+        .unwrap_or(body)
+        .trim();
+    (!tool_name.is_empty()).then_some(tool_name)
 }
 
 struct DraftStreamingRuntime {
@@ -963,19 +1173,45 @@ struct DraftStreamingRuntime {
 #[derive(Clone, Copy)]
 struct ChannelDeliveryPlan<'a> {
     channel: Option<&'a Arc<dyn Channel>>,
+    streaming_progress_delivery: StreamingProgressDelivery,
     supports_draft_updates: bool,
 }
 
 impl<'a> ChannelDeliveryPlan<'a> {
     fn new(channel: Option<&'a Arc<dyn Channel>>) -> Self {
+        let streaming_progress_delivery =
+            match channel.map(|channel| channel.streaming_progress_delivery()) {
+                Some(StreamingProgressDelivery::Draft)
+                    if channel.is_some_and(|channel| channel.supports_draft_updates()) =>
+                {
+                    StreamingProgressDelivery::Draft
+                }
+                Some(StreamingProgressDelivery::Draft) => StreamingProgressDelivery::None,
+                Some(other) => other,
+                None => StreamingProgressDelivery::None,
+            };
+
         Self {
             channel,
-            supports_draft_updates: channel.is_some_and(|channel| channel.supports_draft_updates()),
+            streaming_progress_delivery,
+            supports_draft_updates: matches!(
+                streaming_progress_delivery,
+                StreamingProgressDelivery::Draft
+            ),
         }
     }
 
     fn draft_channel(self) -> Option<&'a Arc<dyn Channel>> {
         self.channel.filter(|_| self.supports_draft_updates)
+    }
+
+    fn progress_channel(self) -> Option<&'a Arc<dyn Channel>> {
+        self.channel.filter(|_| {
+            !matches!(
+                self.streaming_progress_delivery,
+                StreamingProgressDelivery::None
+            )
+        })
     }
 
     fn reply_delivery(
@@ -1105,9 +1341,54 @@ async fn send_channel_reply_message(
     msg: &traits::ChannelMessage,
     text: &str,
 ) -> anyhow::Result<()> {
+    let text = channel.format_outbound_message(OutboundMessageRole::Agent, text);
     channel
         .send(&SendMessage::new(text, &msg.reply_target).in_thread(msg.thread_ts.clone()))
         .await
+}
+
+fn should_forward_streaming_progress_delta(channel: &dyn Channel, delta: &str) -> bool {
+    match ChannelWireDelta::parse(delta) {
+        ChannelWireDelta::Clear | ChannelWireDelta::ProgressBlock(_) => true,
+        ChannelWireDelta::Text {
+            is_internal_progress,
+            ..
+        } => is_internal_progress || channel.streams_assistant_text_in_progress(),
+    }
+}
+
+async fn flush_batched_progress_logs(
+    channel: &dyn Channel,
+    reply_target: &str,
+    thread_ts: Option<String>,
+    pending_logs: &mut Vec<String>,
+) {
+    if pending_logs.is_empty() {
+        return;
+    }
+
+    let content = pending_logs
+        .iter()
+        .map(|entry| entry.trim())
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    pending_logs.clear();
+    let content = content.trim();
+    if content.is_empty() {
+        return;
+    }
+
+    let content = channel.format_outbound_message(OutboundMessageRole::Log, content);
+    if let Err(error) = channel
+        .send(&SendMessage::new(content, reply_target).in_thread(thread_ts))
+        .await
+    {
+        tracing::debug!(
+            "Debounced progress log send failed on {}: {error}",
+            channel.name()
+        );
+    }
 }
 
 async fn finalize_channel_reply_draft(
@@ -1122,7 +1403,10 @@ async fn finalize_channel_reply_draft(
         .await
     {
         Ok(()) => Ok(()),
-        Err(err) if dispatch.fallback_to_fresh_send_on_finalize_failure() => {
+        Err(err)
+            if dispatch.fallback_to_fresh_send_on_finalize_failure()
+                && !channel.finalize_draft_owns_visible_fallback() =>
+        {
             tracing::warn!(
                 "Failed to finalize draft on {}: {err}; sending as new message",
                 channel.name()
@@ -1712,24 +1996,27 @@ async fn setup_draft_streaming_runtime(
 
     tracing::debug!(
         has_target_channel = plan.channel.is_some(),
+        streaming_progress_delivery = ?plan.streaming_progress_delivery,
         use_streaming = plan.supports_draft_updates,
         supports_draft = plan.supports_draft_updates,
         "Draft streaming decision"
     );
 
-    let (delta_tx, delta_rx) = if plan.supports_draft_updates {
+    let (delta_tx, delta_rx) = if plan.progress_channel().is_some() {
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
         (Some(tx), Some(rx))
     } else {
         (None, None)
     };
 
-    let draft_message_id = send_initial_streaming_draft(plan, reply_target, thread_ts).await;
+    let draft_message_id =
+        send_initial_streaming_draft(plan, reply_target, thread_ts.clone()).await;
     let updater = spawn_draft_streaming_updater(
         plan,
         delta_rx,
         draft_message_id.as_deref(),
         reply_target,
+        thread_ts,
         progress_policy,
     );
 
@@ -1766,36 +2053,146 @@ fn spawn_draft_streaming_updater(
     delta_rx: Option<tokio::sync::mpsc::Receiver<String>>,
     draft_message_id: Option<&str>,
     reply_target: &str,
+    thread_ts: Option<String>,
     progress_policy: ChannelProgressPolicy,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let (Some(mut rx), Some(draft_id_ref), Some(channel_ref)) =
-        (delta_rx, draft_message_id, plan.draft_channel())
-    else {
-        return None;
-    };
-
-    let channel = Arc::clone(channel_ref);
-    let reply_target = reply_target.to_string();
-    let draft_id = draft_id_ref.to_string();
-    Some(tokio::spawn(async move {
-        let mut accumulated = String::new();
-        let mut active_draft_id = draft_id;
-        while let Some(delta) = rx.recv().await {
-            let Some(display_text) =
-                apply_draft_stream_delta(&mut accumulated, progress_policy, &delta)
+    match plan.streaming_progress_delivery {
+        StreamingProgressDelivery::None => None,
+        StreamingProgressDelivery::Draft => {
+            let (Some(mut rx), Some(draft_id_ref), Some(channel_ref)) =
+                (delta_rx, draft_message_id, plan.draft_channel())
             else {
-                continue;
+                return None;
             };
-            match channel
-                .update_draft(&reply_target, &active_draft_id, &display_text)
-                .await
-            {
-                Ok(Some(next_draft_id)) => active_draft_id = next_draft_id,
-                Ok(None) => {}
-                Err(error) => tracing::debug!("Draft update failed: {error}"),
-            }
+
+            let channel = Arc::clone(channel_ref);
+            let reply_target = reply_target.to_string();
+            let draft_id = draft_id_ref.to_string();
+            let draft_update_mode = channel.draft_update_mode();
+            Some(tokio::spawn(async move {
+                let mut accumulated = String::new();
+                let mut visible_progress_state = VisibleDraftProgressState::default();
+                let mut active_draft_id = draft_id;
+                while let Some(delta) = rx.recv().await {
+                    let Some(display_text) = apply_draft_stream_delta(
+                        &mut accumulated,
+                        progress_policy,
+                        draft_update_mode,
+                        &delta,
+                    ) else {
+                        continue;
+                    };
+                    let Some(display_text) =
+                        visible_progress_state.filter_delta(draft_update_mode, &display_text)
+                    else {
+                        continue;
+                    };
+                    match channel
+                        .update_draft(&reply_target, &active_draft_id, &display_text)
+                        .await
+                    {
+                        Ok(Some(next_draft_id)) => active_draft_id = next_draft_id,
+                        Ok(None) => {}
+                        Err(error) => tracing::debug!("Draft update failed: {error}"),
+                    }
+                }
+            }))
         }
-    }))
+        StreamingProgressDelivery::DebouncedLogBatch { idle_timeout } => {
+            let (Some(mut rx), Some(channel_ref)) = (delta_rx, plan.progress_channel()) else {
+                return None;
+            };
+
+            let channel = Arc::clone(channel_ref);
+            let reply_target = reply_target.to_string();
+            Some(tokio::spawn(async move {
+                let draft_update_mode = DraftUpdateMode::Delta;
+                let mut accumulated = String::new();
+                let mut visible_progress_state = VisibleDraftProgressState::default();
+                let mut pending_logs = Vec::new();
+                let mut last_visible_log_at: Option<Instant> = None;
+
+                loop {
+                    let next_delta = if pending_logs.is_empty() {
+                        rx.recv().await
+                    } else {
+                        let Some(last_visible_log_instant) = last_visible_log_at else {
+                            flush_batched_progress_logs(
+                                channel.as_ref(),
+                                &reply_target,
+                                thread_ts.clone(),
+                                &mut pending_logs,
+                            )
+                            .await;
+                            continue;
+                        };
+                        let remaining_idle = idle_timeout
+                            .checked_sub(last_visible_log_instant.elapsed())
+                            .unwrap_or_default();
+                        if remaining_idle.is_zero() {
+                            flush_batched_progress_logs(
+                                channel.as_ref(),
+                                &reply_target,
+                                thread_ts.clone(),
+                                &mut pending_logs,
+                            )
+                            .await;
+                            last_visible_log_at = None;
+                            continue;
+                        }
+
+                        match tokio::time::timeout(remaining_idle, rx.recv()).await {
+                            Ok(delta) => delta,
+                            Err(_) => {
+                                flush_batched_progress_logs(
+                                    channel.as_ref(),
+                                    &reply_target,
+                                    thread_ts.clone(),
+                                    &mut pending_logs,
+                                )
+                                .await;
+                                last_visible_log_at = None;
+                                continue;
+                            }
+                        }
+                    };
+
+                    let Some(delta) = next_delta else {
+                        flush_batched_progress_logs(
+                            channel.as_ref(),
+                            &reply_target,
+                            thread_ts.clone(),
+                            &mut pending_logs,
+                        )
+                        .await;
+                        break;
+                    };
+
+                    if !should_forward_streaming_progress_delta(channel.as_ref(), &delta) {
+                        continue;
+                    }
+
+                    let Some(display_text) = apply_draft_stream_delta(
+                        &mut accumulated,
+                        progress_policy,
+                        draft_update_mode,
+                        &delta,
+                    ) else {
+                        continue;
+                    };
+                    let Some(display_text) =
+                        visible_progress_state.filter_delta(draft_update_mode, &display_text)
+                    else {
+                        continue;
+                    };
+                    if !display_text.trim().is_empty() {
+                        pending_logs.push(display_text);
+                        last_visible_log_at = Some(Instant::now());
+                    }
+                }
+            }))
+        }
+    }
 }
 
 fn build_channel_system_prompt(
@@ -4401,6 +4798,15 @@ async fn process_channel_message(
         return;
     }
 
+    if should_drop_duplicate_inbound_message(&msg) {
+        tracing::debug!(
+            channel = %msg.channel,
+            message_id = %msg.id,
+            "Skipping duplicate inbound channel message"
+        );
+        return;
+    }
+
     println!(
         "  💬 [{}] from {}: {}",
         msg.channel,
@@ -5719,7 +6125,40 @@ fn collect_configured_channels(
 
     #[cfg(feature = "channel-lark")]
     {
+        let mut selected_candidates: Vec<crate::config::schema::LarkConfiguredChannel<'_>> =
+            Vec::new();
+        let mut selected_by_app_id = HashMap::<String, usize>::new();
+
         for candidate in configured_lark_channels(&config.channels_config) {
+            let app_id = candidate.config.app_id().trim().to_string();
+            if let Some(existing_index) = selected_by_app_id.get(&app_id).copied() {
+                let existing = selected_candidates[existing_index];
+                let candidate_prefers = candidate.source.prefers_over(existing.source)
+                    || (candidate.identity.requested_channel_name() == "feishu"
+                        && existing.identity.requested_channel_name() != "feishu");
+                if candidate_prefers {
+                    tracing::warn!(
+                        "Lark/Feishu config for app_id '{}' is duplicated; preferring runtime channel '{}' over '{}'.",
+                        app_id,
+                        candidate.identity.requested_channel_name(),
+                        existing.identity.requested_channel_name(),
+                    );
+                    selected_candidates[existing_index] = candidate;
+                } else {
+                    tracing::warn!(
+                        "Lark/Feishu config for app_id '{}' is duplicated; skipping runtime channel '{}'.",
+                        app_id,
+                        candidate.identity.requested_channel_name(),
+                    );
+                }
+                continue;
+            }
+
+            selected_by_app_id.insert(app_id, selected_candidates.len());
+            selected_candidates.push(candidate);
+        }
+
+        for candidate in selected_candidates {
             channels.push(configured_lark_channel(
                 candidate.config,
                 &config.channels_config.ack_reaction,
@@ -6327,6 +6766,7 @@ mod tests {
         let mutex = GUARD.get_or_init(|| Mutex::new(()));
         let guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
         set_runtime_channel_progress_modes(HashMap::new());
+        clear_inbound_message_dedup_store();
         guard
     }
 
@@ -6841,6 +7281,18 @@ mod tests {
         finalized_drafts: tokio::sync::Mutex<Vec<String>>,
     }
 
+    struct DraftFinalizeOwnershipChannel {
+        name: &'static str,
+        owns_visible_fallback: bool,
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+        locally_fallback_messages: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    #[derive(Default)]
+    struct DebouncedLogRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+    }
+
     #[async_trait::async_trait]
     impl Channel for TelegramRecordingChannel {
         fn name(&self) -> &str {
@@ -6922,6 +7374,94 @@ mod tests {
         ) -> anyhow::Result<()> {
             self.finalized_drafts.lock().await.push(text.to_string());
             Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for DraftFinalizeOwnershipChannel {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn supports_draft_updates(&self) -> bool {
+            true
+        }
+
+        fn finalize_draft_owns_visible_fallback(&self) -> bool {
+            self.owns_visible_fallback
+        }
+
+        async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
+            Ok(Some("draft-1".to_string()))
+        }
+
+        async fn finalize_draft(
+            &self,
+            recipient: &str,
+            _message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<()> {
+            if self.owns_visible_fallback {
+                self.locally_fallback_messages
+                    .lock()
+                    .await
+                    .push(format!("{recipient}:{text}"));
+            }
+            anyhow::bail!("finalize failed")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for DebouncedLogRecordingChannel {
+        fn name(&self) -> &str {
+            "feishu"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn streaming_progress_delivery(&self) -> StreamingProgressDelivery {
+            StreamingProgressDelivery::DebouncedLogBatch {
+                idle_timeout: Duration::from_millis(20),
+            }
+        }
+
+        fn streams_assistant_text_in_progress(&self) -> bool {
+            false
+        }
+
+        fn format_outbound_message(&self, role: OutboundMessageRole, text: &str) -> String {
+            match role {
+                OutboundMessageRole::Agent => format!("[zeroclaw agent LLM]\n{text}"),
+                OutboundMessageRole::Log => format!("[zeroclaw log]\n{text}"),
+            }
         }
     }
 
@@ -12336,6 +12876,450 @@ Done reminder set for 1:38 AM."#;
     }
 
     #[test]
+    fn draft_update_mode_delta_preserves_incremental_chunks_without_repetition() {
+        let policy = ChannelProgressPolicy::for_mode(ProgressMode::Verbose);
+        let mut accumulated = String::new();
+
+        let first = policy
+            .classify_draft_delta("a")
+            .expect("first delta should be visible")
+            .render_for_mode(&mut accumulated, DraftUpdateMode::Delta);
+        let second = policy
+            .classify_draft_delta("b")
+            .expect("second delta should be visible")
+            .render_for_mode(&mut accumulated, DraftUpdateMode::Delta);
+        let third = policy
+            .classify_draft_delta("c")
+            .expect("third delta should be visible")
+            .render_for_mode(&mut accumulated, DraftUpdateMode::Delta);
+
+        assert_eq!(first.as_deref(), Some("a"));
+        assert_eq!(second.as_deref(), Some("b"));
+        assert_eq!(third.as_deref(), Some("c"));
+        assert_eq!(accumulated, "abc");
+    }
+
+    #[test]
+    fn draft_update_mode_delta_emits_only_new_progress_block_lines() {
+        let policy = ChannelProgressPolicy::for_mode(ProgressMode::Verbose);
+        let mut accumulated = String::new();
+        let mut visible_progress_state = VisibleDraftProgressState::default();
+
+        let first = visible_progress_state.filter_delta(
+            DraftUpdateMode::Delta,
+            &apply_draft_stream_delta(
+                &mut accumulated,
+                policy,
+                DraftUpdateMode::Delta,
+                "\x00PROGRESS_BLOCK\x00⏳ cron_add",
+            )
+            .expect("first progress delta should exist"),
+        );
+        let second = visible_progress_state.filter_delta(
+            DraftUpdateMode::Delta,
+            &apply_draft_stream_delta(
+                &mut accumulated,
+                policy,
+                DraftUpdateMode::Delta,
+                "\x00PROGRESS_BLOCK\x00✅ cron_add (0s)",
+            )
+            .expect("second progress delta should exist"),
+        );
+        let third = visible_progress_state.filter_delta(
+            DraftUpdateMode::Delta,
+            &apply_draft_stream_delta(
+                &mut accumulated,
+                policy,
+                DraftUpdateMode::Delta,
+                "\x00PROGRESS_BLOCK\x00✅ cron_add (0s)\n⏳ cron_list",
+            )
+            .expect("third progress delta should exist"),
+        );
+        let repeated = apply_draft_stream_delta(
+            &mut accumulated,
+            policy,
+            DraftUpdateMode::Delta,
+            "\x00PROGRESS_BLOCK\x00✅ cron_add (0s)\n⏳ cron_list",
+        );
+        let repeated = repeated
+            .and_then(|delta| visible_progress_state.filter_delta(DraftUpdateMode::Delta, &delta));
+        let fourth = visible_progress_state.filter_delta(
+            DraftUpdateMode::Delta,
+            &apply_draft_stream_delta(
+                &mut accumulated,
+                policy,
+                DraftUpdateMode::Delta,
+                "\x00PROGRESS_BLOCK\x00✅ cron_add (0s)\n✅ cron_list (0s)",
+            )
+            .expect("fourth progress delta should exist"),
+        );
+
+        assert_eq!(first.as_deref(), Some("⏳ cron_add"));
+        assert_eq!(second.as_deref(), Some("✅ cron_add (0s)"));
+        assert_eq!(third.as_deref(), Some("⏳ cron_list"));
+        assert_eq!(repeated, None);
+        assert_eq!(fourth.as_deref(), Some("✅ cron_list (0s)"));
+        assert_eq!(
+            strip_progress_section_markers(
+                &accumulated,
+                crate::agent::loop_::DRAFT_PROGRESS_SECTION_START,
+                crate::agent::loop_::DRAFT_PROGRESS_SECTION_END,
+            ),
+            "✅ cron_add (0s)\n✅ cron_list (0s)"
+        );
+    }
+
+    #[test]
+    fn visible_draft_progress_state_suppresses_repeated_terminal_tool_line_when_tool_reappears() {
+        let mut state = VisibleDraftProgressState::default();
+
+        assert_eq!(
+            state.filter_delta(DraftUpdateMode::Delta, "✅ cron_add (0s)\n⏳ cron_list"),
+            Some("✅ cron_add (0s)\n⏳ cron_list".to_string())
+        );
+        assert_eq!(
+            state.filter_delta(
+                DraftUpdateMode::Delta,
+                "✅ cron_list (0s)\n✅ cron_add (0s)"
+            ),
+            Some("✅ cron_list (0s)".to_string())
+        );
+    }
+
+    #[test]
+    fn visible_draft_progress_state_suppresses_terminal_tool_replays_when_block_order_changes() {
+        let mut state = VisibleDraftProgressState::default();
+
+        assert_eq!(
+            state.filter_delta(
+                DraftUpdateMode::Delta,
+                "✅ cron_add (0s)\n✅ cron_list (0s)"
+            ),
+            Some("✅ cron_add (0s)\n✅ cron_list (0s)".to_string())
+        );
+        assert_eq!(
+            state.filter_delta(
+                DraftUpdateMode::Delta,
+                "✅ cron_list (0s)\n✅ cron_add (0s)"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn visible_draft_progress_state_shows_each_terminal_tool_line_once() {
+        let mut state = VisibleDraftProgressState::default();
+
+        assert_eq!(
+            state.filter_delta(DraftUpdateMode::Delta, "✅ cron_add (0s)"),
+            Some("✅ cron_add (0s)".to_string())
+        );
+        assert_eq!(
+            state.filter_delta(
+                DraftUpdateMode::Delta,
+                "✅ cron_add (0s)\n✅ cron_list (0s)"
+            ),
+            Some("✅ cron_list (0s)".to_string())
+        );
+        assert_eq!(
+            state.filter_delta(
+                DraftUpdateMode::Delta,
+                "✅ cron_add (0s)\n✅ cron_list (0s)"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn visible_draft_progress_state_does_not_resurface_old_terminal_line_after_running_change() {
+        let mut state = VisibleDraftProgressState::default();
+
+        assert_eq!(
+            state.filter_delta(DraftUpdateMode::Delta, "✅ cron_add (0s)\n⏳ cron_list"),
+            Some("✅ cron_add (0s)\n⏳ cron_list".to_string())
+        );
+        assert_eq!(
+            state.filter_delta(
+                DraftUpdateMode::Delta,
+                "✅ cron_add (0s)\n⏳ cron_list: refreshed hint"
+            ),
+            Some("⏳ cron_list: refreshed hint".to_string())
+        );
+    }
+
+    #[test]
+    fn visible_draft_progress_state_keeps_plain_text_delta_behavior() {
+        let mut state = VisibleDraftProgressState::default();
+
+        assert_eq!(
+            state.filter_delta(DraftUpdateMode::Delta, "a"),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            state.filter_delta(DraftUpdateMode::Delta, "bc"),
+            Some("bc".to_string())
+        );
+        assert_eq!(
+            state.filter_delta(DraftUpdateMode::Accumulated, "abc"),
+            Some("abc".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_terminal_tool_progress_line_recognizes_completed_lines() {
+        assert_eq!(
+            parse_terminal_tool_progress_line("✅ cron_add (0s)"),
+            Some(("cron_add", "✅ cron_add (0s)"))
+        );
+        assert_eq!(
+            parse_terminal_tool_progress_line("❌ cron_add (0s): timeout"),
+            Some(("cron_add", "❌ cron_add (0s): timeout"))
+        );
+        assert_eq!(parse_terminal_tool_progress_line("⏳ cron_add"), None);
+        assert_eq!(parse_terminal_tool_progress_line("plain text"), None);
+    }
+
+    #[test]
+    fn visible_draft_progress_state_allows_same_tool_after_running_restart() {
+        let mut state = VisibleDraftProgressState::default();
+
+        assert_eq!(
+            state.filter_delta(DraftUpdateMode::Delta, "✅ cron_add (0s)"),
+            Some("✅ cron_add (0s)".to_string())
+        );
+        assert_eq!(
+            state.filter_delta(DraftUpdateMode::Delta, "⏳ cron_add"),
+            Some("⏳ cron_add".to_string())
+        );
+        assert_eq!(
+            state.filter_delta(DraftUpdateMode::Delta, "✅ cron_add (0s)"),
+            Some("✅ cron_add (0s)".to_string())
+        );
+    }
+
+    #[test]
+    fn visible_draft_progress_state_trims_duplicate_terminal_tool_lines_out_of_reordered_progress_block_delta(
+    ) {
+        let policy = ChannelProgressPolicy::for_mode(ProgressMode::Verbose);
+        let mut accumulated = String::new();
+        let mut visible_progress_state = VisibleDraftProgressState::default();
+
+        let _ = visible_progress_state.filter_delta(
+            DraftUpdateMode::Delta,
+            &apply_draft_stream_delta(
+                &mut accumulated,
+                policy,
+                DraftUpdateMode::Delta,
+                "\x00PROGRESS_BLOCK\x00✅ cron_add (0s)\n✅ cron_list (0s)",
+            )
+            .expect("initial progress delta should exist"),
+        );
+
+        let replayed = apply_draft_stream_delta(
+            &mut accumulated,
+            policy,
+            DraftUpdateMode::Delta,
+            "\x00PROGRESS_BLOCK\x00✅ cron_list (0s)\n✅ cron_add (0s)",
+        );
+
+        assert_eq!(
+            replayed.and_then(
+                |delta| visible_progress_state.filter_delta(DraftUpdateMode::Delta, &delta)
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_channel_reply_draft_avoids_shared_fresh_send_when_channel_owns_fallback() {
+        let channel_impl = Arc::new(DraftFinalizeOwnershipChannel {
+            name: "owned-draft-finalize",
+            owns_visible_fallback: true,
+            sent_messages: tokio::sync::Mutex::new(Vec::new()),
+            locally_fallback_messages: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let msg = traits::ChannelMessage {
+            id: "msg-owned-finalize".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-owned".to_string(),
+            content: "hello".to_string(),
+            channel: "owned-draft-finalize".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+        };
+
+        let result = finalize_channel_reply_draft(
+            &channel,
+            &msg,
+            "draft-1",
+            "final answer",
+            ChannelReplyDispatch::Successful,
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(channel_impl.sent_messages.lock().await.is_empty());
+        assert_eq!(
+            channel_impl
+                .locally_fallback_messages
+                .lock()
+                .await
+                .as_slice(),
+            ["chat-owned:final answer"]
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_channel_reply_draft_falls_back_to_shared_send_when_channel_does_not_own_it() {
+        let channel_impl = Arc::new(DraftFinalizeOwnershipChannel {
+            name: "shared-draft-finalize",
+            owns_visible_fallback: false,
+            sent_messages: tokio::sync::Mutex::new(Vec::new()),
+            locally_fallback_messages: tokio::sync::Mutex::new(Vec::new()),
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let msg = traits::ChannelMessage {
+            id: "msg-shared-finalize".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-shared".to_string(),
+            content: "hello".to_string(),
+            channel: "shared-draft-finalize".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+        };
+
+        let result = finalize_channel_reply_draft(
+            &channel,
+            &msg,
+            "draft-1",
+            "final answer",
+            ChannelReplyDispatch::Successful,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            channel_impl.sent_messages.lock().await.as_slice(),
+            ["chat-shared:final answer"]
+        );
+        assert!(channel_impl
+            .locally_fallback_messages
+            .lock()
+            .await
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_channel_reply_message_formats_agent_role() {
+        let channel_impl = Arc::new(DebouncedLogRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let msg = traits::ChannelMessage {
+            id: "msg-agent-role".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-agent".to_string(),
+            content: "hello".to_string(),
+            channel: "feishu".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+        };
+
+        send_channel_reply_message(&channel, &msg, "final answer")
+            .await
+            .expect("agent reply should send");
+
+        assert_eq!(
+            channel_impl.sent_messages.lock().await.as_slice(),
+            ["chat-agent:[zeroclaw agent LLM]\nfinal answer"]
+        );
+    }
+
+    #[tokio::test]
+    async fn debounced_log_progress_batches_internal_updates_and_skips_agent_streaming() {
+        let channel_impl = Arc::new(DebouncedLogRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let plan = ChannelDeliveryPlan::new(Some(&channel));
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let updater = spawn_draft_streaming_updater(
+            plan,
+            Some(rx),
+            None,
+            "chat-log",
+            None,
+            ChannelProgressPolicy::for_mode(ProgressMode::Verbose),
+        )
+        .expect("debounced log updater should spawn");
+
+        tx.send(format!(
+            "{}Started tool A\n",
+            crate::agent::loop_::DRAFT_PROGRESS_SENTINEL
+        ))
+        .await
+        .expect("first log delta should enqueue");
+        tx.send(format!(
+            "{}Finished tool A\n",
+            crate::agent::loop_::DRAFT_PROGRESS_SENTINEL
+        ))
+        .await
+        .expect("second log delta should enqueue");
+        tx.send("partial assistant reply".to_string())
+            .await
+            .expect("assistant chunk should enqueue");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(tx);
+        updater.await.expect("debounced log updater should finish");
+
+        assert_eq!(
+            channel_impl.sent_messages.lock().await.as_slice(),
+            ["chat-log:[zeroclaw log]\nStarted tool A\nFinished tool A"]
+        );
+    }
+
+    #[tokio::test]
+    async fn debounced_log_progress_flushes_after_idle_even_with_invisible_deltas() {
+        let channel_impl = Arc::new(DebouncedLogRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let plan = ChannelDeliveryPlan::new(Some(&channel));
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let updater = spawn_draft_streaming_updater(
+            plan,
+            Some(rx),
+            None,
+            "chat-log",
+            None,
+            ChannelProgressPolicy::for_mode(ProgressMode::Verbose),
+        )
+        .expect("debounced log updater should spawn");
+
+        tx.send(format!(
+            "{}Started tool A\n",
+            crate::agent::loop_::DRAFT_PROGRESS_SENTINEL
+        ))
+        .await
+        .expect("visible log delta should enqueue");
+
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            tx.send(crate::agent::loop_::DRAFT_CLEAR_SENTINEL.to_string())
+                .await
+                .expect("clear sentinel should enqueue");
+            tx.send("partial assistant reply".to_string())
+                .await
+                .expect("assistant chunk should enqueue");
+        }
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(tx);
+        updater.await.expect("debounced log updater should finish");
+
+        assert_eq!(
+            channel_impl.sent_messages.lock().await.as_slice(),
+            ["chat-log:[zeroclaw log]\nStarted tool A"]
+        );
+    }
+
+    #[test]
     fn compact_mode_keeps_structured_lifecycle_progress_visible() {
         let triggered = "⏱️ Cron triggered: id=job1 name=nightly type=shell\nschedule=every(1000ms)\ncommand=echo ok\nstatus=triggered";
         let running = "▶️ Cron running: id=job1 name=nightly type=shell\nstatus=shell command is now executing";
@@ -12425,11 +13409,11 @@ Done reminder set for 1:38 AM."#;
         );
         assert_eq!(
             effective_progress_mode_for_message("lark", false),
-            ProgressMode::Compact
+            ProgressMode::Off
         );
         assert_eq!(
             effective_progress_mode_for_message("feishu", false),
-            ProgressMode::Compact
+            ProgressMode::Off
         );
         assert_eq!(
             effective_progress_mode_for_message("draft-streaming-channel", true),
@@ -12674,6 +13658,91 @@ Done reminder set for 1:38 AM."#;
 
         assert_eq!(feishu_count, 1);
         assert_eq!(lark_count, 0);
+    }
+
+    #[cfg(feature = "channel-lark")]
+    #[test]
+    fn collect_configured_channels_deduplicates_same_app_id_in_favor_of_feishu() {
+        let mut config = Config::default();
+        config.channels_config.lark = Some(crate::config::LarkConfig {
+            app_id: "shared-app-id".to_string(),
+            app_secret: "shared-secret".to_string(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            mention_only: false,
+            group_reply: None,
+            use_feishu: false,
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            progress_mode: ProgressMode::Compact,
+        });
+        config.channels_config.feishu = Some(crate::config::FeishuConfig {
+            app_id: "shared-app-id".to_string(),
+            app_secret: "shared-secret".to_string(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            group_reply: None,
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            port: None,
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            progress_mode: ProgressMode::Compact,
+        });
+
+        let channels = collect_configured_channels(&config, "test");
+        let channel_names: Vec<&str> = channels.iter().map(|entry| entry.channel.name()).collect();
+
+        assert_eq!(channel_names, vec!["feishu"]);
+    }
+
+    #[test]
+    fn inbound_message_dedup_key_coalesces_lark_and_feishu_aliases() {
+        let lark_msg = traits::ChannelMessage {
+            id: "om_same_1".to_string(),
+            sender: "chat".to_string(),
+            reply_target: "chat".to_string(),
+            content: "hello".to_string(),
+            channel: "lark".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+        };
+        let feishu_msg = traits::ChannelMessage {
+            channel: "feishu".to_string(),
+            ..lark_msg.clone()
+        };
+
+        assert_eq!(
+            inbound_message_dedup_key(&lark_msg),
+            inbound_message_dedup_key(&feishu_msg)
+        );
+    }
+
+    #[test]
+    fn should_drop_duplicate_inbound_message_blocks_second_alias_delivery() {
+        clear_inbound_message_dedup_store();
+
+        let lark_msg = traits::ChannelMessage {
+            id: "om_same_2".to_string(),
+            sender: "chat".to_string(),
+            reply_target: "chat".to_string(),
+            content: "hello".to_string(),
+            channel: "lark".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+        };
+        let feishu_msg = traits::ChannelMessage {
+            channel: "feishu".to_string(),
+            ..lark_msg.clone()
+        };
+
+        assert!(!should_drop_duplicate_inbound_message(&lark_msg));
+        assert!(should_drop_duplicate_inbound_message(&feishu_msg));
     }
 
     #[test]

@@ -3,7 +3,10 @@ use super::progress_event::{
     decide_draft_progress_update, DraftContinuationReason, DraftProgressState,
     DraftProgressUpdateDecision,
 };
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::traits::{
+    Channel, ChannelMessage, DraftUpdateMode, OutboundMessageRole, SendMessage,
+    StreamingProgressDelivery,
+};
 use crate::config::schema::{LarkChannelConfig, LarkChannelPlatform};
 use async_trait::async_trait;
 use base64::Engine;
@@ -14,7 +17,6 @@ use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message as WsMsg;
-use uuid::Uuid;
 
 const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &[
     "OK", "JIAYI", "APPLAUSE", "THUMBSUP", "MUSCLE", "SMILE", "DONE",
@@ -496,6 +498,33 @@ impl LarkChannel {
         }
     }
 
+    fn sender_is_self(sender_type: &str) -> bool {
+        matches!(sender_type, "app" | "bot")
+    }
+
+    fn sender_matches_self_identity(&self, sender_type: &str, open_id: &str) -> bool {
+        Self::sender_is_self(sender_type)
+            || self
+                .resolved_bot_open_id()
+                .as_deref()
+                .is_some_and(|bot_open_id| !bot_open_id.is_empty() && bot_open_id == open_id)
+    }
+
+    async fn mark_inbound_message_seen(&self, message_id: &str) -> bool {
+        if message_id.trim().is_empty() {
+            return false;
+        }
+
+        let now = Instant::now();
+        let mut seen = self.ws_seen_ids.write().await;
+        seen.retain(|_, timestamp| now.duration_since(*timestamp) < Duration::from_secs(30 * 60));
+        if seen.contains_key(message_id) {
+            return true;
+        }
+        seen.insert(message_id.to_string(), now);
+        false
+    }
+
     fn draft_state_key(recipient: &str, message_id: &str) -> String {
         format!("{recipient}:{message_id}")
     }
@@ -556,32 +585,68 @@ impl LarkChannel {
             reason.as_str()
         );
 
-        let next_message_id = self
-            .create_text_message(recipient, text)
-            .await?
-            .unwrap_or(active_message_id);
-        Ok(next_message_id)
+        self.replace_message_with_new_text(
+            recipient,
+            &active_message_id,
+            text,
+            "draft continuation",
+        )
+        .await
     }
 
-    async fn update_message_or_send_fallback(
+    async fn replace_message_with_new_text(
         &self,
         recipient: &str,
         message_id: &str,
         text: &str,
         operation: &str,
     ) -> anyhow::Result<String> {
-        match self.update_text_message(message_id, text).await {
-            Ok(()) => Ok(message_id.to_string()),
-            Err(error) => {
-                tracing::warn!(
-                    "Lark {operation} edit failed for {message_id}: {error}; sending fallback message"
-                );
-                Ok(self
-                    .create_text_message(recipient, text)
-                    .await?
-                    .unwrap_or_else(|| message_id.to_string()))
+        let next_message_id = self
+            .create_text_message(recipient, text)
+            .await?
+            .unwrap_or_else(|| message_id.to_string());
+
+        if next_message_id != message_id && !message_id.trim().is_empty() {
+            if let Err(error) = self.delete_message(message_id).await {
+                tracing::debug!("Lark {operation} cleanup delete failed for {message_id}: {error}");
             }
         }
+
+        Ok(next_message_id)
+    }
+
+    async fn apply_visible_draft_update(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+        operation: &str,
+        next_edits_used: u32,
+    ) -> anyhow::Result<(String, u32)> {
+        let active_message_id = self
+            .replace_message_with_new_text(recipient, message_id, text, operation)
+            .await?;
+        let next_edits_used = if active_message_id == message_id {
+            next_edits_used
+        } else {
+            0
+        };
+        Ok((active_message_id, next_edits_used))
+    }
+
+    fn should_reset_edit_count(
+        previous_message_id: &str,
+        active_message_id: &str,
+        decision: DraftProgressUpdateDecision,
+    ) -> bool {
+        if previous_message_id != active_message_id {
+            return true;
+        }
+
+        matches!(
+            decision,
+            DraftProgressUpdateDecision::CreateContinuation { .. }
+        )
     }
 
     async fn apply_draft_update_plan(
@@ -595,26 +660,28 @@ impl LarkChannel {
             return Ok(None);
         };
         let previous_message_id = target.active_message_id.clone();
+        let decision = target.decision;
         let (active_message_id, next_edits_used) = match target.decision {
             DraftProgressUpdateDecision::CreateContinuation { reason } => (
                 self.create_draft_continuation(recipient, target.active_message_id, text, reason)
                     .await?,
                 0,
             ),
-            DraftProgressUpdateDecision::EditInPlace { next_edits_used } => (
-                self.update_message_or_send_fallback(
+            DraftProgressUpdateDecision::EditInPlace { next_edits_used } => {
+                self.apply_visible_draft_update(
                     recipient,
                     &target.active_message_id,
                     text,
                     "update_draft",
+                    next_edits_used,
                 )
-                .await?,
-                next_edits_used,
-            ),
+                .await?
+            }
             DraftProgressUpdateDecision::Skip => return Ok(None),
         };
         let continuation_message_id =
-            (active_message_id != previous_message_id).then(|| active_message_id.clone());
+            Self::should_reset_edit_count(&previous_message_id, &active_message_id, decision)
+                .then(|| active_message_id.clone());
         self.store_draft_state(draft_key, active_message_id, text, next_edits_used)
             .await;
         Ok(continuation_message_id)
@@ -645,13 +712,6 @@ impl LarkChannel {
     fn build_text_payload(recipient: &str, text: &str) -> serde_json::Value {
         serde_json::json!({
             "receive_id": recipient,
-            "msg_type": "text",
-            "content": serde_json::json!({ "text": text }).to_string(),
-        })
-    }
-
-    fn build_text_edit_payload(text: &str) -> serde_json::Value {
-        serde_json::json!({
             "msg_type": "text",
             "content": serde_json::json!({ "text": text }).to_string(),
         })
@@ -836,291 +896,330 @@ impl LarkChannel {
         Ok((ep.url, ep.client_config.unwrap_or_default()))
     }
 
-    /// WS long-connection event loop.  Returns Ok(()) when the connection closes
-    /// (the caller reconnects).
+    /// WS long-connection event loop.  Returns Ok(()) when the runtime stops.
     #[allow(clippy::too_many_lines)]
     async fn listen_ws(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         self.ensure_bot_open_id().await;
-        let (wss_url, client_config) = self.get_ws_endpoint().await?;
-        let service_id = wss_url
-            .split('?')
-            .nth(1)
-            .and_then(|qs| {
-                qs.split('&')
-                    .find(|kv| kv.starts_with("service_id="))
-                    .and_then(|kv| kv.split('=').nth(1))
-                    .and_then(|v| v.parse::<i32>().ok())
-            })
-            .unwrap_or(0);
-        tracing::info!("Lark: connecting to {wss_url}");
-
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&wss_url).await?;
-        let (mut write, mut read) = ws_stream.split();
-        tracing::info!("Lark: WS connected (service_id={service_id})");
-
-        let mut ping_secs = client_config.ping_interval.unwrap_or(120).max(10);
-        let mut hb_interval = tokio::time::interval(Duration::from_secs(ping_secs));
-        let mut timeout_check = tokio::time::interval(Duration::from_secs(10));
-        hb_interval.tick().await; // consume immediate tick
-
-        let mut seq: u64 = 0;
-        let mut last_recv = Instant::now();
-
-        // Send initial ping immediately (like the official SDK) so the server
-        // starts responding with pongs and we can calibrate the ping_interval.
-        seq = seq.wrapping_add(1);
-        let initial_ping = PbFrame {
-            seq_id: seq,
-            log_id: 0,
-            service: service_id,
-            method: 0,
-            headers: vec![PbHeader {
-                key: "type".into(),
-                value: "ping".into(),
-            }],
-            payload: None,
-        };
-        if write
-            .send(WsMsg::Binary(initial_ping.encode_to_vec().into()))
-            .await
-            .is_err()
-        {
-            anyhow::bail!("Lark: initial ping failed");
-        }
-        // message_id → (fragment_slots, created_at) for multi-part reassembly
-        type FragEntry = (Vec<Option<Vec<u8>>>, Instant);
-        let mut frag_cache: HashMap<String, FragEntry> = HashMap::new();
 
         loop {
-            tokio::select! {
-                biased;
+            let (wss_url, client_config) = self.get_ws_endpoint().await?;
+            let service_id = wss_url
+                .split('?')
+                .nth(1)
+                .and_then(|qs| {
+                    qs.split('&')
+                        .find(|kv| kv.starts_with("service_id="))
+                        .and_then(|kv| kv.split('=').nth(1))
+                        .and_then(|v| v.parse::<i32>().ok())
+                })
+                .unwrap_or(0);
+            tracing::info!("Lark: connecting to {wss_url}");
 
-                _ = hb_interval.tick() => {
-                    seq = seq.wrapping_add(1);
-                    let ping = PbFrame {
-                        seq_id: seq, log_id: 0, service: service_id, method: 0,
-                        headers: vec![PbHeader { key: "type".into(), value: "ping".into() }],
-                        payload: None,
-                    };
-                    if write.send(WsMsg::Binary(ping.encode_to_vec().into())).await.is_err() {
-                        tracing::warn!("Lark: ping failed, reconnecting");
-                        break;
-                    }
-                    // GC stale fragments > 5 min
-                    let cutoff = Instant::now().checked_sub(Duration::from_secs(300)).unwrap_or(Instant::now());
-                    frag_cache.retain(|_, (_, ts)| *ts > cutoff);
-                }
+            let (ws_stream, _) = tokio_tungstenite::connect_async(&wss_url).await?;
+            let (mut write, mut read) = ws_stream.split();
+            tracing::info!("Lark: WS connected (service_id={service_id})");
 
-                _ = timeout_check.tick() => {
-                    if last_recv.elapsed() > WS_HEARTBEAT_TIMEOUT {
-                        tracing::warn!("Lark: heartbeat timeout, reconnecting");
-                        break;
-                    }
-                }
+            let mut ping_secs = client_config.ping_interval.unwrap_or(120).max(10);
+            let mut hb_interval = tokio::time::interval(Duration::from_secs(ping_secs));
+            let mut timeout_check = tokio::time::interval(Duration::from_secs(10));
+            hb_interval.tick().await;
 
-                msg = read.next() => {
-                    let raw = match msg {
-                        Some(Ok(ws_msg)) => {
-                            if should_refresh_last_recv(&ws_msg) {
-                                last_recv = Instant::now();
-                            }
-                            match ws_msg {
-                                WsMsg::Binary(b) => b,
-                                WsMsg::Ping(d) => { let _ = write.send(WsMsg::Pong(d)).await; continue; }
-                                WsMsg::Close(_) => { tracing::info!("Lark: WS closed — reconnecting"); break; }
-                                _ => continue,
-                            }
+            let mut seq: u64 = 0;
+            let mut last_recv = Instant::now();
+
+            seq = seq.wrapping_add(1);
+            let initial_ping = PbFrame {
+                seq_id: seq,
+                log_id: 0,
+                service: service_id,
+                method: 0,
+                headers: vec![PbHeader {
+                    key: "type".into(),
+                    value: "ping".into(),
+                }],
+                payload: None,
+            };
+            if write
+                .send(WsMsg::Binary(initial_ping.encode_to_vec().into()))
+                .await
+                .is_err()
+            {
+                anyhow::bail!("Lark: initial ping failed");
+            }
+
+            type FragEntry = (Vec<Option<Vec<u8>>>, Instant);
+            let mut frag_cache: HashMap<String, FragEntry> = HashMap::new();
+
+            let _ = loop {
+                tokio::select! {
+                    biased;
+
+                    _ = hb_interval.tick() => {
+                        seq = seq.wrapping_add(1);
+                        let ping = PbFrame {
+                            seq_id: seq,
+                            log_id: 0,
+                            service: service_id,
+                            method: 0,
+                            headers: vec![PbHeader {
+                                key: "type".into(),
+                                value: "ping".into(),
+                            }],
+                            payload: None,
+                        };
+                        if write.send(WsMsg::Binary(ping.encode_to_vec().into())).await.is_err() {
+                            tracing::warn!("Lark: ping failed, reconnecting");
+                            break true;
                         }
-                        None => { tracing::info!("Lark: WS closed — reconnecting"); break; }
-                        Some(Err(e)) => { tracing::error!("Lark: WS read error: {e}"); break; }
-                    };
 
-                    let frame = match PbFrame::decode(&raw[..]) {
-                        Ok(f) => f,
-                        Err(e) => { tracing::error!("Lark: proto decode: {e}"); continue; }
-                    };
+                        let cutoff = Instant::now()
+                            .checked_sub(Duration::from_secs(300))
+                            .unwrap_or(Instant::now());
+                        frag_cache.retain(|_, (_, ts)| *ts > cutoff);
+                    }
 
-                    // CONTROL frame
-                    if frame.method == 0 {
-                        if frame.header_value("type") == "pong" {
-                            if let Some(p) = &frame.payload {
-                                if let Ok(cfg) = serde_json::from_slice::<WsClientConfig>(p) {
-                                    if let Some(secs) = cfg.ping_interval {
-                                        let secs = secs.max(10);
-                                        if secs != ping_secs {
-                                            ping_secs = secs;
-                                            hb_interval = tokio::time::interval(Duration::from_secs(ping_secs));
-                                            tracing::info!("Lark: ping_interval → {ping_secs}s");
+                    _ = timeout_check.tick() => {
+                        if last_recv.elapsed() > WS_HEARTBEAT_TIMEOUT {
+                            tracing::warn!("Lark: heartbeat timeout, reconnecting");
+                            break true;
+                        }
+                    }
+
+                    msg = read.next() => {
+                        let raw = match msg {
+                            Some(Ok(ws_msg)) => {
+                                if should_refresh_last_recv(&ws_msg) {
+                                    last_recv = Instant::now();
+                                }
+                                match ws_msg {
+                                    WsMsg::Binary(b) => b,
+                                    WsMsg::Ping(d) => {
+                                        let _ = write.send(WsMsg::Pong(d)).await;
+                                        continue;
+                                    }
+                                    WsMsg::Close(_) => {
+                                        tracing::info!("Lark: WS closed by peer, reconnecting");
+                                        break true;
+                                    }
+                                    _ => continue,
+                                }
+                            }
+                            None => {
+                                tracing::info!("Lark: WS stream ended, reconnecting");
+                                break true;
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!("Lark: WS read error, reconnecting: {e}");
+                                break true;
+                            }
+                        };
+
+                        let frame = match PbFrame::decode(&raw[..]) {
+                            Ok(f) => f,
+                            Err(e) => {
+                                tracing::error!("Lark: proto decode: {e}");
+                                continue;
+                            }
+                        };
+
+                        if frame.method == 0 {
+                            if frame.header_value("type") == "pong" {
+                                if let Some(p) = &frame.payload {
+                                    if let Ok(cfg) = serde_json::from_slice::<WsClientConfig>(p) {
+                                        if let Some(secs) = cfg.ping_interval {
+                                            let secs = secs.max(10);
+                                            if secs != ping_secs {
+                                                ping_secs = secs;
+                                                hb_interval = tokio::time::interval(Duration::from_secs(ping_secs));
+                                                tracing::info!("Lark: ping_interval -> {ping_secs}s");
+                                            }
                                         }
                                     }
                                 }
                             }
+                            continue;
                         }
-                        continue;
-                    }
 
-                    // DATA frame
-                    let msg_type = frame.header_value("type").to_string();
-                    let msg_id   = frame.header_value("message_id").to_string();
-                    let sum      = frame.header_value("sum").parse::<usize>().unwrap_or(1);
-                    let seq_num  = frame.header_value("seq").parse::<usize>().unwrap_or(0);
+                        let msg_type = frame.header_value("type").to_string();
+                        let msg_id = frame.header_value("message_id").to_string();
+                        let sum = frame.header_value("sum").parse::<usize>().unwrap_or(1);
+                        let seq_num = frame.header_value("seq").parse::<usize>().unwrap_or(0);
 
-                    // ACK immediately (Feishu requires within 3 s)
-                    {
-                        let mut ack = frame.clone();
-                        ack.payload = Some(br#"{"code":200,"headers":{},"data":[]}"#.to_vec());
-                        ack.headers.push(PbHeader { key: "biz_rt".into(), value: "0".into() });
-                        let _ = write.send(WsMsg::Binary(ack.encode_to_vec().into())).await;
-                    }
+                        {
+                            let mut ack = frame.clone();
+                            ack.payload = Some(br#"{"code":200,"headers":{},"data":[]}"#.to_vec());
+                            ack.headers.push(PbHeader {
+                                key: "biz_rt".into(),
+                                value: "0".into(),
+                            });
+                            let _ = write.send(WsMsg::Binary(ack.encode_to_vec().into())).await;
+                        }
 
-                    // Fragment reassembly
-                    let sum = if sum == 0 { 1 } else { sum };
-                    let payload: Vec<u8> = if sum == 1 || msg_id.is_empty() || seq_num >= sum {
-                        frame.payload.clone().unwrap_or_default()
-                    } else {
-                        let entry = frag_cache.entry(msg_id.clone())
-                            .or_insert_with(|| (vec![None; sum], Instant::now()));
-                        if entry.0.len() != sum { *entry = (vec![None; sum], Instant::now()); }
-                        entry.0[seq_num] = frame.payload.clone();
-                        if entry.0.iter().all(|s| s.is_some()) {
-                            let full: Vec<u8> = entry.0.iter()
-                                .flat_map(|s| s.as_deref().unwrap_or(&[]))
-                                .copied().collect();
-                            frag_cache.remove(&msg_id);
-                            full
-                        } else { continue; }
-                    };
+                        let sum = if sum == 0 { 1 } else { sum };
+                        let payload: Vec<u8> = if sum == 1 || msg_id.is_empty() || seq_num >= sum {
+                            frame.payload.clone().unwrap_or_default()
+                        } else {
+                            let entry = frag_cache
+                                .entry(msg_id.clone())
+                                .or_insert_with(|| (vec![None; sum], Instant::now()));
+                            if entry.0.len() != sum {
+                                *entry = (vec![None; sum], Instant::now());
+                            }
+                            entry.0[seq_num] = frame.payload.clone();
+                            if entry.0.iter().all(|s| s.is_some()) {
+                                let full: Vec<u8> = entry
+                                    .0
+                                    .iter()
+                                    .flat_map(|s| s.as_deref().unwrap_or(&[]))
+                                    .copied()
+                                    .collect();
+                                frag_cache.remove(&msg_id);
+                                full
+                            } else {
+                                continue;
+                            }
+                        };
 
-                    if msg_type != "event" { continue; }
+                        if msg_type != "event" {
+                            continue;
+                        }
 
-                    let event: LarkEvent = match serde_json::from_slice(&payload) {
-                        Ok(e) => e,
-                        Err(e) => { tracing::error!("Lark: event JSON: {e}"); continue; }
-                    };
-                    if event.header.event_type != "im.message.receive_v1" { continue; }
+                        let event: LarkEvent = match serde_json::from_slice(&payload) {
+                            Ok(e) => e,
+                            Err(e) => {
+                                tracing::error!("Lark: event JSON: {e}");
+                                continue;
+                            }
+                        };
+                        if event.header.event_type != "im.message.receive_v1" {
+                            continue;
+                        }
 
-                    let event_payload = event.event;
+                        let event_payload = event.event;
+                        let recv: MsgReceivePayload = match serde_json::from_value(event_payload.clone()) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::error!("Lark: payload parse: {e}");
+                                continue;
+                            }
+                        };
 
-                    let recv: MsgReceivePayload = match serde_json::from_value(event_payload.clone()) {
-                        Ok(r) => r,
-                        Err(e) => { tracing::error!("Lark: payload parse: {e}"); continue; }
-                    };
+                        let sender_open_id = recv.sender.sender_id.open_id.as_deref().unwrap_or("");
+                        if self.sender_matches_self_identity(&recv.sender.sender_type, sender_open_id) {
+                            continue;
+                        }
+                        if !self.is_user_allowed(sender_open_id) {
+                            tracing::warn!("Lark WS: ignoring {sender_open_id} (not in allowed_users)");
+                            continue;
+                        }
 
-                    if recv.sender.sender_type == "app" || recv.sender.sender_type == "bot" { continue; }
-
-                    let sender_open_id = recv.sender.sender_id.open_id.as_deref().unwrap_or("");
-                    if !self.is_user_allowed(sender_open_id) {
-                        tracing::warn!("Lark WS: ignoring {sender_open_id} (not in allowed_users)");
-                        continue;
-                    }
-
-                    let lark_msg = &recv.message;
-
-                    // Dedup
-                    {
-                        let now = Instant::now();
-                        let mut seen = self.ws_seen_ids.write().await;
-                        // GC
-                        seen.retain(|_, t| now.duration_since(*t) < Duration::from_secs(30 * 60));
-                        if seen.contains_key(&lark_msg.message_id) {
+                        let lark_msg = &recv.message;
+                        if self.mark_inbound_message_seen(&lark_msg.message_id).await {
                             tracing::debug!("Lark WS: dup {}", lark_msg.message_id);
                             continue;
                         }
-                        seen.insert(lark_msg.message_id.clone(), now);
-                    }
 
-                    // Decode content by type (mirrors clawdbot-feishu parsing)
-                    let (text, post_mentioned_open_ids) = match lark_msg.message_type.as_str() {
-                        "text" => {
-                            let v: serde_json::Value = match serde_json::from_str(&lark_msg.content) {
-                                Ok(v) => v,
-                                Err(_) => continue,
-                            };
-                            match v.get("text").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
-                                Some(t) => (t.to_string(), Vec::new()),
-                                None => continue,
-                            }
-                        }
-                        "post" => match parse_post_content_details(&lark_msg.content) {
-                            Some(details) => (details.text, details.mentioned_open_ids),
-                            None => continue,
-                        },
-                        "image" => {
-                            let text = if let Some(image_key) = parse_image_key(&lark_msg.content) {
-                                match self.fetch_image_marker(&image_key).await {
-                                    Ok(marker) => marker,
-                                    Err(error) => {
-                                        tracing::warn!(
-                                            "Lark WS: failed to download image {image_key}: {error}"
-                                        );
-                                        LARK_IMAGE_DOWNLOAD_FALLBACK_TEXT.to_string()
-                                    }
+                        let (text, post_mentioned_open_ids) = match lark_msg.message_type.as_str() {
+                            "text" => {
+                                let v: serde_json::Value = match serde_json::from_str(&lark_msg.content) {
+                                    Ok(v) => v,
+                                    Err(_) => continue,
+                                };
+                                match v.get("text").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
+                                    Some(t) => (t.to_string(), Vec::new()),
+                                    None => continue,
                                 }
-                            } else {
-                                tracing::warn!(
-                                    "Lark WS: image content missing image_key; using fallback text"
+                            }
+                            "post" => match parse_post_content_details(&lark_msg.content) {
+                                Some(details) => (details.text, details.mentioned_open_ids),
+                                None => continue,
+                            },
+                            "image" => {
+                                let text = if let Some(image_key) = parse_image_key(&lark_msg.content) {
+                                    match self.fetch_image_marker(&image_key).await {
+                                        Ok(marker) => marker,
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                "Lark WS: failed to download image {image_key}: {error}"
+                                            );
+                                            LARK_IMAGE_DOWNLOAD_FALLBACK_TEXT.to_string()
+                                        }
+                                    }
+                                } else {
+                                    tracing::warn!(
+                                        "Lark WS: image content missing image_key; using fallback text"
+                                    );
+                                    LARK_IMAGE_DOWNLOAD_FALLBACK_TEXT.to_string()
+                                };
+                                (text, Vec::new())
+                            }
+                            _ => {
+                                tracing::debug!(
+                                    "Lark WS: skipping unsupported type '{}'",
+                                    lark_msg.message_type
                                 );
-                                LARK_IMAGE_DOWNLOAD_FALLBACK_TEXT.to_string()
-                            };
-                            (text, Vec::new())
+                                continue;
+                            }
+                        };
+
+                        let text = strip_at_placeholders(&text);
+                        let text = text.trim().to_string();
+                        if text.is_empty() {
+                            continue;
                         }
-                        _ => { tracing::debug!("Lark WS: skipping unsupported type '{}'", lark_msg.message_type); continue; }
-                    };
 
-                    // Strip @_user_N placeholders
-                    let text = strip_at_placeholders(&text);
-                    let text = text.trim().to_string();
-                    if text.is_empty() { continue; }
+                        let bot_open_id = self.resolved_bot_open_id();
+                        if lark_msg.chat_type == "group"
+                            && !should_respond_in_group(
+                                self.mention_only,
+                                bot_open_id.as_deref(),
+                                &lark_msg.mentions,
+                                &post_mentioned_open_ids,
+                            )
+                        {
+                            continue;
+                        }
 
-                    // Group-chat: only respond when explicitly @-mentioned
-                    let bot_open_id = self.resolved_bot_open_id();
-                    if lark_msg.chat_type == "group"
-                        && !should_respond_in_group(
-                            self.mention_only,
-                            bot_open_id.as_deref(),
-                            &lark_msg.mentions,
-                            &post_mentioned_open_ids,
-                        )
-                    {
-                        continue;
+                        if let Some(ack_emoji) = select_lark_ack_reaction(
+                            self.ack_reaction.as_ref(),
+                            Some(&event_payload),
+                            &text,
+                            Some(sender_open_id),
+                            Some(&lark_msg.chat_id),
+                            lark_msg.chat_type == "group",
+                        ) {
+                            let reaction_channel = self.clone();
+                            let reaction_message_id = lark_msg.message_id.clone();
+                            tokio::spawn(async move {
+                                reaction_channel
+                                    .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
+                                    .await;
+                            });
+                        }
+
+                        let channel_msg = ChannelMessage {
+                            id: lark_msg.message_id.clone(),
+                            sender: lark_msg.chat_id.clone(),
+                            reply_target: lark_msg.chat_id.clone(),
+                            content: text,
+                            channel: self.channel_name().to_string(),
+                            timestamp: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                            thread_ts: None,
+                        };
+
+                        tracing::debug!("Lark WS: message in {}", lark_msg.chat_id);
+                        if tx.send(channel_msg).await.is_err() {
+                            return Ok(());
+                        }
                     }
-
-                    if let Some(ack_emoji) = select_lark_ack_reaction(
-                        self.ack_reaction.as_ref(),
-                        Some(&event_payload),
-                        &text,
-                        Some(sender_open_id),
-                        Some(&lark_msg.chat_id),
-                        lark_msg.chat_type == "group",
-                    ) {
-                        let reaction_channel = self.clone();
-                        let reaction_message_id = lark_msg.message_id.clone();
-                        tokio::spawn(async move {
-                            reaction_channel
-                                .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
-                                .await;
-                        });
-                    }
-
-                    let channel_msg = ChannelMessage {
-                        id: Uuid::new_v4().to_string(),
-                        sender: lark_msg.chat_id.clone(),
-                        reply_target: lark_msg.chat_id.clone(),
-                        content: text,
-                        channel: self.channel_name().to_string(),
-                        timestamp: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                        thread_ts: None,
-                    };
-
-                    tracing::debug!("Lark WS: message in {}", lark_msg.chat_id);
-                    if tx.send(channel_msg).await.is_err() { break; }
                 }
-            }
+            };
+
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
-        Ok(())
     }
 
     /// Check if a user open_id is allowed
@@ -1247,7 +1346,7 @@ impl LarkChannel {
     }
 
     async fn ensure_bot_open_id(&self) {
-        if !self.mention_only || self.resolved_bot_open_id().is_some() {
+        if self.resolved_bot_open_id().is_some() {
             return;
         }
 
@@ -1256,14 +1355,10 @@ impl LarkChannel {
                 tracing::info!("Lark: resolved bot open_id: {open_id}");
             }
             Ok(None) => {
-                tracing::warn!(
-                    "Lark: bot open_id missing from /bot/v3/info response; mention_only group messages will be ignored"
-                );
+                tracing::debug!("Lark: bot open_id missing from /bot/v3/info response");
             }
             Err(err) => {
-                tracing::warn!(
-                    "Lark: failed to resolve bot open_id: {err}; mention_only group messages will be ignored"
-                );
+                tracing::debug!("Lark: failed to resolve bot open_id: {err}");
             }
         }
     }
@@ -1343,27 +1438,6 @@ impl LarkChannel {
         }
     }
 
-    async fn update_text_message(&self, message_id: &str, text: &str) -> anyhow::Result<()> {
-        let mut token = self.get_tenant_access_token().await?;
-        let body = Self::build_text_edit_payload(text);
-        let url = self.message_url(message_id);
-        let mut retried = false;
-
-        loop {
-            let (status, response) = self
-                .send_json_once(reqwest::Method::PATCH, &url, &token, Some(&body))
-                .await?;
-            if !retried && should_refresh_lark_tenant_token(status, &response) {
-                self.invalidate_token().await;
-                token = self.get_tenant_access_token().await?;
-                retried = true;
-                continue;
-            }
-            ensure_lark_send_success(status, &response, "while updating text message")?;
-            return Ok(());
-        }
-    }
-
     async fn delete_message(&self, message_id: &str) -> anyhow::Result<()> {
         let mut token = self.get_tenant_access_token().await?;
         let url = self.message_url(message_id);
@@ -1411,6 +1485,15 @@ impl LarkChannel {
             .pointer("/sender/sender_id/open_id")
             .and_then(|s| s.as_str())
             .unwrap_or("");
+
+        let sender_type = event
+            .pointer("/sender/sender_type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+
+        if self.sender_matches_self_identity(sender_type, open_id) {
+            return messages;
+        }
 
         if open_id.is_empty() {
             return messages;
@@ -1499,9 +1582,14 @@ impl LarkChannel {
             .pointer("/message/chat_id")
             .and_then(|c| c.as_str())
             .unwrap_or(open_id);
+        let message_id = event
+            .pointer("/message/message_id")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(chat_id);
 
         messages.push(ChannelMessage {
-            id: Uuid::new_v4().to_string(),
+            id: message_id.to_string(),
             sender: chat_id.to_string(),
             reply_target: chat_id.to_string(),
             content: text,
@@ -1521,6 +1609,7 @@ impl LarkChannel {
         payload: &serde_json::Value,
     ) -> Vec<ChannelMessage> {
         let mut messages = Vec::new();
+        self.ensure_bot_open_id().await;
 
         let event_type = payload
             .pointer("/header/event_type")
@@ -1539,6 +1628,13 @@ impl LarkChannel {
             .pointer("/sender/sender_id/open_id")
             .and_then(|s| s.as_str())
             .unwrap_or("");
+        let sender_type = event
+            .pointer("/sender/sender_type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if self.sender_matches_self_identity(sender_type, open_id) {
+            return messages;
+        }
         if open_id.is_empty() {
             return messages;
         }
@@ -1635,9 +1731,19 @@ impl LarkChannel {
             .pointer("/message/chat_id")
             .and_then(|c| c.as_str())
             .unwrap_or(open_id);
+        let message_id = event
+            .pointer("/message/message_id")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(chat_id);
+
+        if self.mark_inbound_message_seen(message_id).await {
+            tracing::debug!("Lark webhook: dup {message_id}");
+            return messages;
+        }
 
         messages.push(ChannelMessage {
-            id: Uuid::new_v4().to_string(),
+            id: message_id.to_string(),
             sender: chat_id.to_string(),
             reply_target: chat_id.to_string(),
             content: text,
@@ -1658,6 +1764,47 @@ impl Channel for LarkChannel {
 
     fn supports_draft_updates(&self) -> bool {
         self.max_draft_edits > 0
+    }
+
+    fn streaming_progress_delivery(&self) -> StreamingProgressDelivery {
+        if matches!(self.platform, LarkChannelPlatform::Feishu) {
+            StreamingProgressDelivery::DebouncedLogBatch {
+                idle_timeout: Duration::from_secs(5),
+            }
+        } else if self.supports_draft_updates() {
+            StreamingProgressDelivery::Draft
+        } else {
+            StreamingProgressDelivery::None
+        }
+    }
+
+    fn streams_assistant_text_in_progress(&self) -> bool {
+        !matches!(self.platform, LarkChannelPlatform::Feishu)
+    }
+
+    fn draft_update_mode(&self) -> DraftUpdateMode {
+        DraftUpdateMode::Delta
+    }
+
+    fn finalize_draft_owns_visible_fallback(&self) -> bool {
+        true
+    }
+
+    fn format_outbound_message(&self, role: OutboundMessageRole, text: &str) -> String {
+        if !matches!(self.platform, LarkChannelPlatform::Feishu) {
+            return text.to_string();
+        }
+
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return text.to_string();
+        }
+
+        let label = match role {
+            OutboundMessageRole::Agent => "zeroclaw agent LLM",
+            OutboundMessageRole::Log => "zeroclaw log",
+        };
+        format!("[{label}]\n{trimmed}")
     }
 
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
@@ -1714,18 +1861,25 @@ impl Channel for LarkChannel {
         text: &str,
     ) -> anyhow::Result<()> {
         let cleaned_text = super::strip_tool_call_tags(text);
-        let resolved_message_id = self
-            .take_draft_message_id(recipient, message_id)
-            .await
-            .unwrap_or_default();
+        let removed_state = self.remove_draft_state(recipient, message_id).await;
+        let resolved_message_id =
+            DraftMessageResolver::from_state_owned(removed_state.clone(), message_id)
+                .unwrap_or_default();
 
         if resolved_message_id.trim().is_empty() {
             let _ = self.create_text_message(recipient, &cleaned_text).await?;
             return Ok(());
         }
 
+        if removed_state
+            .as_ref()
+            .is_some_and(|state| state.last_rendered_text == cleaned_text)
+        {
+            return Ok(());
+        }
+
         let _ = self
-            .update_message_or_send_fallback(
+            .replace_message_with_new_text(
                 recipient,
                 &resolved_message_id,
                 &cleaned_text,
@@ -2271,7 +2425,7 @@ mod tests {
         render_tool_policy_block_progress_summary_from_parts, should_force_draft_continuation,
         CronLifecycleDescriptor, CronLifecycleRenderLimits,
     };
-    use axum::{extract::Path, extract::State, routing::patch, routing::post, Json, Router};
+    use axum::{extract::Path, extract::State, routing::delete, routing::post, Json, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::TcpListener;
     use tokio::sync::Mutex as AsyncMutex;
@@ -2569,6 +2723,7 @@ mod tests {
                     }
                 },
                 "message": {
+                    "message_id": "om_text_123",
                     "message_type": "text",
                     "content": "{\"text\":\"Hello ZeroClaw!\"}",
                     "chat_id": "oc_chat123",
@@ -2579,10 +2734,40 @@ mod tests {
 
         let msgs = ch.parse_event_payload(&payload);
         assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, "om_text_123");
         assert_eq!(msgs[0].content, "Hello ZeroClaw!");
         assert_eq!(msgs[0].sender, "oc_chat123");
         assert_eq!(msgs[0].channel, "lark");
         assert_eq!(msgs[0].timestamp, 1_699_999_999);
+    }
+
+    #[test]
+    fn lark_parse_ignores_self_sent_message() {
+        let ch = LarkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "token".into(),
+            None,
+            vec!["*".into()],
+            true,
+        );
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": {
+                    "sender_id": { "open_id": "ou_bot" },
+                    "sender_type": "bot"
+                },
+                "message": {
+                    "message_id": "om_bot_1",
+                    "message_type": "text",
+                    "content": "{\"text\":\"self echo\"}",
+                    "chat_id": "oc_chat"
+                }
+            }
+        });
+
+        assert!(ch.parse_event_payload(&payload).is_empty());
     }
 
     #[test]
@@ -2657,6 +2842,89 @@ mod tests {
         let msgs = ch.parse_event_payload_async(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, LARK_IMAGE_DOWNLOAD_FALLBACK_TEXT);
+    }
+
+    #[tokio::test]
+    async fn lark_parse_event_payload_async_ignores_self_sent_message() {
+        let ch = LarkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "token".into(),
+            None,
+            vec!["*".into()],
+            true,
+        );
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": {
+                    "sender_id": { "open_id": "ou_bot" },
+                    "sender_type": "app"
+                },
+                "message": {
+                    "message_id": "om_app_1",
+                    "message_type": "text",
+                    "content": "{\"text\":\"self echo\"}",
+                    "chat_id": "oc_chat"
+                }
+            }
+        });
+
+        assert!(ch.parse_event_payload_async(&payload).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lark_parse_event_payload_async_deduplicates_message_id() {
+        let ch = LarkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "token".into(),
+            None,
+            vec!["*".into()],
+            true,
+        );
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": {
+                    "sender_id": { "open_id": "ou_user" }
+                },
+                "message": {
+                    "message_id": "om_dup_1",
+                    "message_type": "text",
+                    "content": "{\"text\":\"hello\"}",
+                    "chat_id": "oc_chat"
+                }
+            }
+        });
+
+        let first = ch.parse_event_payload_async(&payload).await;
+        let second = ch.parse_event_payload_async(&payload).await;
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].id, "om_dup_1");
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn lark_parse_ignores_self_sent_message_by_bot_open_id_when_sender_type_missing() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": {
+                    "sender_id": { "open_id": "ou_bot" }
+                },
+                "message": {
+                    "message_id": "om_bot_open_id_1",
+                    "message_type": "text",
+                    "content": "{\"text\":\"self echo\"}",
+                    "chat_id": "oc_chat"
+                }
+            }
+        });
+
+        assert!(ch.parse_event_payload(&payload).is_empty());
     }
 
     #[test]
@@ -2945,6 +3213,44 @@ mod tests {
     }
 
     #[test]
+    fn feishu_uses_debounced_log_delivery_and_role_prefixes() {
+        use crate::config::schema::{FeishuConfig, LarkReceiveMode};
+
+        let cfg = FeishuConfig {
+            app_id: "cli_feishu_app123".into(),
+            app_secret: "secret456".into(),
+            encrypt_key: None,
+            verification_token: Some("vtoken789".into()),
+            allowed_users: vec!["*".into()],
+            group_reply: None,
+            receive_mode: LarkReceiveMode::Webhook,
+            port: Some(9898),
+            draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
+            ),
+            max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
+            progress_mode: crate::config::ProgressMode::default(),
+        };
+
+        let ch = LarkChannel::from_feishu_config(&cfg);
+
+        assert_eq!(
+            ch.streaming_progress_delivery(),
+            StreamingProgressDelivery::DebouncedLogBatch {
+                idle_timeout: Duration::from_secs(5)
+            }
+        );
+        assert!(!ch.streams_assistant_text_in_progress());
+        assert_eq!(
+            ch.format_outbound_message(OutboundMessageRole::Log, "batched log"),
+            "[zeroclaw log]\nbatched log"
+        );
+        assert_eq!(
+            ch.format_outbound_message(OutboundMessageRole::Agent, "final answer"),
+            "[zeroclaw agent LLM]\nfinal answer"
+        );
+    }
+
+    #[test]
     fn lark_group_reply_and_draft_limits_follow_runtime_config() {
         use crate::config::schema::{
             GroupReplyConfig, GroupReplyMode, LarkConfig, LarkReceiveMode,
@@ -2979,6 +3285,7 @@ mod tests {
     struct MockDraftApiState {
         create_calls: AtomicUsize,
         patched_message_ids: AsyncMutex<Vec<String>>,
+        deleted_message_ids: AsyncMutex<Vec<String>>,
         created_messages: AsyncMutex<Vec<(String, String)>>,
     }
 
@@ -3013,9 +3320,11 @@ mod tests {
         state.created_messages.lock().await.push((receive_id, text));
         let call = state.create_calls.fetch_add(1, Ordering::SeqCst);
         let message_id = if call == 0 {
-            "msg-root"
+            "msg-root".to_string()
+        } else if call == 1 {
+            "msg-fallback".to_string()
         } else {
-            "msg-fallback"
+            format!("msg-fallback-{call}")
         };
         Json(serde_json::json!({
             "code": 0,
@@ -3025,34 +3334,16 @@ mod tests {
         }))
     }
 
-    async fn mock_patch_message(
+    async fn mock_delete_message(
         Path(message_id): Path<String>,
         State(state): State<Arc<MockDraftApiState>>,
     ) -> Json<serde_json::Value> {
-        state
-            .patched_message_ids
-            .lock()
-            .await
-            .push(message_id.clone());
-        if message_id == "msg-root" {
-            return Json(serde_json::json!({
-                "code": 19001,
-                "msg": "simulated edit failure"
-            }));
-        }
-        Json(serde_json::json!({ "code": 0 }))
-    }
-
-    async fn mock_patch_message_success(
-        Path(message_id): Path<String>,
-        State(state): State<Arc<MockDraftApiState>>,
-    ) -> Json<serde_json::Value> {
-        state.patched_message_ids.lock().await.push(message_id);
+        state.deleted_message_ids.lock().await.push(message_id);
         Json(serde_json::json!({ "code": 0 }))
     }
 
     #[tokio::test]
-    async fn lark_update_draft_edit_failure_falls_back_to_visible_progress_message() {
+    async fn lark_update_draft_replaces_visible_progress_message_without_patch() {
         let state = Arc::new(MockDraftApiState::default());
         let app = Router::new()
             .route(
@@ -3062,7 +3353,7 @@ mod tests {
             .route("/open-apis/im/v1/messages", post(mock_create_message))
             .route(
                 "/open-apis/im/v1/messages/{message_id}",
-                patch(mock_patch_message),
+                delete(mock_delete_message),
             )
             .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3101,18 +3392,23 @@ mod tests {
             .unwrap();
 
         let patched_message_ids = state.patched_message_ids.lock().await.clone();
+        let deleted_message_ids = state.deleted_message_ids.lock().await.clone();
         assert!(
-            patched_message_ids.iter().any(|id| id == "msg-root"),
-            "expected initial draft edit attempt to hit root id"
+            patched_message_ids.is_empty(),
+            "draft replacement flow should not patch text messages"
         );
         assert!(
-            patched_message_ids.iter().any(|id| id == "msg-fallback"),
-            "expected finalize to edit fallback message id after edit failure"
+            deleted_message_ids.iter().any(|id| id == "msg-root"),
+            "expected progress replacement to clean up the root draft message"
+        );
+        assert!(
+            deleted_message_ids.iter().any(|id| id == "msg-fallback"),
+            "expected finalize replacement to clean up the previous progress message"
         );
         assert_eq!(
             state.create_calls.load(Ordering::SeqCst),
-            2,
-            "expected one draft send + one fallback progress send"
+            3,
+            "expected one draft send + one progress replacement + one final replacement"
         );
 
         server.abort();
@@ -3129,7 +3425,7 @@ mod tests {
             .route("/open-apis/im/v1/messages", post(mock_create_message))
             .route(
                 "/open-apis/im/v1/messages/{message_id}",
-                patch(mock_patch_message_success),
+                delete(mock_delete_message),
             )
             .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3173,21 +3469,105 @@ mod tests {
             .unwrap();
 
         let patched_message_ids = state.patched_message_ids.lock().await.clone();
+        let deleted_message_ids = state.deleted_message_ids.lock().await.clone();
         assert!(
-            patched_message_ids.iter().any(|id| id == "msg-root"),
-            "expected first progress update to edit root draft message"
+            patched_message_ids.is_empty(),
+            "edit-cap replacement flow should not patch text messages"
         );
         assert!(
-            patched_message_ids.iter().any(|id| id == "msg-fallback"),
-            "expected finalize to target continuation message id after hitting edit cap"
+            deleted_message_ids.iter().any(|id| id == "msg-root"),
+            "expected first replacement to clean up the root draft"
+        );
+        assert!(
+            deleted_message_ids.iter().any(|id| id == "msg-fallback"),
+            "expected second replacement to clean up the previous progress message"
+        );
+        assert!(
+            deleted_message_ids.iter().any(|id| id == "msg-fallback-2"),
+            "expected finalize replacement to clean up the latest progress message"
         );
         assert_eq!(
             state.create_calls.load(Ordering::SeqCst),
-            2,
-            "expected one draft send + one continuation progress message"
+            4,
+            "expected one draft send + two progress replacements + one final replacement"
         );
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn lark_finalize_draft_skips_noop_when_final_text_already_rendered() {
+        let state = Arc::new(MockDraftApiState::default());
+        let app = Router::new()
+            .route(
+                "/open-apis/auth/v3/tenant_access_token/internal",
+                post(mock_tenant_token),
+            )
+            .route("/open-apis/im/v1/messages", post(mock_create_message))
+            .route(
+                "/open-apis/im/v1/messages/{message_id}",
+                delete(mock_delete_message),
+            )
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let base = format!("http://{addr}/open-apis");
+        let mut channel = LarkChannel::new(
+            "app_id".into(),
+            "app_secret".into(),
+            "verification_token".into(),
+            None,
+            vec!["*".into()],
+            false,
+        )
+        .with_api_base_override(base);
+        channel.draft_update_interval_ms = 0;
+
+        let recipient = "oc_test_chat";
+        let draft_id = channel
+            .send_draft(&SendMessage::new("initial", recipient))
+            .await
+            .unwrap()
+            .expect("draft id should exist");
+
+        channel
+            .update_draft(recipient, &draft_id, "final answer")
+            .await
+            .unwrap();
+        channel
+            .finalize_draft(recipient, &draft_id, "final answer")
+            .await
+            .unwrap();
+
+        let patched_message_ids = state.patched_message_ids.lock().await.clone();
+        let deleted_message_ids = state.deleted_message_ids.lock().await.clone();
+        assert!(patched_message_ids.is_empty());
+        assert_eq!(deleted_message_ids, vec!["msg-root".to_string()]);
+        assert_eq!(
+            state.create_calls.load(Ordering::SeqCst),
+            2,
+            "finalize no-op should not send a duplicate final replacement"
+        );
+
+        server.abort();
+    }
+
+    #[test]
+    fn lark_finalize_draft_owns_visible_fallback() {
+        let channel = LarkChannel::new(
+            "app_id".into(),
+            "app_secret".into(),
+            "verification_token".into(),
+            None,
+            vec!["*".into()],
+            false,
+        );
+
+        assert!(channel.finalize_draft_owns_visible_fallback());
     }
 
     #[tokio::test]
@@ -3201,7 +3581,7 @@ mod tests {
             .route("/open-apis/im/v1/messages", post(mock_create_message))
             .route(
                 "/open-apis/im/v1/messages/{message_id}",
-                patch(mock_patch_message_success),
+                delete(mock_delete_message),
             )
             .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3241,18 +3621,14 @@ mod tests {
             .unwrap();
 
         let patched_message_ids = state.patched_message_ids.lock().await.clone();
-        assert!(
-            !patched_message_ids.iter().any(|id| id == "msg-root"),
-            "policy block progress should bypass throttled root edit and switch to continuation"
-        );
-        assert!(
-            patched_message_ids.iter().any(|id| id == "msg-fallback"),
-            "expected finalize to target continuation message after policy block progress"
-        );
+        let deleted_message_ids = state.deleted_message_ids.lock().await.clone();
+        assert!(patched_message_ids.is_empty());
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-root"));
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-fallback"));
         assert_eq!(
             state.create_calls.load(Ordering::SeqCst),
-            2,
-            "expected one draft send + one immediate policy-block continuation message"
+            3,
+            "expected one draft send + one policy-block replacement + one final replacement"
         );
 
         server.abort();
@@ -3269,7 +3645,7 @@ mod tests {
             .route("/open-apis/im/v1/messages", post(mock_create_message))
             .route(
                 "/open-apis/im/v1/messages/{message_id}",
-                patch(mock_patch_message_success),
+                delete(mock_delete_message),
             )
             .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3313,18 +3689,15 @@ mod tests {
             .unwrap();
 
         let patched_message_ids = state.patched_message_ids.lock().await.clone();
-        assert!(
-            !patched_message_ids.iter().any(|id| id == "msg-root"),
-            "triggered/running progress should bypass throttled root edit and switch to continuation"
-        );
-        assert!(
-            patched_message_ids.iter().any(|id| id == "msg-fallback"),
-            "expected finalize to target continuation message after lifecycle progress"
-        );
+        let deleted_message_ids = state.deleted_message_ids.lock().await.clone();
+        assert!(patched_message_ids.is_empty());
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-root"));
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-fallback"));
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-fallback-2"));
         assert_eq!(
             state.create_calls.load(Ordering::SeqCst),
-            3,
-            "expected one draft send + two immediate lifecycle continuation messages"
+            4,
+            "expected one draft send + two lifecycle replacements + one final replacement"
         );
 
         server.abort();
@@ -3341,7 +3714,7 @@ mod tests {
             .route("/open-apis/im/v1/messages", post(mock_create_message))
             .route(
                 "/open-apis/im/v1/messages/{message_id}",
-                patch(mock_patch_message_success),
+                delete(mock_delete_message),
             )
             .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3381,18 +3754,14 @@ mod tests {
             .unwrap();
 
         let patched_message_ids = state.patched_message_ids.lock().await.clone();
-        assert!(
-            !patched_message_ids.iter().any(|id| id == "msg-root"),
-            "high-priority progress should force continuation and avoid editing root draft"
-        );
-        assert!(
-            patched_message_ids.iter().any(|id| id == "msg-fallback"),
-            "expected finalize to target continuation message after high-priority progress"
-        );
+        let deleted_message_ids = state.deleted_message_ids.lock().await.clone();
+        assert!(patched_message_ids.is_empty());
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-root"));
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-fallback"));
         assert_eq!(
             state.create_calls.load(Ordering::SeqCst),
-            2,
-            "expected one draft send + one continuation message for high-priority progress"
+            3,
+            "expected one draft send + one high-priority replacement + one final replacement"
         );
 
         server.abort();
@@ -3409,7 +3778,7 @@ mod tests {
             .route("/open-apis/im/v1/messages", post(mock_create_message))
             .route(
                 "/open-apis/im/v1/messages/{message_id}",
-                patch(mock_patch_message_success),
+                delete(mock_delete_message),
             )
             .with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3459,7 +3828,7 @@ mod tests {
             .route("/open-apis/im/v1/messages", post(mock_create_message))
             .route(
                 "/open-apis/im/v1/messages/{message_id}",
-                patch(mock_patch_message_success),
+                delete(mock_delete_message),
             )
             .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3502,18 +3871,14 @@ mod tests {
             .unwrap();
 
         let patched_message_ids = state.patched_message_ids.lock().await.clone();
-        assert!(
-            !patched_message_ids.iter().any(|id| id == "msg-root"),
-            "missing draft state should still force continuation for high-priority lifecycle progress"
-        );
-        assert!(
-            patched_message_ids.iter().any(|id| id == "msg-fallback"),
-            "expected finalize to target continuation message after high-priority lifecycle progress"
-        );
+        let deleted_message_ids = state.deleted_message_ids.lock().await.clone();
+        assert!(patched_message_ids.is_empty());
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-root"));
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-fallback"));
         assert_eq!(
             state.create_calls.load(Ordering::SeqCst),
-            2,
-            "expected one draft send + one continuation message when cached state is missing"
+            3,
+            "expected one draft send + one replacement + one final replacement when cached state is missing"
         );
 
         server.abort();
@@ -3530,7 +3895,7 @@ mod tests {
             .route("/open-apis/im/v1/messages", post(mock_create_message))
             .route(
                 "/open-apis/im/v1/messages/{message_id}",
-                patch(mock_patch_message_success),
+                delete(mock_delete_message),
             )
             .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3582,18 +3947,16 @@ mod tests {
             .unwrap();
 
         let patched_message_ids = state.patched_message_ids.lock().await.clone();
-        assert!(
-            !patched_message_ids.iter().any(|id| id == "msg-root"),
-            "triggered/running/blocked progress should bypass throttled root edit and switch to continuation"
-        );
-        assert!(
-            patched_message_ids.iter().any(|id| id == "msg-fallback"),
-            "expected finalize to target continuation message after lifecycle progress"
-        );
+        let deleted_message_ids = state.deleted_message_ids.lock().await.clone();
+        assert!(patched_message_ids.is_empty());
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-root"));
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-fallback"));
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-fallback-2"));
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-fallback-3"));
         assert_eq!(
             state.create_calls.load(Ordering::SeqCst),
-            4,
-            "expected one draft send + three immediate lifecycle continuation messages"
+            5,
+            "expected one draft send + three lifecycle replacements + one final replacement"
         );
 
         server.abort();
@@ -3610,7 +3973,7 @@ mod tests {
             .route("/open-apis/im/v1/messages", post(mock_create_message))
             .route(
                 "/open-apis/im/v1/messages/{message_id}",
-                patch(mock_patch_message_success),
+                delete(mock_delete_message),
             )
             .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3650,14 +4013,14 @@ mod tests {
             .unwrap();
 
         let patched_message_ids = state.patched_message_ids.lock().await.clone();
-        assert!(
-            !patched_message_ids.iter().any(|id| id == "msg-root"),
-            "repeated running lifecycle progress should not be dropped as duplicate root edit"
-        );
+        let deleted_message_ids = state.deleted_message_ids.lock().await.clone();
+        assert!(patched_message_ids.is_empty());
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-root"));
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-fallback"));
         assert_eq!(
             state.create_calls.load(Ordering::SeqCst),
             3,
-            "expected one draft send + two continuation messages for repeated running progress"
+            "expected one draft send + two replacement messages for repeated running progress"
         );
 
         server.abort();
@@ -3674,7 +4037,7 @@ mod tests {
             .route("/open-apis/im/v1/messages", post(mock_create_message))
             .route(
                 "/open-apis/im/v1/messages/{message_id}",
-                patch(mock_patch_message_success),
+                delete(mock_delete_message),
             )
             .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3719,9 +4082,14 @@ mod tests {
             "expected proactive lifecycle announcements to send three standalone messages"
         );
         let patched_message_ids = state.patched_message_ids.lock().await.clone();
+        let deleted_message_ids = state.deleted_message_ids.lock().await.clone();
         assert!(
             patched_message_ids.is_empty(),
             "proactive lifecycle sends should not depend on draft edit path"
+        );
+        assert!(
+            deleted_message_ids.is_empty(),
+            "proactive lifecycle sends should not trigger replacement cleanup"
         );
         let created_messages = state.created_messages.lock().await.clone();
         assert_eq!(created_messages.len(), 3);
@@ -3744,7 +4112,7 @@ mod tests {
             .route("/open-apis/im/v1/messages", post(mock_create_message))
             .route(
                 "/open-apis/im/v1/messages/{message_id}",
-                patch(mock_patch_message_success),
+                delete(mock_delete_message),
             )
             .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3796,18 +4164,16 @@ mod tests {
             .unwrap();
 
         let patched_message_ids = state.patched_message_ids.lock().await.clone();
-        assert!(
-            !patched_message_ids.iter().any(|id| id == "msg-root"),
-            "triggered/running/completed progress should bypass throttled root edit and switch to continuation"
-        );
-        assert!(
-            patched_message_ids.iter().any(|id| id == "msg-fallback"),
-            "expected finalize to target continuation message after lifecycle progress"
-        );
+        let deleted_message_ids = state.deleted_message_ids.lock().await.clone();
+        assert!(patched_message_ids.is_empty());
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-root"));
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-fallback"));
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-fallback-2"));
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-fallback-3"));
         assert_eq!(
             state.create_calls.load(Ordering::SeqCst),
-            4,
-            "expected one draft send + three immediate lifecycle continuation messages"
+            5,
+            "expected one draft send + three lifecycle replacements + one final replacement"
         );
 
         server.abort();
@@ -3824,7 +4190,7 @@ mod tests {
             .route("/open-apis/im/v1/messages", post(mock_create_message))
             .route(
                 "/open-apis/im/v1/messages/{message_id}",
-                patch(mock_patch_message_success),
+                delete(mock_delete_message),
             )
             .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3863,18 +4229,14 @@ mod tests {
             .unwrap();
 
         let patched_message_ids = state.patched_message_ids.lock().await.clone();
-        assert!(
-            !patched_message_ids.iter().any(|id| id == "msg-root"),
-            "result progress should bypass throttled root edit and switch to continuation"
-        );
-        assert!(
-            patched_message_ids.iter().any(|id| id == "msg-fallback"),
-            "expected finalize to target continuation message after result progress"
-        );
+        let deleted_message_ids = state.deleted_message_ids.lock().await.clone();
+        assert!(patched_message_ids.is_empty());
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-root"));
+        assert!(deleted_message_ids.iter().any(|id| id == "msg-fallback"));
         assert_eq!(
             state.create_calls.load(Ordering::SeqCst),
-            2,
-            "expected one draft send + one immediate result continuation message"
+            3,
+            "expected one draft send + one result replacement + one final replacement"
         );
 
         server.abort();
@@ -4057,9 +4419,9 @@ mod tests {
     }
 
     #[test]
-    fn lark_text_edit_payload_preserves_policy_block_progress_summary() {
+    fn lark_text_payload_preserves_policy_block_progress_summary() {
         let progress_line = shell_policy_block_progress_line("cat /etc/passwd");
-        let payload = LarkChannel::build_text_edit_payload(&progress_line);
+        let payload = LarkChannel::build_text_payload("oc_test_chat", &progress_line);
         let content = payload
             .get("content")
             .and_then(|value| value.as_str())
