@@ -20,6 +20,9 @@ use zeroclaw::observability::{NoopObserver, Observer};
 use zeroclaw::providers::{ChatRequest, ChatResponse, Provider, ToolCall};
 use zeroclaw::tools::{Tool, ToolResult};
 
+type CapturedMessages = Vec<Vec<(String, String)>>;
+type SharedCapturedMessages = Arc<Mutex<CapturedMessages>>;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Mock infrastructure
 // ─────────────────────────────────────────────────────────────────────────────
@@ -38,11 +41,11 @@ impl MockProvider {
 
 struct CapturingProvider {
     responses: Mutex<Vec<ChatResponse>>,
-    requests: Arc<Mutex<Vec<Vec<(String, String)>>>>,
+    requests: SharedCapturedMessages,
 }
 
 impl CapturingProvider {
-    fn new(responses: Vec<ChatResponse>, requests: Arc<Mutex<Vec<Vec<(String, String)>>>>) -> Self {
+    fn new(responses: Vec<ChatResponse>, requests: SharedCapturedMessages) -> Self {
         Self {
             responses: Mutex::new(responses),
             requests,

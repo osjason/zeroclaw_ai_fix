@@ -298,20 +298,29 @@ Lưu ý:
 | `level` | `supervised` | `read_only`, `supervised` hoặc `full` |
 | `workspace_only` | `true` | Giới hạn ghi/lệnh trong phạm vi workspace |
 | `allowed_commands` | _bắt buộc để chạy shell_ | Danh sách lệnh được phép |
+| `command_context_rules` | `[]` | Luật allow/deny theo từng lệnh với ràng buộc domain/path |
 | `unrestricted_commands` | `[]` | danh sách trắng break-glass bỏ qua toàn bộ shell policy cho lệnh khớp |
-| `forbidden_paths` | `[]` | Danh sách đường dẫn bị cấm |
+| `shell_env_passthrough` | `[]` | Tên biến môi trường được phép truyền vào subprocess của shell tool |
+| `forbidden_paths` | danh sách bảo vệ dựng sẵn | Danh sách đường dẫn bị cấm |
+| `allowed_roots` | `[]` | Các root bổ sung được phép truy cập ngoài workspace |
 | `max_actions_per_hour` | `100` | Ngân sách hành động mỗi giờ |
 | `max_cost_per_day_cents` | `1000` | Giới hạn chi tiêu mỗi ngày (cent) |
 | `require_approval_for_medium_risk` | `true` | Yêu cầu phê duyệt cho lệnh rủi ro trung bình |
 | `block_high_risk_commands` | `true` | Chặn cứng lệnh rủi ro cao |
-| `auto_approve` | `[]` | Thao tác tool luôn được tự động phê duyệt |
+| `allow_unsafe_shell_structures` | `false` | Cho phép redirection/substitution/background operator của shell |
+| `auto_approve` | `["file_read","memory_recall"]` | Thao tác tool luôn được tự động phê duyệt |
 | `always_ask` | `[]` | Thao tác tool luôn yêu cầu phê duyệt |
+| `non_cli_excluded_tools` | danh sách loại trừ dựng sẵn cho non-CLI | Các tool bị ẩn khỏi tool spec trên kênh non-CLI |
 
 Lưu ý:
 
 - `level = "full"` bỏ qua phê duyệt rủi ro trung bình cho shell execution, nhưng vẫn áp dụng guardrail đã cấu hình.
+- Truy cập ngoài workspace vẫn cần `allowed_roots`, kể cả khi `workspace_only = false`.
+- Với path policy trong `[autonomy]` và allow rule của `command_context_rules`, prefix khớp cụ thể hơn sẽ thắng giữa allow và deny.
 - `allowed_commands` chỉ mở allowlist tên/đường dẫn lệnh; các guardrail khác vẫn còn hiệu lực.
+- `command_context_rules` được đánh giá theo từng shell segment và có thể giới hạn theo domain hoặc path prefix.
 - `unrestricted_commands` là danh sách trắng shell mạnh nhất: mục khớp sẽ bỏ qua `allowed_commands`, `command_context_rules`, path guard, shell-structure guard, kiểm tra read-only/autonomy và approval/risk gate. Chỉ nên dùng rất hẹp cho tình huống break-glass.
+- `shell_env_passthrough` chỉ nên chứa đúng tên biến môi trường bạn muốn subprocess nhìn thấy.
 - Phân tích toán tử/dấu phân cách shell nhận biết dấu ngoặc kép. Ký tự như `;` trong đối số được trích dẫn được xử lý là ký tự, không phải dấu phân cách lệnh.
 - Toán tử chuỗi shell không trích dẫn vẫn được kiểm tra bởi policy (`;`, `|`, `&&`, `||`, chạy nền và chuyển hướng).
 

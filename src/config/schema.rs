@@ -15148,6 +15148,240 @@ sensitivity = 0.9
     }
 
     #[test]
+    async fn autonomy_and_security_toml_exposes_all_user_settable_policy_surfaces() {
+        let parsed: Config = toml::from_str(
+            r#"
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4.6"
+default_temperature = 0.7
+
+[autonomy]
+level = "full"
+workspace_only = false
+allowed_commands = ["git", "cat"]
+unrestricted_commands = ["python3"]
+forbidden_paths = ["/etc", "sandbox/private"]
+allowed_roots = ["~/Desktop/projects", "sandbox/allow"]
+max_actions_per_hour = 42
+max_cost_per_day_cents = 1337
+require_approval_for_medium_risk = false
+block_high_risk_commands = false
+allow_unsafe_shell_structures = true
+shell_env_passthrough = ["DATABASE_URL", "RUST_LOG"]
+allow_sensitive_file_reads = true
+allow_sensitive_file_writes = true
+auto_approve = ["file_read", "memory_recall", "shell"]
+always_ask = ["shell"]
+non_cli_excluded_tools = ["shell", "browser"]
+non_cli_approval_approvers = ["telegram:alice", "discord:*"]
+non_cli_natural_language_approval_mode = "request_confirm"
+
+[[autonomy.command_context_rules]]
+command = "cat"
+action = "allow"
+allowed_path_prefixes = ["sandbox/allow"]
+denied_path_prefixes = ["sandbox/private"]
+allow_high_risk = false
+
+[autonomy.non_cli_natural_language_approval_mode_by_channel]
+telegram = "direct"
+discord = "disabled"
+
+[security.sandbox]
+enabled = true
+backend = "firejail"
+firejail_args = ["--private"]
+
+[security.resources]
+max_memory_mb = 1024
+max_cpu_time_seconds = 90
+max_subprocesses = 16
+memory_monitoring = false
+
+[security.audit]
+enabled = true
+log_path = "logs/audit.log"
+max_size_mb = 256
+sign_events = true
+
+[security.otp]
+enabled = true
+method = "totp"
+token_ttl_secs = 30
+cache_valid_secs = 120
+gated_actions = ["shell", "browser_open"]
+gated_domains = ["*.chase.com", "accounts.google.com"]
+gated_domain_categories = ["banking"]
+challenge_delivery = "thread"
+challenge_timeout_secs = 180
+challenge_max_attempts = 4
+
+[[security.roles]]
+name = "developer"
+description = "Developer role"
+allowed_tools = ["shell", "file_read"]
+denied_tools = ["memory_forget"]
+totp_gated = ["shell"]
+inherits = "operator"
+gated_domains = ["*.github.com"]
+gated_domain_categories = ["identity_providers"]
+
+[security.estop]
+enabled = true
+state_file = "~/.zeroclaw/estop-state.json"
+require_otp_to_resume = true
+
+[security.syscall_anomaly]
+enabled = true
+strict_mode = true
+alert_on_unknown_syscall = true
+max_denied_events_per_minute = 3
+max_total_events_per_minute = 60
+max_alerts_per_minute = 10
+alert_cooldown_secs = 15
+log_path = "syscall-anomalies.log"
+baseline_syscalls = ["read", "write", "openat", "close"]
+
+[security.perplexity_filter]
+enable_perplexity_filter = true
+perplexity_threshold = 16.5
+suffix_window_chars = 72
+min_prompt_chars = 40
+symbol_ratio_threshold = 0.25
+
+[security.outbound_leak_guard]
+enabled = true
+action = "block"
+sensitivity = 0.9
+
+[security.url_access]
+block_private_ip = true
+allow_cidrs = ["100.64.0.0/10", "198.18.0.0/15"]
+allow_domains = ["internal.example", "*.svc.local"]
+allow_loopback = true
+require_first_visit_approval = true
+enforce_domain_allowlist = true
+domain_allowlist = ["docs.rs", "github.com"]
+domain_blocklist = ["*.malware.test"]
+approved_domains = ["example.com"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.autonomy.level, AutonomyLevel::Full);
+        assert!(!parsed.autonomy.workspace_only);
+        assert_eq!(parsed.autonomy.allowed_commands, vec!["git", "cat"]);
+        assert_eq!(parsed.autonomy.unrestricted_commands, vec!["python3"]);
+        assert_eq!(parsed.autonomy.command_context_rules.len(), 1);
+        assert_eq!(
+            parsed.autonomy.command_context_rules[0].allowed_path_prefixes,
+            vec!["sandbox/allow"]
+        );
+        assert_eq!(
+            parsed.autonomy.command_context_rules[0].denied_path_prefixes,
+            vec!["sandbox/private"]
+        );
+        assert_eq!(
+            parsed.autonomy.forbidden_paths,
+            vec!["/etc", "sandbox/private"]
+        );
+        assert_eq!(
+            parsed.autonomy.allowed_roots,
+            vec!["~/Desktop/projects", "sandbox/allow"]
+        );
+        assert_eq!(parsed.autonomy.max_actions_per_hour, 42);
+        assert_eq!(parsed.autonomy.max_cost_per_day_cents, 1337);
+        assert!(!parsed.autonomy.require_approval_for_medium_risk);
+        assert!(!parsed.autonomy.block_high_risk_commands);
+        assert!(parsed.autonomy.allow_unsafe_shell_structures);
+        assert_eq!(
+            parsed.autonomy.shell_env_passthrough,
+            vec!["DATABASE_URL", "RUST_LOG"]
+        );
+        assert!(parsed.autonomy.allow_sensitive_file_reads);
+        assert!(parsed.autonomy.allow_sensitive_file_writes);
+        assert_eq!(
+            parsed.autonomy.auto_approve,
+            vec!["file_read", "memory_recall", "shell"]
+        );
+        assert_eq!(parsed.autonomy.always_ask, vec!["shell"]);
+        assert_eq!(
+            parsed.autonomy.non_cli_excluded_tools,
+            vec!["shell", "browser"]
+        );
+        assert_eq!(
+            parsed.autonomy.non_cli_approval_approvers,
+            vec!["telegram:alice", "discord:*"]
+        );
+        assert_eq!(
+            parsed.autonomy.non_cli_natural_language_approval_mode,
+            NonCliNaturalLanguageApprovalMode::RequestConfirm
+        );
+        assert_eq!(
+            parsed
+                .autonomy
+                .non_cli_natural_language_approval_mode_by_channel
+                .get("telegram"),
+            Some(&NonCliNaturalLanguageApprovalMode::Direct)
+        );
+        assert_eq!(
+            parsed
+                .autonomy
+                .non_cli_natural_language_approval_mode_by_channel
+                .get("discord"),
+            Some(&NonCliNaturalLanguageApprovalMode::Disabled)
+        );
+
+        assert_eq!(parsed.security.sandbox.enabled, Some(true));
+        assert!(matches!(
+            parsed.security.sandbox.backend,
+            SandboxBackend::Firejail
+        ));
+        assert_eq!(parsed.security.sandbox.firejail_args, vec!["--private"]);
+        assert_eq!(parsed.security.resources.max_memory_mb, 1024);
+        assert_eq!(parsed.security.resources.max_cpu_time_seconds, 90);
+        assert_eq!(parsed.security.resources.max_subprocesses, 16);
+        assert!(!parsed.security.resources.memory_monitoring);
+        assert!(parsed.security.audit.enabled);
+        assert_eq!(parsed.security.audit.log_path, "logs/audit.log");
+        assert_eq!(parsed.security.audit.max_size_mb, 256);
+        assert!(parsed.security.audit.sign_events);
+        assert!(parsed.security.otp.enabled);
+        assert_eq!(
+            parsed.security.otp.challenge_delivery,
+            OtpChallengeDelivery::Thread
+        );
+        assert_eq!(parsed.security.otp.challenge_timeout_secs, 180);
+        assert_eq!(parsed.security.otp.challenge_max_attempts, 4);
+        assert_eq!(parsed.security.roles.len(), 1);
+        assert_eq!(parsed.security.roles[0].name, "developer");
+        assert!(parsed.security.estop.enabled);
+        assert!(parsed.security.syscall_anomaly.strict_mode);
+        assert!(parsed.security.perplexity_filter.enable_perplexity_filter);
+        assert_eq!(
+            parsed.security.outbound_leak_guard.action,
+            OutboundLeakGuardAction::Block
+        );
+        assert_eq!(
+            parsed.security.url_access.allow_cidrs,
+            vec!["100.64.0.0/10", "198.18.0.0/15"]
+        );
+        assert!(parsed.security.url_access.allow_loopback);
+        assert!(parsed.security.url_access.require_first_visit_approval);
+        assert!(parsed.security.url_access.enforce_domain_allowlist);
+        assert_eq!(
+            parsed.security.url_access.domain_blocklist,
+            vec!["*.malware.test"]
+        );
+        assert_eq!(
+            parsed.security.url_access.approved_domains,
+            vec!["example.com"]
+        );
+
+        parsed.validate().unwrap();
+    }
+
+    #[test]
     async fn security_validation_rejects_invalid_domain_glob() {
         let mut config = Config::default();
         config.security.otp.gated_domains = vec!["bad domain.com".into()];

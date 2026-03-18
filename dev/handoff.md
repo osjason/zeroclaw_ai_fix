@@ -1,7 +1,0 @@
-done: 本轮完成了“预检结构收口”这一个具体事项：将 `scheduler` 的命令预检从字符串接口统一到 `CommandPolicyViolation` 结构，再在返回边界统一 `format_block_message()`；并删除 `policy.rs` 中冗余的字符串版预检函数。修改文件：[src/cron/scheduler.rs](C:/Users/osjas/MyData/PG/zeroclaw/src/cron/scheduler.rs), [src/security/policy.rs](C:/Users/osjas/MyData/PG/zeroclaw/src/security/policy.rs)。最小验证已执行并通过：`cargo test --lib cron::scheduler::tests::process_due_jobs_blocked_command_delivers_trigger_running_then_blocked_with_policy -- --exact`（1 passed）。已提交：`e02c10fa refactor(security): unify scheduler preflight on violation type`。
-state: 当前子目标进行中；scheduler 侧已与 tools/policy 的结构化违规则型对齐，拦截输出仍保持 `policy/command/reason`。工作区仍有既有未提交改动：`src/channels/progress_event.rs`（本轮未触碰）。
-next_files: [src/tools/cron_add.rs](C:/Users/osjas/MyData/PG/zeroclaw/src/tools/cron_add.rs), [src/tools/cron_update.rs](C:/Users/osjas/MyData/PG/zeroclaw/src/tools/cron_update.rs), [src/tools/cron_common.rs](C:/Users/osjas/MyData/PG/zeroclaw/src/tools/cron_common.rs)
-next_action: 对 `cron_add/cron_update` 再做一次收口，确保所有“命令拦截”仅走共享 preflight 路径，不留分散分支。
-next_verify: `cargo test --lib tools::cron_add::tests::blocks_disallowed_shell_command_matches_preflight_event_fields -- --exact` 和 `cargo test --lib tools::cron_update::tests::blocks_disallowed_command_updates_match_preflight_event_fields -- --exact`
-next_success: 两条用例通过，且 `cron_add/cron_update` 拦截输出字段与 preflight 结构完全一致（`policy_id/command_fragment/reason`）。
-blockers: 无

@@ -17,8 +17,22 @@ const MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Environment variables safe to pass to shell commands.
 /// Only functional variables are included — never API keys or secrets.
 const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
-    "SYSTEMROOT", "WINDIR", "USERPROFILE", "TMP", "TEMP", "PATHEXT", "PSMODULEPATH",
+    "PATH",
+    "HOME",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "USER",
+    "SHELL",
+    "TMPDIR",
+    "SYSTEMROOT",
+    "WINDIR",
+    "USERPROFILE",
+    "TMP",
+    "TEMP",
+    "PATHEXT",
+    "PSMODULEPATH",
 ];
 
 fn truncate_utf8_to_max_bytes(text: &mut String, max_bytes: usize) {

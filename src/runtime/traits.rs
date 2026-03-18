@@ -120,10 +120,10 @@ mod tests {
 
             #[cfg(not(windows))]
             {
-            let mut cmd = tokio::process::Command::new("echo");
-            cmd.arg(command);
-            cmd.current_dir(workspace_dir);
-            Ok(cmd)
+                let mut cmd = tokio::process::Command::new("echo");
+                cmd.arg(command);
+                cmd.current_dir(workspace_dir);
+                Ok(cmd)
             }
         }
     }

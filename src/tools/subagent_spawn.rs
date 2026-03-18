@@ -653,11 +653,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("read-only"));
+        assert!(result.error.as_deref().unwrap_or("").contains("read-only"));
     }
 
     #[tokio::test]

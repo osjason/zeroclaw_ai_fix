@@ -1177,6 +1177,10 @@ impl Default for SecurityPolicy {
                 "git".into(),
                 "npm".into(),
                 "cargo".into(),
+                "mkdir".into(),
+                "touch".into(),
+                "cp".into(),
+                "mv".into(),
                 "ls".into(),
                 "cat".into(),
                 "grep".into(),
@@ -1214,8 +1218,8 @@ impl Default for SecurityPolicy {
                 "~/.config".into(),
             ],
             allowed_roots: Vec::new(),
-            max_actions_per_hour: 20,
-            max_cost_per_day_cents: 500,
+            max_actions_per_hour: 100,
+            max_cost_per_day_cents: 1000,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             allow_unsafe_shell_structures: false,
@@ -1965,11 +1969,34 @@ impl SecurityPolicy {
     }
 
     fn resolve_rule_prefix(&self, prefix: &str) -> PathBuf {
-        let expanded = expand_user_path(prefix.trim());
-        if expanded.is_absolute() {
-            expanded
-        } else {
-            self.workspace_dir.join(expanded)
+        self.resolve_policy_path(prefix.trim())
+    }
+
+    fn strongest_matching_rule_prefix(&self, prefixes: &[String], path: &Path) -> Option<PathBuf> {
+        prefixes
+            .iter()
+            .map(|prefix| self.resolve_rule_prefix(prefix))
+            .filter(|prefix| path.starts_with(prefix))
+            .max_by_key(|prefix| prefix.components().count())
+    }
+
+    fn command_rule_explicit_path_policy_allows(
+        &self,
+        rule: &crate::config::CommandContextRuleConfig,
+        path: &Path,
+    ) -> Option<bool> {
+        let allowed = self.strongest_matching_rule_prefix(&rule.allowed_path_prefixes, path);
+        let denied = self.strongest_matching_rule_prefix(&rule.denied_path_prefixes, path);
+
+        match (allowed, denied) {
+            (Some(allowed_prefix), Some(denied_prefix)) => {
+                let allowed_depth = allowed_prefix.components().count();
+                let denied_depth = denied_prefix.components().count();
+                Some(allowed_depth > denied_depth)
+            }
+            (Some(_), None) => Some(true),
+            (None, Some(_)) => Some(false),
+            (None, None) => None,
         }
     }
 
@@ -2021,6 +2048,25 @@ impl SecurityPolicy {
             })
             .collect();
 
+        if rule.action == crate::config::CommandContextRuleAction::Allow {
+            if !rule.allowed_path_prefixes.is_empty() {
+                if path_args.is_empty() {
+                    return false;
+                }
+                if !path_args.iter().all(|path| {
+                    self.command_rule_explicit_path_policy_allows(rule, path) == Some(true)
+                }) {
+                    return false;
+                }
+            } else if path_args.iter().any(|path| {
+                self.command_rule_explicit_path_policy_allows(rule, path) == Some(false)
+            }) {
+                return false;
+            }
+
+            return true;
+        }
+
         if !rule.allowed_path_prefixes.is_empty() {
             if path_args.is_empty() {
                 return false;
@@ -2045,23 +2091,14 @@ impl SecurityPolicy {
                 .iter()
                 .map(|prefix| self.resolve_rule_prefix(prefix))
                 .collect();
-            if rule.action == crate::config::CommandContextRuleAction::Deny {
-                if path_args.is_empty() {
-                    return false;
-                }
-                return path_args.iter().any(|path| {
-                    denied_prefixes
-                        .iter()
-                        .any(|prefix| path.starts_with(prefix))
-                });
+            if path_args.is_empty() {
+                return false;
             }
-            if path_args.iter().any(|path| {
+            return path_args.iter().any(|path| {
                 denied_prefixes
                     .iter()
                     .any(|prefix| path.starts_with(prefix))
-            }) {
-                return false;
-            }
+            });
         }
 
         true
@@ -2947,6 +2984,91 @@ impl SecurityPolicy {
     // forbidden-prefix match. Each layer addresses a distinct escape
     // technique; together they enforce workspace confinement.
 
+    fn resolve_policy_path(&self, path: &str) -> PathBuf {
+        let expanded = expand_user_path(path);
+        if expanded.is_absolute() || expanded.has_root() {
+            expanded
+        } else {
+            self.workspace_dir.join(expanded)
+        }
+    }
+
+    fn strongest_matching_allowed_root(
+        &self,
+        path: &Path,
+        canonicalize_roots: bool,
+        include_workspace_root: bool,
+    ) -> Option<PathBuf> {
+        self.allowed_roots
+            .iter()
+            .map(|root| {
+                let normalized = if root.is_absolute() || root.has_root() {
+                    root.clone()
+                } else {
+                    self.workspace_dir.join(root)
+                };
+                if canonicalize_roots {
+                    normalized.canonicalize().unwrap_or(normalized)
+                } else {
+                    normalized
+                }
+            })
+            .filter(|root| path.starts_with(root))
+            .chain(include_workspace_root.then(|| {
+                let workspace_root = if canonicalize_roots {
+                    self.workspace_dir
+                        .canonicalize()
+                        .unwrap_or_else(|_| self.workspace_dir.clone())
+                } else {
+                    self.workspace_dir.clone()
+                };
+                path.starts_with(&workspace_root).then_some(workspace_root)
+            })
+            .flatten())
+            .max_by_key(|root| root.components().count())
+    }
+
+    fn strongest_matching_forbidden_path(
+        &self,
+        path: &Path,
+        canonicalize_roots: bool,
+    ) -> Option<PathBuf> {
+        self.forbidden_paths
+            .iter()
+            .map(|forbidden| {
+                let normalized = self.resolve_policy_path(forbidden);
+                if canonicalize_roots {
+                    normalized.canonicalize().unwrap_or(normalized)
+                } else {
+                    normalized
+                }
+            })
+            .filter(|forbidden| path.starts_with(forbidden))
+            .max_by_key(|forbidden| forbidden.components().count())
+    }
+
+    fn explicit_path_policy_allows(
+        &self,
+        path: &Path,
+        canonicalize_roots: bool,
+        include_workspace_root: bool,
+    ) -> Option<bool> {
+        let allowed =
+            self.strongest_matching_allowed_root(path, canonicalize_roots, include_workspace_root);
+        let forbidden = self.strongest_matching_forbidden_path(path, canonicalize_roots);
+
+        match (allowed, forbidden) {
+            (Some(allowed_root), Some(forbidden_root)) => {
+                let allowed_depth = allowed_root.components().count();
+                let forbidden_depth = forbidden_root.components().count();
+                Some(allowed_depth > forbidden_depth)
+            }
+            (Some(_), None) => Some(true),
+            (None, Some(_)) => Some(false),
+            (None, None) => None,
+        }
+    }
+
     /// Check if a file path is allowed (no path traversal, within workspace)
     pub fn is_path_allowed(&self, path: &str) -> bool {
         if path == "/" || path == "\\" {
@@ -2978,20 +3100,27 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Expand "~" for consistent matching with forbidden paths and allowlists.
+        // Expand "~" for consistent matching with policy paths.
         let expanded_path = expand_user_path(path);
+        let policy_path = if expanded_path.is_absolute() {
+            expanded_path.clone()
+        } else {
+            self.workspace_dir.join(&expanded_path)
+        };
+        let explicit_allow =
+            self.explicit_path_policy_allows(&policy_path, false, false) == Some(true);
 
-        // Block absolute paths when workspace_only is set
-        if self.workspace_only && is_policy_absolute_path(path, &expanded_path) {
+        // Block absolute paths when workspace_only is set unless the path lives
+        // under an explicitly allowlisted root.
+        if self.workspace_only && is_policy_absolute_path(path, &expanded_path) && !explicit_allow {
             return false;
         }
 
-        // Block forbidden paths using path-component-aware matching
-        for forbidden in &self.forbidden_paths {
-            let forbidden_path = expand_user_path(forbidden);
-            if expanded_path.starts_with(forbidden_path) {
-                return false;
-            }
+        // Explicit path policy uses the most-specific matching root so a
+        // narrow allow can override a broad deny, while a narrower deny still
+        // beats a broader allow.
+        if self.explicit_path_policy_allows(&policy_path, false, false) == Some(false) {
+            return false;
         }
 
         true
@@ -3006,27 +3135,15 @@ impl SecurityPolicy {
             .workspace_dir
             .canonicalize()
             .unwrap_or_else(|_| self.workspace_dir.clone());
+
+        match self.explicit_path_policy_allows(resolved, true, true) {
+            Some(true) => return true,
+            Some(false) => return false,
+            None => {}
+        }
+
         if resolved.starts_with(&workspace_root) {
             return true;
-        }
-
-        // Check extra allowed roots (e.g. shared skills directories) before
-        // forbidden checks so explicit allowlists can coexist with broad
-        // default forbidden roots such as `/home` and `/tmp`.
-        for root in &self.allowed_roots {
-            let canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
-            if resolved.starts_with(&canonical) {
-                return true;
-            }
-        }
-
-        // For paths outside workspace/allowlist, block forbidden roots to
-        // prevent symlink escapes and sensitive directory access.
-        for forbidden in &self.forbidden_paths {
-            let forbidden_path = expand_user_path(forbidden);
-            if resolved.starts_with(&forbidden_path) {
-                return false;
-            }
         }
 
         // When workspace_only is disabled the user explicitly opted out of
@@ -3180,7 +3297,7 @@ impl SecurityPolicy {
                 .iter()
                 .map(|root| {
                     let expanded = expand_user_path(root);
-                    if expanded.is_absolute() {
+                    if expanded.is_absolute() || expanded.has_root() {
                         expanded
                     } else {
                         workspace_dir.join(expanded)
@@ -3506,6 +3623,85 @@ mod tests {
             .validate_command_execution_with_reason("curl https://evil.example/v1", true)
             .expect_err("non-matching context must remain blocked");
         assert_eq!(blocked.policy_id(), "autonomy.command_context_rules");
+    }
+
+    #[test]
+    fn command_context_allow_rule_honors_more_specific_allowed_path_prefix() {
+        let root =
+            std::env::temp_dir().join("zeroclaw_test_command_context_allow_path_specificity");
+        let workspace = root.join("workspace");
+        let allowed = workspace.join("sandbox").join("allow");
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(allowed.join("nested")).unwrap();
+        std::fs::create_dir_all(workspace.join("sandbox").join("blocked")).unwrap();
+
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            block_high_risk_commands: false,
+            workspace_dir: workspace.clone(),
+            allowed_commands: vec!["cat".into()],
+            command_context_rules: vec![crate::config::CommandContextRuleConfig {
+                command: "cat".into(),
+                action: crate::config::CommandContextRuleAction::Allow,
+                allowed_domains: vec![],
+                allowed_path_prefixes: vec!["sandbox/allow".into()],
+                denied_path_prefixes: vec!["sandbox".into()],
+                allow_high_risk: false,
+            }],
+            ..SecurityPolicy::default()
+        };
+
+        assert!(
+            p.validate_command_execution_with_reason("cat sandbox/allow/nested/file.txt", true)
+                .is_ok(),
+            "a narrower allowed_path_prefix should override a broader denied_path_prefix"
+        );
+
+        let blocked = p
+            .validate_command_execution_with_reason("cat sandbox/blocked/file.txt", true)
+            .expect_err("siblings outside the explicit allow path must remain blocked");
+        assert_eq!(blocked.policy_id(), "autonomy.command_context_rules");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn command_context_allow_rule_more_specific_denied_path_prefix_still_blocks() {
+        let root =
+            std::env::temp_dir().join("zeroclaw_test_command_context_allow_denied_specificity");
+        let workspace = root.join("workspace");
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(workspace.join("sandbox").join("public")).unwrap();
+        std::fs::create_dir_all(workspace.join("sandbox").join("private")).unwrap();
+
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            block_high_risk_commands: false,
+            workspace_dir: workspace.clone(),
+            allowed_commands: vec!["cat".into()],
+            command_context_rules: vec![crate::config::CommandContextRuleConfig {
+                command: "cat".into(),
+                action: crate::config::CommandContextRuleAction::Allow,
+                allowed_domains: vec![],
+                allowed_path_prefixes: vec!["sandbox".into()],
+                denied_path_prefixes: vec!["sandbox/private".into()],
+                allow_high_risk: false,
+            }],
+            ..SecurityPolicy::default()
+        };
+
+        assert!(p
+            .validate_command_execution_with_reason("cat sandbox/public/file.txt", true)
+            .is_ok());
+
+        let blocked = p
+            .validate_command_execution_with_reason("cat sandbox/private/key.txt", true)
+            .expect_err("a more specific denied_path_prefix must still win");
+        assert_eq!(blocked.policy_id(), "autonomy.command_context_rules");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3878,6 +4074,93 @@ mod tests {
     }
 
     #[test]
+    fn allowed_root_overrides_broader_forbidden_parent_for_path_checks() {
+        let root = std::env::temp_dir().join("zeroclaw_test_forbidden_allowed_overlap");
+        let forbidden = root.join("forbidden_root");
+        let allowed = forbidden.join("allowed_root");
+        let nested = allowed.join("nested").join("file.txt");
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_only: true,
+            forbidden_paths: vec![forbidden.display().to_string()],
+            allowed_roots: vec![allowed.clone()],
+            ..SecurityPolicy::default()
+        };
+
+        assert!(
+            policy.is_path_allowed(&nested.display().to_string()),
+            "explicitly allowlisted subpaths must bypass broader forbidden parents"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn relative_forbidden_parent_can_be_overridden_by_more_specific_allowed_root() {
+        let root = std::env::temp_dir().join("zeroclaw_test_relative_forbidden_allowed_overlap");
+        let workspace = root.join("workspace");
+        let nested = workspace
+            .join("sandbox")
+            .join("allow")
+            .join("nested")
+            .join("file.txt");
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            workspace_only: true,
+            forbidden_paths: vec!["sandbox".into()],
+            allowed_roots: vec![workspace.join("sandbox").join("allow")],
+            ..SecurityPolicy::default()
+        };
+
+        assert!(
+            policy.is_path_allowed("sandbox/allow/nested/file.txt"),
+            "workspace-relative forbidden parents should honor a more specific allowed_root"
+        );
+        assert!(
+            !policy.is_path_allowed("sandbox/blocked/file.txt"),
+            "siblings outside the explicit allow root must remain blocked"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn more_specific_forbidden_path_beats_broader_allowed_root() {
+        let root = std::env::temp_dir().join("zeroclaw_test_specific_forbidden_wins");
+        let workspace = root.join("workspace");
+        let private = workspace.join("sandbox").join("private").join("key.txt");
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(private.parent().unwrap()).unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            workspace_only: true,
+            forbidden_paths: vec!["sandbox/private".into()],
+            allowed_roots: vec![workspace.join("sandbox")],
+            ..SecurityPolicy::default()
+        };
+
+        assert!(
+            !policy.is_path_allowed("sandbox/private/key.txt"),
+            "a more specific forbidden path must still win over a broader allowed root"
+        );
+        assert!(
+            policy.is_path_allowed("sandbox/public/file.txt"),
+            "non-forbidden siblings under the broader allowed root should remain accessible"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn forbidden_paths_blocked() {
         let p = SecurityPolicy {
             workspace_only: false,
@@ -3977,11 +4260,64 @@ mod tests {
         assert!(p.workspace_only);
         assert!(!p.allowed_commands.is_empty());
         assert!(!p.forbidden_paths.is_empty());
-        assert!(p.max_actions_per_hour > 0);
-        assert!(p.max_cost_per_day_cents > 0);
+        assert_eq!(p.max_actions_per_hour, 100);
+        assert_eq!(p.max_cost_per_day_cents, 1000);
         assert!(p.require_approval_for_medium_risk);
         assert!(p.block_high_risk_commands);
         assert!(p.shell_env_passthrough.is_empty());
+    }
+
+    #[test]
+    fn default_policy_matches_default_autonomy_config() {
+        let autonomy = crate::config::AutonomyConfig::default();
+        let policy = SecurityPolicy::default();
+        let from_config = SecurityPolicy::from_config(&autonomy, Path::new("."));
+
+        assert_eq!(policy.autonomy, from_config.autonomy);
+        assert_eq!(policy.workspace_only, from_config.workspace_only);
+        assert_eq!(policy.allowed_commands, from_config.allowed_commands);
+        assert_eq!(
+            policy.unrestricted_commands,
+            from_config.unrestricted_commands
+        );
+        assert_eq!(
+            policy.command_context_rules.len(),
+            from_config.command_context_rules.len()
+        );
+        assert_eq!(policy.forbidden_paths, from_config.forbidden_paths);
+        assert_eq!(policy.allowed_roots, from_config.allowed_roots);
+        assert_eq!(
+            policy.max_actions_per_hour,
+            from_config.max_actions_per_hour
+        );
+        assert_eq!(
+            policy.max_cost_per_day_cents,
+            from_config.max_cost_per_day_cents
+        );
+        assert_eq!(
+            policy.require_approval_for_medium_risk,
+            from_config.require_approval_for_medium_risk
+        );
+        assert_eq!(
+            policy.block_high_risk_commands,
+            from_config.block_high_risk_commands
+        );
+        assert_eq!(
+            policy.allow_unsafe_shell_structures,
+            from_config.allow_unsafe_shell_structures
+        );
+        assert_eq!(
+            policy.shell_env_passthrough,
+            from_config.shell_env_passthrough
+        );
+        assert_eq!(
+            policy.allow_sensitive_file_reads,
+            from_config.allow_sensitive_file_reads
+        );
+        assert_eq!(
+            policy.allow_sensitive_file_writes,
+            from_config.allow_sensitive_file_writes
+        );
     }
 
     // ── ActionTracker / rate limiting ───────────────────────
@@ -4355,6 +4691,61 @@ mod tests {
         let p = default_policy();
         assert_eq!(p.forbidden_path_argument("cat src/main.rs"), None);
         assert_eq!(p.forbidden_path_argument("grep -r todo ./src"), None);
+    }
+
+    #[test]
+    fn forbidden_path_argument_allows_path_inside_allowed_root_under_forbidden_parent() {
+        let root = std::env::temp_dir().join("zeroclaw_test_cmd_forbidden_allowed_overlap");
+        let forbidden = root.join("forbidden_root");
+        let allowed = forbidden.join("allowed_root");
+        let nested = allowed.join("nested").join("file.txt");
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+
+        let p = SecurityPolicy {
+            workspace_only: true,
+            forbidden_paths: vec![forbidden.display().to_string()],
+            allowed_roots: vec![allowed],
+            ..SecurityPolicy::default()
+        };
+
+        assert_eq!(
+            p.forbidden_path_argument(&format!("cat {}", nested.display())),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn forbidden_path_argument_honors_relative_forbidden_and_allowed_root_specificity() {
+        let root = std::env::temp_dir().join("zeroclaw_test_cmd_relative_forbidden_allowed");
+        let workspace = root.join("workspace");
+        let allowed = workspace.join("sandbox").join("allow");
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(allowed.join("nested")).unwrap();
+        std::fs::create_dir_all(workspace.join("sandbox").join("private")).unwrap();
+
+        let p = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            workspace_only: true,
+            forbidden_paths: vec!["sandbox".into(), "sandbox/private".into()],
+            allowed_roots: vec![allowed],
+            ..SecurityPolicy::default()
+        };
+
+        assert_eq!(
+            p.forbidden_path_argument("cat sandbox/allow/nested/file.txt"),
+            None
+        );
+        assert_eq!(
+            p.forbidden_path_argument("cat sandbox/private/key.txt"),
+            Some("sandbox/private/key.txt".into())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -5080,6 +5471,116 @@ mod tests {
         assert!(
             !policy_with.is_resolved_path_allowed(&unrelated.canonicalize().unwrap()),
             "paths outside workspace and allowed_roots must still be blocked"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolved_allowed_root_overrides_broader_forbidden_parent() {
+        let root = std::env::temp_dir().join("zeroclaw_test_resolved_forbidden_allowed_overlap");
+        let workspace = root.join("workspace");
+        let forbidden = root.join("forbidden_root");
+        let allowed = forbidden.join("allowed_root");
+        let nested = allowed.join("nested");
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            workspace_only: true,
+            forbidden_paths: vec![forbidden.display().to_string()],
+            allowed_roots: vec![allowed],
+            ..SecurityPolicy::default()
+        };
+
+        let resolved = nested.canonicalize().unwrap();
+        assert!(
+            policy.is_resolved_path_allowed(&resolved),
+            "resolved paths inside an explicitly allowlisted subroot must stay accessible"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolved_relative_forbidden_parent_honors_more_specific_allowed_root() {
+        let root = std::env::temp_dir().join("zeroclaw_test_resolved_relative_forbidden_allowed");
+        let workspace = root.join("workspace");
+        let nested = workspace.join("sandbox").join("allow").join("nested");
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            workspace_only: true,
+            forbidden_paths: vec!["sandbox".into()],
+            allowed_roots: vec![workspace.join("sandbox").join("allow")],
+            ..SecurityPolicy::default()
+        };
+
+        let resolved = nested.canonicalize().unwrap();
+        assert!(
+            policy.is_resolved_path_allowed(&resolved),
+            "resolved paths should honor a more specific allowed_root over a workspace-relative forbidden parent"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolved_workspace_forbidden_path_is_blocked_even_inside_workspace() {
+        let root = std::env::temp_dir().join("zeroclaw_test_resolved_workspace_forbidden");
+        let workspace = root.join("workspace");
+        let secret = workspace.join("secret").join("nested");
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&secret).unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            workspace_only: true,
+            forbidden_paths: vec!["secret".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let resolved = secret.canonicalize().unwrap();
+        assert!(
+            !policy.is_resolved_path_allowed(&resolved),
+            "workspace-local forbidden paths must remain blocked after resolution"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_workspace_forbidden_path_blocks_symlink_aliases_inside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join("zeroclaw_test_workspace_forbidden_symlink_alias");
+        let workspace = root.join("workspace");
+        let secret = workspace.join("secret");
+        let alias = workspace.join("alias");
+
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(secret.join("nested")).unwrap();
+        symlink(&secret, &alias).unwrap();
+
+        let policy = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            workspace_only: true,
+            forbidden_paths: vec!["secret".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let resolved = alias.join("nested").canonicalize().unwrap();
+        assert!(
+            !policy.is_resolved_path_allowed(&resolved),
+            "workspace-local symlink aliases must not bypass forbidden_paths"
         );
 
         let _ = std::fs::remove_dir_all(&root);

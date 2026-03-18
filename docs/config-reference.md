@@ -146,20 +146,23 @@ Notes:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `enabled` | `false` | Enable OTP gating for sensitive actions/domains |
+| `enabled` | `true` | Enable OTP gating for sensitive actions/domains |
 | `method` | `totp` | OTP method (`totp`, `pairing`, `cli-prompt`) |
 | `token_ttl_secs` | `30` | TOTP time-step window in seconds |
 | `cache_valid_secs` | `300` | Cache window for recently validated OTP codes |
 | `gated_actions` | `["shell","file_write","browser_open","browser","memory_forget"]` | Tool actions protected by OTP |
 | `gated_domains` | `[]` | Explicit domain patterns requiring OTP (`*.example.com`, `login.example.com`) |
 | `gated_domain_categories` | `[]` | Domain preset categories (`banking`, `medical`, `government`, `identity_providers`) |
+| `challenge_delivery` | `dm` | Channel delivery mode for OTP challenges (`dm`, `thread`, `ephemeral`) |
+| `challenge_timeout_secs` | `120` | How long an OTP challenge stays valid |
+| `challenge_max_attempts` | `3` | Maximum OTP attempts per challenge |
 
 Notes:
 
 - Domain patterns support wildcard `*`.
 - Category presets expand to curated domain sets during validation.
 - Invalid domain globs or unknown categories fail fast at startup.
-- When `enabled = true` and no OTP secret exists, ZeroClaw generates one and prints an enrollment URI once.
+- OTP gating is enabled by default; when no OTP secret exists, ZeroClaw generates one and prints an enrollment URI once.
 
 Example:
 
@@ -172,6 +175,44 @@ cache_valid_secs = 300
 gated_actions = ["shell", "browser_open"]
 gated_domains = ["*.chase.com", "accounts.google.com"]
 gated_domain_categories = ["banking"]
+challenge_delivery = "thread"
+challenge_timeout_secs = 180
+challenge_max_attempts = 4
+```
+
+## `[[security.roles]]`
+
+Custom security roles for user-level tool authorization and OTP scoping.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `name` | _required_ | Stable role name used by user records |
+| `description` | `""` | Optional human-readable description |
+| `allowed_tools` | `[]` | Explicit tool allowlist for the role |
+| `denied_tools` | `[]` | Explicit tool denylist for the role |
+| `totp_gated` | `[]` | Tool names that require OTP for this role |
+| `inherits` | unset | Optional parent role name |
+| `gated_domains` | `[]` | Role-scoped domain patterns requiring OTP |
+| `gated_domain_categories` | `[]` | Role-scoped domain category presets requiring OTP |
+
+Notes:
+
+- Role names must be unique, use safe identifier characters, and must not conflict with built-in roles (`owner`, `admin`, `operator`, `viewer`, `guest`).
+- `inherits` may reference either a built-in role or another custom role defined in `config.toml`.
+- Role domain constraints are validated with the same glob/category rules as `security.otp`.
+
+Example:
+
+```toml
+[[security.roles]]
+name = "developer"
+description = "Developer role"
+allowed_tools = ["shell", "file_read", "file_write"]
+denied_tools = ["memory_forget"]
+totp_gated = ["shell", "file_write"]
+inherits = "operator"
+gated_domains = ["*.github.com"]
+gated_domain_categories = ["identity_providers"]
 ```
 
 ## `[security.estop]`
@@ -369,6 +410,72 @@ Example:
 enabled = true
 action = "block"
 sensitivity = 0.9
+```
+
+## `[security.sandbox]`
+
+OS-level isolation backend selection for command execution.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `null` (auto-detect) | `true` forces sandboxing, `false` disables it, `null` lets ZeroClaw auto-detect |
+| `backend` | `auto` | Sandbox backend (`auto`, `landlock`, `firejail`, `bubblewrap`, `docker`, `none`) |
+| `firejail_args` | `[]` | Extra Firejail arguments when `backend = "firejail"` |
+
+Notes:
+
+- `enabled = null` keeps the secure auto-detect behavior and is the default.
+- `backend = "none"` disables OS-level isolation and should be reserved for controlled environments.
+
+Example:
+
+```toml
+[security.sandbox]
+enabled = true
+backend = "firejail"
+firejail_args = ["--private"]
+```
+
+## `[security.resources]`
+
+Resource caps applied to command execution.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `max_memory_mb` | `512` | Maximum memory per command in MB |
+| `max_cpu_time_seconds` | `60` | Maximum CPU time per command in seconds |
+| `max_subprocesses` | `10` | Maximum number of subprocesses per command |
+| `memory_monitoring` | `true` | Enable runtime memory monitoring |
+
+Example:
+
+```toml
+[security.resources]
+max_memory_mb = 1024
+max_cpu_time_seconds = 90
+max_subprocesses = 16
+memory_monitoring = false
+```
+
+## `[security.audit]`
+
+Audit-log persistence and tamper-evidence settings.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `true` | Enable audit logging |
+| `log_path` | `audit.log` | Audit log path relative to the ZeroClaw directory |
+| `max_size_mb` | `100` | Rotate the audit log after this size |
+| `sign_events` | `false` | Add HMAC signatures for tamper evidence |
+
+Example:
+
+```toml
+[security.audit]
+enabled = true
+log_path = "logs/audit.log"
+max_size_mb = 256
+sign_events = true
 ```
 
 ## `[agents.<name>]`
@@ -858,18 +965,21 @@ Environment overrides:
 | `level` | `supervised` | `read_only`, `supervised`, or `full` |
 | `workspace_only` | `true` | reject absolute path inputs unless explicitly disabled |
 | `allowed_commands` | _required for shell execution_ | allowlist of executable names, explicit executable paths, or `"*"` |
+| `command_context_rules` | `[]` | per-command allow/deny overrides with optional domain/path constraints |
 | `unrestricted_commands` | `[]` | hard whitelist that bypasses shell policy gates for explicitly matched commands |
+| `shell_env_passthrough` | `[]` | extra environment variable names forwarded to shell tool subprocesses |
 | `forbidden_paths` | built-in protected list | explicit path denylist (system paths + sensitive dotdirs by default) |
 | `allowed_roots` | `[]` | additional roots allowed outside workspace after canonicalization |
-| `max_actions_per_hour` | `20` | per-policy action budget |
-| `max_cost_per_day_cents` | `500` | per-policy spend guardrail |
+| `max_actions_per_hour` | `100` | per-policy action budget |
+| `max_cost_per_day_cents` | `1000` | per-policy spend guardrail |
 | `require_approval_for_medium_risk` | `true` | approval gate for medium-risk commands |
 | `block_high_risk_commands` | `true` | hard block for high-risk commands |
+| `allow_unsafe_shell_structures` | `false` | opt in to shell redirection/substitution/background operators |
 | `allow_sensitive_file_reads` | `false` | allow `file_read` on sensitive files/dirs (for example `.env`, `.aws/credentials`, private keys) |
 | `allow_sensitive_file_writes` | `false` | allow `file_write`/`file_edit` on sensitive files/dirs (for example `.env`, `.aws/credentials`, private keys) |
-| `auto_approve` | `[]` | tool operations always auto-approved |
+| `auto_approve` | `["file_read","memory_recall"]` | tool operations always auto-approved |
 | `always_ask` | `[]` | tool operations that always require approval |
-| `non_cli_excluded_tools` | `[]` | tools hidden from non-CLI channel tool specs |
+| `non_cli_excluded_tools` | built-in non-CLI exclusion list | tools hidden from non-CLI channel tool specs |
 | `non_cli_approval_approvers` | `[]` | optional allowlist for who can run non-CLI approval-management commands |
 | `non_cli_natural_language_approval_mode` | `direct` | natural-language behavior for approval-management commands (`direct`, `request_confirm`, `disabled`) |
 | `non_cli_natural_language_approval_mode_by_channel` | `{}` | per-channel override map for natural-language approval mode |
@@ -879,9 +989,12 @@ Notes:
 - `level = "full"` skips medium-risk approval gating for shell execution, while still enforcing configured guardrails.
 - Access outside the workspace requires `allowed_roots`, even when `workspace_only = false`.
 - `allowed_roots` supports absolute paths, `~/...`, and workspace-relative paths.
+- For both `[autonomy]` path policy and `command_context_rules` allow rules, the most specific matching prefix wins between allow and deny entries.
 - `allowed_commands` entries can be command names (for example, `"git"`), explicit executable paths (for example, `"/usr/bin/antigravity"`), or `"*"` to allow any command name/path (risk gates still apply).
+- `command_context_rules` are evaluated per shell segment and can constrain commands by domains and path prefixes.
 - `unrestricted_commands` is the true break-glass shell whitelist. Matching entries bypass `allowed_commands`, `command_context_rules`, path guards, shell-structure guards, read-only/autonomy prechecks, and approval/risk gates for that command. Keep this list narrowly scoped and prefer `allowed_commands` for normal operation.
 - `unrestricted_commands` uses the same matcher shapes as `allowed_commands`: command names, explicit executable paths, or `"*"` (which effectively disables shell command policy for all commands and should not be used in production).
+- `shell_env_passthrough` extends the built-in safe environment baseline after `env_clear()`. Only add exact variable names you intentionally want subprocesses to see.
 - `file_read` blocks sensitive secret-bearing files/directories by default. Set `allow_sensitive_file_reads = true` only for controlled debugging sessions.
 - `file_write` and `file_edit` block sensitive secret-bearing files/directories by default. Set `allow_sensitive_file_writes = true` only for controlled break-glass sessions.
 - `file_read`, `file_write`, and `file_edit` refuse multiply-linked files (hard-link guard) to reduce workspace path bypass risk via hard-link escapes.

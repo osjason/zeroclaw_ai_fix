@@ -1,0 +1,2 @@
+Mar 18 12:55:03 nanopi-r2s zeroclaw[1304610]: 2026-03-18T12:55:03.442982735+08:00 ERROR zeroclaw::channels::lark: Lark: WS read error: IO error: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof
+Mar 18 12:55:03 nanopi-r2s zeroclaw[1304610]: 2026-03-18T12:55:03.444290601+08:00  WARN zeroclaw::channels: Channel feishu exited unexpectedly; restarting

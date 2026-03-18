@@ -32,11 +32,20 @@
     - `supervised`: Χρειάζεται την έγκρισή σας για σημαντικές ενέργειες (προεπιλογή).
     - `full`: Μπορεί να τρέχει εντολές ελεύθερα (προσοχή!).
 - `allowed_commands`: Λίστα με τις εντολές που επιτρέπεται να τρέχει η AI.
+- `command_context_rules`: Πιο λεπτοί allow/deny κανόνες ανά εντολή με περιορισμούς domain/path.
 - `unrestricted_commands`: Break-glass λευκή λίστα που παρακάμπτει όλα τα shell policy gates για τις εντολές που ταιριάζουν.
+- `shell_env_passthrough`: Επιπλέον ονόματα μεταβλητών περιβάλλοντος που επιτρέπεται να περάσουν σε shell subprocesses.
 - `forbidden_paths`: Φάκελοι που η AI **δεν** επιτρέπεται να αγγίξει (π.χ. `/etc`).
+- `allowed_roots`: Επιπλέον roots εκτός workspace που επιτρέπονται ρητά.
+- `max_actions_per_hour`: Προεπιλογή `100`.
+- `max_cost_per_day_cents`: Προεπιλογή `1000`.
+- `allow_unsafe_shell_structures`: Προεπιλογή `false`· επιτρέπει redirection/substitution/background operators μόνο με explicit opt-in.
+- `auto_approve`: Προεπιλογή `["file_read","memory_recall"]`.
+- `non_cli_excluded_tools`: Ενσωματωμένη λίστα εργαλείων που κρύβονται από non-CLI κανάλια.
 
 Σημειώσεις:
 
+- Για path policy στο `[autonomy]` και για allow rules στο `command_context_rules`, κερδίζει το πιο συγκεκριμένο matching prefix ανάμεσα σε allow και deny.
 - Το `allowed_commands` ανοίγει μόνο το allowlist ονομάτων/μονοπατιών εντολών. Τα υπόλοιπα shell guardrails παραμένουν ενεργά.
 - Το `unrestricted_commands` είναι το πραγματικό hard whitelist: παρακάμπτει `allowed_commands`, `command_context_rules`, path guards, shell-structure guards, read-only/autonomy prechecks και approval/risk gates. Κρατήστε το πολύ στενό.
 
