@@ -328,8 +328,26 @@ mod tests {
     async fn kill_shared_terminates_and_clears_child() {
         let proc = new_shared_process();
 
-        let child = Command::new("sleep")
-            .arg("30")
+        let mut child_command = if cfg!(windows) {
+            let mut command = Command::new(if which::which("pwsh").is_ok() {
+                "pwsh"
+            } else {
+                "powershell"
+            });
+            command
+                .arg("-NoLogo")
+                .arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-Command")
+                .arg("Start-Sleep -Seconds 30");
+            command
+        } else {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        };
+
+        let child = child_command
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()

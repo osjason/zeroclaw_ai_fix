@@ -1,5 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use super::{action_command_preflight_for, ActionCommandPreflight};
+use crate::config::ResourceLimitsConfig;
 use crate::runtime::RuntimeAdapter;
 use crate::security::SecurityPolicy;
 use crate::security::SyscallAnomalyDetector;
@@ -17,6 +18,7 @@ const MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Only functional variables are included — never API keys or secrets.
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+    "SYSTEMROOT", "WINDIR", "USERPROFILE", "TMP", "TEMP", "PATHEXT", "PSMODULEPATH",
 ];
 
 fn truncate_utf8_to_max_bytes(text: &mut String, max_bytes: usize) {
@@ -35,11 +37,20 @@ pub struct ShellTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
     syscall_detector: Option<Arc<SyscallAnomalyDetector>>,
+    resource_limits: ResourceLimitsConfig,
 }
 
 impl ShellTool {
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
-        Self::new_with_syscall_detector(security, runtime, None)
+        Self::new_with_limits(security, runtime, None, ResourceLimitsConfig::default())
+    }
+
+    pub fn new_with_resource_limits(
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        resource_limits: ResourceLimitsConfig,
+    ) -> Self {
+        Self::new_with_limits(security, runtime, None, resource_limits)
     }
 
     pub fn new_with_syscall_detector(
@@ -47,10 +58,25 @@ impl ShellTool {
         runtime: Arc<dyn RuntimeAdapter>,
         syscall_detector: Option<Arc<SyscallAnomalyDetector>>,
     ) -> Self {
+        Self::new_with_limits(
+            security,
+            runtime,
+            syscall_detector,
+            ResourceLimitsConfig::default(),
+        )
+    }
+
+    pub fn new_with_limits(
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        syscall_detector: Option<Arc<SyscallAnomalyDetector>>,
+        resource_limits: ResourceLimitsConfig,
+    ) -> Self {
         Self {
             security,
             runtime,
             syscall_detector,
+            resource_limits,
         }
     }
 }
@@ -162,6 +188,9 @@ impl Tool for ShellTool {
             return Ok(result);
         }
 
+        let (command, resource_limits_warning) =
+            crate::tools::resource_limits::prepare_shell_command(&command, &self.resource_limits)?;
+
         // Execute with timeout to prevent hanging commands.
         // Clear the environment to prevent leaking API keys and other secrets
         // (CWE-200), then re-add only safe, functional variables.
@@ -185,6 +214,12 @@ impl Tool for ShellTool {
                 cmd.env(&var, val);
             }
         }
+        #[cfg(windows)]
+        if std::env::var("HOME").is_err() {
+            if let Ok(user_profile) = std::env::var("USERPROFILE") {
+                cmd.env("HOME", user_profile);
+            }
+        }
 
         let result =
             tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
@@ -202,6 +237,12 @@ impl Tool for ShellTool {
                 if stderr.len() > MAX_OUTPUT_BYTES {
                     truncate_utf8_to_max_bytes(&mut stderr, MAX_OUTPUT_BYTES);
                     stderr.push_str("\n... [stderr truncated at 1MB]");
+                }
+                if let Some(warning) = resource_limits_warning {
+                    if !stderr.is_empty() {
+                        stderr.push('\n');
+                    }
+                    stderr.push_str(&warning);
                 }
 
                 if let Some(detector) = &self.syscall_detector {
@@ -265,6 +306,56 @@ mod tests {
 
     fn test_runtime() -> Arc<dyn RuntimeAdapter> {
         Arc::new(NativeRuntime::new())
+    }
+
+    #[cfg(windows)]
+    fn shell_echo_command(text: &str) -> String {
+        format!("echo {text}")
+    }
+
+    #[cfg(not(windows))]
+    fn shell_echo_command(text: &str) -> String {
+        format!("echo {text}")
+    }
+
+    #[cfg(windows)]
+    fn shell_env_command() -> &'static str {
+        "Get-ChildItem Env:"
+    }
+
+    #[cfg(not(windows))]
+    fn shell_env_command() -> &'static str {
+        "env"
+    }
+
+    #[cfg(windows)]
+    fn shell_touch_command(path: &str) -> String {
+        format!("mkdir {path}")
+    }
+
+    #[cfg(not(windows))]
+    fn shell_touch_command(path: &str) -> String {
+        format!("touch {path}")
+    }
+
+    #[cfg(windows)]
+    fn shell_stderr_command(text: &str) -> String {
+        format!("[Console]::Error.WriteLine('{text}')")
+    }
+
+    #[cfg(not(windows))]
+    fn shell_stderr_command(text: &str) -> String {
+        format!("echo {text} >&2")
+    }
+
+    #[cfg(windows)]
+    fn shell_missing_path_command() -> &'static str {
+        "ls .\\nonexistent_dir_xyz"
+    }
+
+    #[cfg(not(windows))]
+    fn shell_missing_path_command() -> &'static str {
+        "ls /nonexistent_dir_xyz"
     }
 
     fn test_syscall_detector(tmp: &TempDir) -> Arc<SyscallAnomalyDetector> {
@@ -343,7 +434,7 @@ mod tests {
     async fn shell_executes_allowed_command() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let result = tool
-            .execute(json!({"command": "echo hello"}))
+            .execute(json!({"command": shell_echo_command("hello")}))
             .await
             .expect("echo command execution should succeed");
         assert!(result.success);
@@ -355,7 +446,7 @@ mod tests {
     async fn shell_executes_command_from_cmd_alias() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let result = tool
-            .execute(json!({"cmd": "echo alias"}))
+            .execute(json!({"cmd": shell_echo_command("alias")}))
             .await
             .expect("cmd alias execution should succeed");
         assert!(result.success);
@@ -411,7 +502,7 @@ mod tests {
     async fn shell_captures_exit_code() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let result = tool
-            .execute(json!({"command": "ls /nonexistent_dir_xyz"}))
+            .execute(json!({"command": shell_missing_path_command()}))
             .await
             .expect("command with nonexistent path should return a result");
         assert!(!result.success);
@@ -529,6 +620,9 @@ mod tests {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: std::env::temp_dir(),
+            #[cfg(windows)]
+            allowed_commands: vec!["Get-ChildItem".into(), "echo".into()],
+            #[cfg(not(windows))]
             allowed_commands: vec!["env".into(), "echo".into()],
             ..SecurityPolicy::default()
         })
@@ -538,6 +632,9 @@ mod tests {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: std::env::temp_dir(),
+            #[cfg(windows)]
+            allowed_commands: vec!["Get-ChildItem".into()],
+            #[cfg(not(windows))]
             allowed_commands: vec!["env".into()],
             shell_env_passthrough: vars.iter().map(|v| (*v).to_string()).collect(),
             ..SecurityPolicy::default()
@@ -575,7 +672,7 @@ mod tests {
 
         let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
         let result = tool
-            .execute(json!({"command": "env"}))
+            .execute(json!({"command": shell_env_command()}))
             .await
             .expect("env command execution should succeed");
         assert!(result.success);
@@ -594,14 +691,21 @@ mod tests {
         let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
 
         let result = tool
-            .execute(json!({"command": "env"}))
+            .execute(json!({"command": shell_env_command()}))
             .await
             .expect("env command should succeed");
         assert!(result.success);
+        #[cfg(windows)]
+        {
+            assert!(result.output.contains("HOME"));
+            assert!(result.output.contains("PATH"));
+        }
+        #[cfg(not(windows))]
         assert!(
             result.output.contains("HOME="),
             "HOME should be available in shell environment"
         );
+        #[cfg(not(windows))]
         assert!(
             result.output.contains("PATH="),
             "PATH should be available in shell environment"
@@ -632,10 +736,15 @@ mod tests {
         );
 
         let result = tool
-            .execute(json!({"command": "env"}))
+            .execute(json!({"command": shell_env_command()}))
             .await
             .expect("env command execution should succeed");
         assert!(result.success);
+        #[cfg(windows)]
+        assert!(result.output.contains("ZEROCLAW_TEST_PASSTHROUGH"));
+        #[cfg(windows)]
+        assert!(result.output.contains("db://unit-test"));
+        #[cfg(not(windows))]
         assert!(result
             .output
             .contains("ZEROCLAW_TEST_PASSTHROUGH=db://unit-test"));
@@ -661,16 +770,24 @@ mod tests {
 
     #[tokio::test]
     async fn shell_requires_approval_for_medium_risk_command() {
+        let approval_path = "zeroclaw_shell_approval_test_dir";
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
+            #[cfg(windows)]
+            allowed_commands: vec!["mkdir".into()],
+            #[cfg(not(windows))]
             allowed_commands: vec!["touch".into()],
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
 
         let tool = ShellTool::new(security.clone(), test_runtime());
+        #[cfg(windows)]
+        let _ = tokio::fs::remove_dir_all(std::env::temp_dir().join(approval_path)).await;
+        #[cfg(not(windows))]
+        let _ = tokio::fs::remove_file(std::env::temp_dir().join(approval_path)).await;
         let denied = tool
-            .execute(json!({"command": "touch zeroclaw_shell_approval_test"}))
+            .execute(json!({"command": shell_touch_command(approval_path)}))
             .await
             .expect("unapproved command should return a result");
         assert!(!denied.success);
@@ -682,15 +799,17 @@ mod tests {
 
         let allowed = tool
             .execute(json!({
-                "command": "touch zeroclaw_shell_approval_test",
+                "command": shell_touch_command(approval_path),
                 "approved": true
             }))
             .await
             .expect("approved command execution should succeed");
         assert!(allowed.success);
 
-        let _ =
-            tokio::fs::remove_file(std::env::temp_dir().join("zeroclaw_shell_approval_test")).await;
+        #[cfg(windows)]
+        let _ = tokio::fs::remove_dir_all(std::env::temp_dir().join(approval_path)).await;
+        #[cfg(not(windows))]
+        let _ = tokio::fs::remove_file(std::env::temp_dir().join(approval_path)).await;
     }
 
     // ── §5.2 Shell timeout enforcement tests ─────────────────
@@ -773,7 +892,7 @@ mod tests {
     async fn shell_captures_stderr_output() {
         let tool = ShellTool::new(test_security(AutonomyLevel::Full), test_runtime());
         let result = tool
-            .execute(json!({"command": "echo error_msg >&2"}))
+            .execute(json!({"command": shell_stderr_command("error_msg")}))
             .await
             .unwrap();
         assert!(result.error.as_deref().unwrap_or("").contains("error_msg"));

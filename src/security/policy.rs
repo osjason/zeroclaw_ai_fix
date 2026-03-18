@@ -686,7 +686,7 @@ fn shell_structure_violation(command: &str) -> Option<CommandPolicyViolation> {
         CommandPolicyViolation::new(
             block.policy_id,
             format!(
-                "{}. Set `[autonomy].allow_unsafe_shell_structures = true` to opt in.",
+                "Command not allowed by security policy: {}. Set `[autonomy].allow_unsafe_shell_structures = true` to opt in.",
                 block.reason
             ),
             command,
@@ -1228,7 +1228,10 @@ impl Default for SecurityPolicy {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .or_else(|| directories::UserDirs::new().map(|dirs| dirs.home_dir().to_path_buf()))
 }
 
 fn expand_user_path(path: &str) -> PathBuf {
@@ -1245,6 +1248,86 @@ fn expand_user_path(path: &str) -> PathBuf {
     }
 
     PathBuf::from(path)
+}
+
+fn is_policy_absolute_path(raw_path: &str, expanded_path: &Path) -> bool {
+    expanded_path.is_absolute()
+        || raw_path.starts_with('/')
+        || raw_path.starts_with('\\')
+        || raw_path
+            .as_bytes()
+            .get(1)
+            .is_some_and(|separator| *separator == b':')
+            && raw_path
+                .as_bytes()
+                .get(2)
+                .is_some_and(|separator| matches!(*separator, b'\\' | b'/'))
+}
+
+fn split_shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+
+    let push_word = |words: &mut Vec<String>, current: &mut String| {
+        if !current.is_empty() {
+            words.push(current.clone());
+            current.clear();
+        }
+    };
+
+    for ch in command.chars() {
+        match quote {
+            QuoteState::Single => {
+                current.push(ch);
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::Double => {
+                current.push(ch);
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::None => {
+                if escaped {
+                    current.push(ch);
+                    escaped = false;
+                    continue;
+                }
+
+                match ch {
+                    '\\' => {
+                        current.push(ch);
+                        escaped = true;
+                    }
+                    '\'' => {
+                        current.push(ch);
+                        quote = QuoteState::Single;
+                    }
+                    '"' => {
+                        current.push(ch);
+                        quote = QuoteState::Double;
+                    }
+                    c if c.is_whitespace() => push_word(&mut words, &mut current),
+                    _ => current.push(ch),
+                }
+            }
+        }
+    }
+
+    push_word(&mut words, &mut current);
+    words
 }
 
 // ── Shell Command Parsing Utilities ───────────────────────────────────────
@@ -1805,10 +1888,10 @@ impl SecurityPolicy {
     }
 
     fn normalize_segment_args(segment: &str) -> Vec<String> {
-        skip_env_assignments(segment)
-            .split_whitespace()
+        split_shell_words(skip_env_assignments(segment))
+            .into_iter()
             .skip(1)
-            .map(|token| strip_wrapping_quotes(token).trim().to_string())
+            .map(|token| strip_wrapping_quotes(&token).trim().to_string())
             .filter(|token| !token.is_empty())
             .collect()
     }
@@ -1826,8 +1909,8 @@ impl SecurityPolicy {
 
     fn segment_command_parts(segment: &str) -> Option<(String, String)> {
         let cmd_part = skip_env_assignments(segment);
-        let mut words = cmd_part.split_whitespace();
-        let executable = strip_wrapping_quotes(words.next()?).trim();
+        let words = split_shell_words(cmd_part);
+        let executable = strip_wrapping_quotes(words.first()?).trim();
         if executable.is_empty() {
             return None;
         }
@@ -2274,7 +2357,7 @@ impl SecurityPolicy {
         };
 
         format!(
-            "Command blocked by allowed_commands: no entry in autonomy.allowed_commands matched executable={executable}; segment_command={segment_command}; context_override={context_override}; full_command={command}"
+            "Command not allowed by security policy: Command blocked by allowed_commands: no entry in autonomy.allowed_commands matched executable={executable}; segment_command={segment_command}; context_override={context_override}; full_command={command}"
         )
     }
 
@@ -2635,9 +2718,7 @@ impl SecurityPolicy {
     /// blocked before the allowlist logic runs.
     ///
     fn is_command_allowed_under_policy(&self, command: &str) -> bool {
-        self.assess_command_execution(command, false)
-            .map(CommandPolicyAssessment::allows_execution)
-            .unwrap_or(false)
+        self.build_command_policy_evaluation(command).is_ok()
     }
 
     fn command_passes_global_allowlist_phase(
@@ -2812,8 +2893,8 @@ impl SecurityPolicy {
 
         for segment in split_unquoted_segments(command) {
             let cmd_part = skip_env_assignments(&segment);
-            let mut words = cmd_part.split_whitespace();
-            let Some(executable) = words.next() else {
+            let words = split_shell_words(cmd_part);
+            let Some(executable) = words.first() else {
                 continue;
             };
 
@@ -2824,7 +2905,7 @@ impl SecurityPolicy {
                 }
             }
 
-            for token in words {
+            for token in words.iter().skip(1) {
                 let candidate = strip_wrapping_quotes(token).trim();
                 if candidate.is_empty() || candidate.contains("://") {
                     continue;
@@ -2868,6 +2949,10 @@ impl SecurityPolicy {
 
     /// Check if a file path is allowed (no path traversal, within workspace)
     pub fn is_path_allowed(&self, path: &str) -> bool {
+        if path == "/" || path == "\\" {
+            return false;
+        }
+
         // Block null bytes (can truncate paths in C-backed syscalls)
         if path.contains('\0') {
             return false;
@@ -2897,7 +2982,7 @@ impl SecurityPolicy {
         let expanded_path = expand_user_path(path);
 
         // Block absolute paths when workspace_only is set
-        if self.workspace_only && expanded_path.is_absolute() {
+        if self.workspace_only && is_policy_absolute_path(path, &expanded_path) {
             return false;
         }
 
@@ -3865,8 +3950,8 @@ mod tests {
         let workspace = PathBuf::from("/tmp/test-workspace");
         let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
 
-        let expected_home_root = if let Some(home) = std::env::var_os("HOME") {
-            PathBuf::from(home).join("Desktop")
+        let expected_home_root = if let Some(home) = home_dir() {
+            home.join("Desktop")
         } else {
             PathBuf::from("~/Desktop")
         };

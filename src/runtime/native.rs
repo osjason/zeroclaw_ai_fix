@@ -10,6 +10,24 @@ impl NativeRuntime {
     }
 }
 
+#[cfg(windows)]
+fn build_windows_shell_command(command: &str, workspace_dir: &Path) -> tokio::process::Command {
+    let shell = if which::which("pwsh").is_ok() {
+        "pwsh"
+    } else {
+        "powershell"
+    };
+    let mut process = tokio::process::Command::new(shell);
+    process
+        .arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(command)
+        .current_dir(workspace_dir);
+    process
+}
+
 impl RuntimeAdapter for NativeRuntime {
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -43,9 +61,17 @@ impl RuntimeAdapter for NativeRuntime {
         command: &str,
         workspace_dir: &Path,
     ) -> anyhow::Result<tokio::process::Command> {
-        let mut process = tokio::process::Command::new("sh");
-        process.arg("-c").arg(command).current_dir(workspace_dir);
-        Ok(process)
+        #[cfg(windows)]
+        {
+            return Ok(build_windows_shell_command(command, workspace_dir));
+        }
+
+        #[cfg(not(windows))]
+        {
+            let mut process = tokio::process::Command::new("sh");
+            process.arg("-c").arg(command).current_dir(workspace_dir);
+            Ok(process)
+        }
     }
 }
 
@@ -92,5 +118,18 @@ mod tests {
             .unwrap();
         let debug = format!("{command:?}");
         assert!(debug.contains("echo hello"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_runtime_uses_powershell() {
+        let cwd = std::env::temp_dir();
+        let command = NativeRuntime::new()
+            .build_shell_command("Write-Output hello", &cwd)
+            .unwrap();
+        let debug = format!("{command:?}");
+        let lowered = debug.to_ascii_lowercase();
+        assert!(lowered.contains("pwsh") || lowered.contains("powershell"));
+        assert!(debug.contains("-Command"));
     }
 }

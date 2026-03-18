@@ -1,6 +1,7 @@
 use super::shell::collect_allowed_shell_env_vars;
 use super::traits::{Tool, ToolResult};
 use super::{action_command_preflight_for, ActionCommandPreflight};
+use crate::config::ResourceLimitsConfig;
 use crate::runtime::RuntimeAdapter;
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
@@ -17,7 +18,7 @@ use tokio::io::AsyncReadExt;
 const MAX_OUTPUT_BYTES: usize = 524_288;
 
 /// Maximum concurrent background processes.
-const MAX_PROCESSES: usize = 8;
+const DEFAULT_MAX_PROCESSES: usize = 8;
 
 #[derive(Debug, Default, Clone)]
 struct OutputBuffer {
@@ -47,11 +48,21 @@ pub struct ProcessTool {
     syscall_detector: Option<Arc<SyscallAnomalyDetector>>,
     processes: Arc<RwLock<HashMap<usize, ProcessEntry>>>,
     next_id: Mutex<usize>,
+    resource_limits: ResourceLimitsConfig,
+    max_processes: usize,
 }
 
 impl ProcessTool {
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
-        Self::new_with_syscall_detector(security, runtime, None)
+        Self::new_with_limits(security, runtime, None, ResourceLimitsConfig::default())
+    }
+
+    pub fn new_with_resource_limits(
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        resource_limits: ResourceLimitsConfig,
+    ) -> Self {
+        Self::new_with_limits(security, runtime, None, resource_limits)
     }
 
     pub fn new_with_syscall_detector(
@@ -59,12 +70,31 @@ impl ProcessTool {
         runtime: Arc<dyn RuntimeAdapter>,
         syscall_detector: Option<Arc<SyscallAnomalyDetector>>,
     ) -> Self {
+        Self::new_with_limits(
+            security,
+            runtime,
+            syscall_detector,
+            ResourceLimitsConfig::default(),
+        )
+    }
+
+    fn new_with_limits(
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        syscall_detector: Option<Arc<SyscallAnomalyDetector>>,
+        resource_limits: ResourceLimitsConfig,
+    ) -> Self {
+        let max_processes = usize::try_from(resource_limits.max_subprocesses)
+            .unwrap_or(DEFAULT_MAX_PROCESSES)
+            .max(1);
         Self {
             security,
             runtime,
             syscall_detector,
             processes: Arc::new(RwLock::new(HashMap::new())),
             next_id: Mutex::new(0),
+            resource_limits,
+            max_processes,
         }
     }
 
@@ -94,12 +124,13 @@ impl ProcessTool {
                         .unwrap_or(false)
                 })
                 .count();
-            if running >= MAX_PROCESSES {
+            if running >= self.max_processes {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
                     error: Some(format!(
-                        "Maximum concurrent processes ({MAX_PROCESSES}) reached"
+                        "Maximum concurrent processes ({}) reached",
+                        self.max_processes
                     )),
                 });
             }
@@ -118,10 +149,13 @@ impl ProcessTool {
             return Ok(blocked_result);
         }
 
+        let (command, resource_limits_warning) =
+            crate::tools::resource_limits::prepare_shell_command(command, &self.resource_limits)?;
+
         // Build command via runtime adapter.
         let mut cmd = match self
             .runtime
-            .build_shell_command(command, &self.security.workspace_dir)
+            .build_shell_command(&command, &self.security.workspace_dir)
         {
             Ok(cmd) => cmd,
             Err(e) => {
@@ -141,6 +175,12 @@ impl ProcessTool {
         for var in collect_allowed_shell_env_vars(&self.security) {
             if let Ok(val) = std::env::var(&var) {
                 cmd.env(&var, val);
+            }
+        }
+        #[cfg(windows)]
+        if std::env::var("HOME").is_err() {
+            if let Ok(user_profile) = std::env::var("USERPROFILE") {
+                cmd.env("HOME", user_profile);
             }
         }
 
@@ -177,7 +217,7 @@ impl ProcessTool {
 
         let entry = ProcessEntry {
             id,
-            command: command.to_string(),
+            command: command.clone(),
             pid,
             started_at: Instant::now(),
             child: Mutex::new(child),
@@ -193,7 +233,8 @@ impl ProcessTool {
             output: json!({
                 "id": id,
                 "pid": pid,
-                "message": format!("Process started: {command}")
+                "message": format!("Process started: {command}"),
+                "resource_limits_warning": resource_limits_warning
             })
             .to_string(),
             error: None,
@@ -243,7 +284,10 @@ impl ProcessTool {
         })
     }
 
-    fn handle_output(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn handle_output(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        const SNAPSHOT_RETRIES: usize = 20;
+        const SNAPSHOT_RETRY_DELAY_MS: u64 = 50;
+
         if let Err(e) = self
             .security
             .enforce_tool_operation(ToolOperation::Read, "process")
@@ -256,25 +300,46 @@ impl ProcessTool {
         }
 
         let id = parse_id(args, "output")?;
+        let mut snapshots = None;
+        for _ in 0..=SNAPSHOT_RETRIES {
+            let current = {
+                let processes = self.processes.read().unwrap();
+                let Some(entry) = processes.get(&id) else {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("No process with id {id}")),
+                    });
+                };
+                (
+                    snapshot_output_buffer(&entry.stdout_buf),
+                    snapshot_output_buffer(&entry.stderr_buf),
+                )
+            };
 
-        let processes = self.processes.read().unwrap();
-        let entry = match processes.get(&id) {
-            Some(e) => e,
-            None => {
+            if !current.0.data.is_empty() || !current.1.data.is_empty() {
+                snapshots = Some(current);
+                break;
+            }
+
+            snapshots = Some(current);
+            tokio::time::sleep(std::time::Duration::from_millis(SNAPSHOT_RETRY_DELAY_MS)).await;
+        }
+
+        let (stdout_snapshot, stderr_snapshot) = snapshots.expect("snapshot loop must run");
+        let stdout = stdout_snapshot.data;
+        let stderr = stderr_snapshot.data;
+
+        if let Some(detector) = &self.syscall_detector {
+            let processes = self.processes.read().unwrap();
+            let Some(entry) = processes.get(&id) else {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
                     error: Some(format!("No process with id {id}")),
                 });
-            }
-        };
+            };
 
-        let stdout_snapshot = snapshot_output_buffer(&entry.stdout_buf);
-        let stderr_snapshot = snapshot_output_buffer(&entry.stderr_buf);
-        let stdout = stdout_snapshot.data;
-        let stderr = stderr_snapshot.data;
-
-        if let Some(detector) = &self.syscall_detector {
             let mut offsets = entry.analyzed_offsets.lock().unwrap();
             let stdout_delta = slice_unseen_output(
                 &stdout,
@@ -322,43 +387,35 @@ impl ProcessTool {
 
         let id = parse_id(args, "kill")?;
 
-        let pid = {
+        let (pid, kill_result) = {
             let processes = self.processes.read().unwrap();
-            match processes.get(&id) {
-                Some(entry) => entry.pid,
-                None => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("No process with id {id}")),
-                    });
-                }
-            }
-        };
-
-        // Send SIGTERM via kill command.
-        let kill_result = std::process::Command::new("kill")
-            .arg(pid.to_string())
-            .output();
-
-        match kill_result {
-            Ok(output) if output.status.success() => Ok(ToolResult {
-                success: true,
-                output: format!("Sent SIGTERM to process {id} (pid {pid})"),
-                error: None,
-            }),
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                Ok(ToolResult {
+            let Some(entry) = processes.get(&id) else {
+                return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!("Failed to kill process {id} (pid {pid}): {stderr}")),
-                })
-            }
+                    error: Some(format!("No process with id {id}")),
+                });
+            };
+
+            let pid = entry.pid;
+            let result = entry
+                .child
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Failed to lock process {id}"))?
+                .start_kill();
+            (pid, result)
+        };
+
+        match kill_result {
+            Ok(()) => Ok(ToolResult {
+                success: true,
+                output: format!("Sent termination signal to process {id} (pid {pid})"),
+                error: None,
+            }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Failed to execute kill command: {e}")),
+                error: Some(format!("Failed to kill process {id} (pid {pid}): {e}")),
             }),
         }
     }
@@ -481,7 +538,7 @@ impl Tool for ProcessTool {
         match action {
             "spawn" => self.handle_spawn(&args),
             "list" => self.handle_list(),
-            "output" => self.handle_output(&args),
+            "output" => self.handle_output(&args).await,
             "kill" => self.handle_kill(&args),
             other => Ok(ToolResult {
                 success: false,
@@ -521,12 +578,37 @@ mod tests {
         let mut policy = SecurityPolicy::default();
         policy.autonomy = AutonomyLevel::Full;
         policy.workspace_dir = std::env::temp_dir();
+        #[cfg(windows)]
+        policy.allowed_commands.push("Write-Output".into());
+        #[cfg(windows)]
+        policy.allowed_commands.push("Start-Sleep".into());
+        #[cfg(not(windows))]
         policy.allowed_commands.push("sleep".into());
         Arc::new(policy)
     }
 
     fn test_runtime() -> Arc<dyn RuntimeAdapter> {
         Arc::new(NativeRuntime::new())
+    }
+
+    #[cfg(windows)]
+    fn process_echo_command(text: &str) -> String {
+        format!("Write-Output {text}")
+    }
+
+    #[cfg(not(windows))]
+    fn process_echo_command(text: &str) -> String {
+        format!("echo {text}")
+    }
+
+    #[cfg(windows)]
+    fn process_sleep_command(seconds: u64) -> String {
+        format!("Start-Sleep -Seconds {seconds}")
+    }
+
+    #[cfg(not(windows))]
+    fn process_sleep_command(seconds: u64) -> String {
+        format!("sleep {seconds}")
     }
 
     fn test_syscall_detector(tmp: &TempDir) -> Arc<SyscallAnomalyDetector> {
@@ -572,7 +654,20 @@ mod tests {
     #[test]
     fn constants_are_correct() {
         assert_eq!(MAX_OUTPUT_BYTES, 524_288);
-        assert_eq!(MAX_PROCESSES, 8);
+        assert_eq!(DEFAULT_MAX_PROCESSES, 8);
+    }
+
+    #[test]
+    fn process_tool_uses_resource_limit_for_max_processes() {
+        let tool = ProcessTool::new_with_resource_limits(
+            test_security(),
+            test_runtime(),
+            ResourceLimitsConfig {
+                max_subprocesses: 3,
+                ..ResourceLimitsConfig::default()
+            },
+        );
+        assert_eq!(tool.max_processes, 3);
     }
 
     #[test]
@@ -611,7 +706,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "action": "spawn",
-                "command": "echo hello_process_test"
+                "command": process_echo_command("hello_process_test")
             }))
             .await
             .unwrap();
@@ -626,7 +721,7 @@ mod tests {
         let tool = make_tool();
         tool.execute(json!({
             "action": "spawn",
-            "command": "echo list_test"
+            "command": process_echo_command("list_test")
         }))
         .await
         .unwrap();
@@ -642,7 +737,7 @@ mod tests {
         let spawn_result = tool
             .execute(json!({
                 "action": "spawn",
-                "command": "echo output_capture_test"
+                "command": process_echo_command("output_capture_test")
             }))
             .await
             .unwrap();
@@ -670,7 +765,7 @@ mod tests {
         let spawn_result = tool
             .execute(json!({
                 "action": "spawn",
-                "command": "sleep 60"
+                "command": process_sleep_command(60)
             }))
             .await
             .unwrap();
@@ -830,7 +925,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "action": "spawn",
-                "command": "echo test"
+                "command": process_echo_command("test")
             }))
             .await
             .unwrap();
@@ -838,7 +933,7 @@ mod tests {
         let event = parse_security_policy_block_event(result.error.as_deref().unwrap())
             .expect("expected structured security policy block event");
         assert_eq!(event.policy_id, "autonomy.max_actions_per_hour");
-        assert_eq!(event.command_fragment, "echo test");
+        assert_eq!(event.command_fragment, process_echo_command("test"));
         assert!(event.reason.contains("Rate limit exceeded"));
     }
 
@@ -927,7 +1022,7 @@ mod tests {
         let spawn_result = tool
             .execute(json!({
                 "action": "spawn",
-                "command": "echo seccomp denied syscall=openat"
+                "command": process_echo_command("seccomp denied syscall=openat")
             }))
             .await
             .expect("spawn should return result");

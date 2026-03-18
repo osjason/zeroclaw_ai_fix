@@ -171,7 +171,10 @@ impl Tool for ContentSearchTool {
         }
 
         // --- Path security checks ---
-        if std::path::Path::new(search_path).is_absolute() {
+        if std::path::Path::new(search_path).is_absolute()
+            || search_path.starts_with('/')
+            || search_path.starts_with('\\')
+        {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),

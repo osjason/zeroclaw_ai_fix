@@ -185,6 +185,53 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     })
 }
 
+pub fn claim_due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
+    let lim = i64::try_from(config.scheduler.max_tasks.max(1))
+        .context("Scheduler max_tasks overflows i64")?;
+    with_connection(config, |conn| {
+        let tx = conn.unchecked_transaction()?;
+        let mut stmt = tx.prepare(
+            "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output
+             FROM cron_jobs
+             WHERE enabled = 1 AND next_run <= ?1 AND running_since IS NULL
+             ORDER BY next_run ASC
+             LIMIT ?2",
+        )?;
+
+        let rows = stmt.query_map(params![now.to_rfc3339(), lim], map_cron_job_row)?;
+
+        let mut claimed = Vec::new();
+        for row in rows {
+            let job = row?;
+            let changed = tx.execute(
+                "UPDATE cron_jobs
+                 SET running_since = ?1
+                 WHERE id = ?2 AND enabled = 1 AND next_run <= ?3 AND running_since IS NULL",
+                params![now.to_rfc3339(), job.id, now.to_rfc3339()],
+            )?;
+            if changed == 1 {
+                claimed.push(job);
+            }
+        }
+        drop(stmt);
+
+        tx.commit().context("Failed to commit cron due-job claim")?;
+        Ok(claimed)
+    })
+}
+
+pub fn clear_running_job_claims(config: &Config) -> Result<()> {
+    with_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs SET running_since = NULL WHERE running_since IS NOT NULL",
+            [],
+        )
+        .context("Failed to clear cron running claims")?;
+        Ok(())
+    })
+}
+
 pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
     let mut job = get_job(config, job_id)?;
     let mut schedule_changed = false;
@@ -266,7 +313,7 @@ pub fn record_last_run(
     with_connection(config, |conn| {
         conn.execute(
             "UPDATE cron_jobs
-             SET last_run = ?1, last_status = ?2, last_output = ?3
+             SET last_run = ?1, last_status = ?2, last_output = ?3, running_since = NULL
              WHERE id = ?4",
             params![finished_at.to_rfc3339(), status, bounded_output, job_id],
         )
@@ -289,7 +336,7 @@ pub fn reschedule_after_run(
     with_connection(config, |conn| {
         conn.execute(
             "UPDATE cron_jobs
-             SET next_run = ?1, last_run = ?2, last_status = ?3, last_output = ?4
+             SET next_run = ?1, last_run = ?2, last_status = ?3, last_output = ?4, running_since = NULL
              WHERE id = ?5",
             params![
                 next_run.to_rfc3339(),
@@ -538,6 +585,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             enabled          INTEGER NOT NULL DEFAULT 1,
             delivery         TEXT,
             delete_after_run INTEGER NOT NULL DEFAULT 0,
+            running_since    TEXT,
             created_at       TEXT NOT NULL,
             next_run         TEXT NOT NULL,
             last_run         TEXT,
@@ -571,6 +619,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     add_column_if_missing(&conn, "enabled", "INTEGER NOT NULL DEFAULT 1")?;
     add_column_if_missing(&conn, "delivery", "TEXT")?;
     add_column_if_missing(&conn, "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(&conn, "running_since", "TEXT")?;
 
     f(&conn)
 }
@@ -683,6 +732,28 @@ mod tests {
         let far_future = Utc::now() + ChronoDuration::days(365);
         let due = due_jobs(&config, far_future).unwrap();
         assert_eq!(due.len(), 2);
+    }
+
+    #[test]
+    fn claim_due_jobs_marks_jobs_inflight_until_claims_are_cleared() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_job(&config, "* * * * *", "echo claimed").unwrap();
+        let far_future = Utc::now() + ChronoDuration::days(365);
+
+        let claimed = claim_due_jobs(&config, far_future).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, job.id);
+
+        let claimed_again = claim_due_jobs(&config, far_future).unwrap();
+        assert!(claimed_again.is_empty());
+
+        clear_running_job_claims(&config).unwrap();
+
+        let reclaimed = claim_due_jobs(&config, far_future).unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].id, job.id);
     }
 
     #[test]

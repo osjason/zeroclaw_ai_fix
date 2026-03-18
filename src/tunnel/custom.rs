@@ -35,6 +35,30 @@ impl CustomTunnel {
     }
 }
 
+#[cfg(windows)]
+fn build_shell_process(command: &str) -> Command {
+    let shell = if which::which("pwsh").is_ok() {
+        "pwsh"
+    } else {
+        "powershell"
+    };
+    let mut child = Command::new(shell);
+    child
+        .arg("-NoLogo")
+        .arg("-NoProfile")
+        .arg("-NonInteractive")
+        .arg("-Command")
+        .arg(command);
+    child
+}
+
+#[cfg(not(windows))]
+fn build_shell_process(command: &str) -> Command {
+    let mut child = Command::new("sh");
+    child.arg("-c").arg(command);
+    child
+}
+
 #[async_trait::async_trait]
 impl Tunnel for CustomTunnel {
     fn name(&self) -> &str {
@@ -46,14 +70,11 @@ impl Tunnel for CustomTunnel {
             .start_command
             .replace("{port}", &local_port.to_string())
             .replace("{host}", local_host);
-
-        let parts: Vec<&str> = cmd.split_whitespace().collect();
-        if parts.is_empty() {
+        if cmd.trim().is_empty() {
             bail!("Custom tunnel start_command is empty");
         }
 
-        let mut child = Command::new(parts[0])
-            .args(&parts[1..])
+        let mut child = build_shell_process(&cmd)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
