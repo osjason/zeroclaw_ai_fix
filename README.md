@@ -37,6 +37,7 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 
 <p align="center">
   <strong>Quick Routes:</strong>
+  <a href="docs/config-reference.md">Config</a> ·
   <a href="docs/reference/README.md">Reference</a> ·
   <a href="docs/operations/README.md">Operations</a> ·
   <a href="docs/troubleshooting.md">Troubleshoot</a> ·
@@ -199,6 +200,11 @@ Local machine quick benchmark (macOS arm64, Feb 2026) normalized for 0.8GHz edge
 ---
 
 For full documentation, see [`docs/README.md`](docs/README.md) | [`docs/SUMMARY.md`](docs/SUMMARY.md)
+
+Need configuration docs quickly?
+
+- English runtime-contract reference: [`docs/config-reference.md`](docs/config-reference.md)
+- Simplified Chinese detailed guide: [`docs/i18n/zh-CN/config-toml-guide.md`](docs/i18n/zh-CN/config-toml-guide.md)
 
 ## ⚠️ Official Repository & Impersonation Warning
 

@@ -2,8 +2,8 @@
 
 该页面用于在 `docs/i18n/zh-CN/` 下快速定位所有 top-level 文档。
 
-最后更新：**2026-02-24**。
-当前状态：**top-level parity 完成（40/40）**。
+最后更新：**2026-03-19**。
+当前状态：**top-level parity 完成（40/40），并新增中文扩展指南 1 篇**。
 
 ## 规范来源
 
@@ -15,6 +15,7 @@
 
 - [commands-reference.md](commands-reference.md)
 - [config-reference.md](config-reference.md)
+- [config-toml-guide.md](config-toml-guide.md)
 - [providers-reference.md](providers-reference.md)
 - [channels-reference.md](channels-reference.md)
 - [operations-runbook.md](operations-runbook.md)

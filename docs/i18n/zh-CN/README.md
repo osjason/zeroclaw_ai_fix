@@ -2,7 +2,7 @@
 
 这是中文文档在 `docs/i18n/<locale>/` 结构下的标准入口。
 
-最后对齐：**2026-02-24**。
+最后对齐：**2026-03-19**。
 
 > 说明：命令、配置键、API 路径保持英文；实现细节以英文文档为准。
 
@@ -19,6 +19,7 @@
 - Provider 参考：[providers-reference.md](providers-reference.md)
 - Channel 参考：[channels-reference.md](channels-reference.md)
 - 配置参考：[config-reference.md](config-reference.md)
+- `config.toml` 全量详解：[config-toml-guide.md](config-toml-guide.md)
 - 运维 Runbook：[operations-runbook.md](operations-runbook.md)
 - 故障排查：[troubleshooting.md](troubleshooting.md)
 
