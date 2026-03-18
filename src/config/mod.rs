@@ -99,7 +99,7 @@ mod tests {
             draft_update_interval_ms: crate::config::schema::default_lark_draft_update_interval_ms(
             ),
             max_draft_edits: crate::config::schema::default_lark_max_draft_edits(),
-            progress_mode: ProgressMode::default(),
+            progress_mode: ProgressMode::Off,
         };
 
         let nextcloud_talk = NextcloudTalkConfig {

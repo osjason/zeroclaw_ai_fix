@@ -13,6 +13,7 @@ Thứ tự tìm config khi khởi động:
 ZeroClaw ghi log đường dẫn config đã giải quyết khi khởi động ở mức `INFO`:
 
 - `Config loaded` với các trường: `path`, `workspace`, `source`, `initialized`
+- `source` có thể là `ZEROCLAW_CONFIG_DIR`, `ZEROCLAW_WORKSPACE`, `active_workspace.toml`, hoặc `default_config_dir`
 
 Lệnh CLI để kiểm tra và sửa đổi cấu hình:
 

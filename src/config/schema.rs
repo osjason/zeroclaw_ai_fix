@@ -39,6 +39,7 @@ fn canonical_provider_for_model_defaults(provider_name: &str) -> String {
         "kimi_coding" | "kimi_for_coding" => "kimi-code".to_string(),
         "nvidia-nim" | "build.nvidia.com" => "nvidia".to_string(),
         "aws-bedrock" => "bedrock".to_string(),
+        "step" | "step-ai" => "stepfun".to_string(),
         "llama.cpp" => "llamacpp".to_string(),
         _ => provider_name.to_string(),
     }
@@ -4875,6 +4876,10 @@ pub enum ProgressMode {
     Off,
 }
 
+fn default_feishu_progress_mode() -> ProgressMode {
+    ProgressMode::Off
+}
+
 fn default_draft_update_interval_ms() -> u64 {
     1000
 }
@@ -5843,7 +5848,8 @@ impl LarkChannelPlatform {
     #[must_use]
     pub fn default_progress_mode(self) -> ProgressMode {
         match self {
-            Self::Lark | Self::Feishu => ProgressMode::Compact,
+            Self::Lark => ProgressMode::Compact,
+            Self::Feishu => ProgressMode::Off,
         }
     }
 
@@ -6226,7 +6232,7 @@ pub struct FeishuConfig {
     #[serde(default = "default_lark_max_draft_edits")]
     pub max_draft_edits: u32,
     /// Draft progress verbosity for streaming updates.
-    #[serde(default)]
+    #[serde(default = "default_feishu_progress_mode")]
     pub progress_mode: ProgressMode,
 }
 
@@ -7158,8 +7164,10 @@ struct ActiveWorkspaceState {
 }
 
 fn default_config_dir() -> Result<PathBuf> {
-    let home = UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .or_else(|| UserDirs::new().map(|u| u.home_dir().to_path_buf()))
         .context("Could not find home directory")?;
     Ok(home.join(".zeroclaw"))
 }
@@ -7405,7 +7413,7 @@ impl ConfigResolutionSource {
             Self::EnvConfigDir => "ZEROCLAW_CONFIG_DIR",
             Self::EnvWorkspace => "ZEROCLAW_WORKSPACE",
             Self::ActiveWorkspaceMarker => "active_workspace.toml",
-            Self::DefaultConfigDir => "default",
+            Self::DefaultConfigDir => "default_config_dir",
         }
     }
 }
@@ -8144,6 +8152,19 @@ fn apply_feishu_legacy_compat(
 }
 
 impl Config {
+    fn sync_legacy_hardware_datasheets_alias(&mut self) {
+        if self.hardware.workspace_datasheets
+            && self
+                .peripherals
+                .datasheet_dir
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(|value| value.is_empty())
+        {
+            self.peripherals.datasheet_dir = Some("datasheets".to_string());
+        }
+    }
+
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
@@ -8282,6 +8303,7 @@ impl Config {
 
             decrypt_channel_secrets(&store, &mut config.channels_config)?;
 
+            config.sync_legacy_hardware_datasheets_alias();
             config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
@@ -8305,6 +8327,7 @@ impl Config {
                 let _ = fs::set_permissions(&config_path, Permissions::from_mode(0o600)).await;
             }
 
+            config.sync_legacy_hardware_datasheets_alias();
             config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
@@ -9815,6 +9838,7 @@ impl Config {
     pub async fn save(&self) -> Result<()> {
         // Encrypt secrets before serialization
         let mut config_to_save = self.clone();
+        config_to_save.sync_legacy_hardware_datasheets_alias();
         let zeroclaw_dir = self
             .config_path
             .parent()
@@ -13246,6 +13270,26 @@ provider_api = "not-a-real-mode"
     }
 
     #[test]
+    async fn config_resolution_source_labels_are_stable() {
+        assert_eq!(
+            ConfigResolutionSource::EnvConfigDir.as_str(),
+            "ZEROCLAW_CONFIG_DIR"
+        );
+        assert_eq!(
+            ConfigResolutionSource::EnvWorkspace.as_str(),
+            "ZEROCLAW_WORKSPACE"
+        );
+        assert_eq!(
+            ConfigResolutionSource::ActiveWorkspaceMarker.as_str(),
+            "active_workspace.toml"
+        );
+        assert_eq!(
+            ConfigResolutionSource::DefaultConfigDir.as_str(),
+            "default_config_dir"
+        );
+    }
+
+    #[test]
     async fn resolve_runtime_config_dirs_uses_env_workspace_first() {
         let _env_guard = env_override_lock().await;
         let default_config_dir = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
@@ -14290,7 +14334,7 @@ default_model = "legacy-model"
             port: None,
             draft_update_interval_ms: default_lark_draft_update_interval_ms(),
             max_draft_edits: default_lark_max_draft_edits(),
-            progress_mode: ProgressMode::default(),
+            progress_mode: default_feishu_progress_mode(),
         }
     }
 
@@ -14419,7 +14463,7 @@ default_model = "legacy-model"
         );
         assert_eq!(
             LarkChannelPlatform::Feishu.default_progress_mode(),
-            ProgressMode::Compact
+            ProgressMode::Off
         );
         let identity = LarkRuntimeChannelIdentity::from_runtime_channel_name("lark")
             .expect("lark runtime identity should resolve");
@@ -14427,7 +14471,7 @@ default_model = "legacy-model"
         assert_eq!(identity.requested_channel_name(), "lark");
         assert_eq!(identity.fallback_channel_name(), "feishu");
         assert_eq!(identity.lookup_channel_names(), ["lark", "feishu"]);
-        assert_eq!(identity.default_progress_mode(), ProgressMode::Compact);
+        assert_eq!(identity.default_progress_mode(), ProgressMode::Off);
         let identity = LarkRuntimeChannelIdentity::from_platform(LarkChannelPlatform::Feishu);
         assert_eq!(identity.canonical_channel_name(), "feishu");
         assert_eq!(identity.requested_channel_name(), "feishu");
@@ -14440,7 +14484,7 @@ default_model = "legacy-model"
         );
         assert_eq!(
             LarkRuntimeChannelIdentity::default_progress_mode_for_runtime_channel("feishu"),
-            Some(ProgressMode::Compact)
+            Some(ProgressMode::Off)
         );
         assert_eq!(
             LarkRuntimeChannelIdentity::default_progress_mode_for_runtime_channel("telegram"),
@@ -14488,8 +14532,8 @@ default_model = "legacy-model"
             progress_mode: ProgressMode::Verbose,
         });
 
-        let resolved = configured_lark_channel(&channels, "feishu")
-            .expect("feishu channel should resolve");
+        let resolved =
+            configured_lark_channel(&channels, "feishu").expect("feishu channel should resolve");
 
         assert_eq!(resolved.identity.requested_channel_name(), "feishu");
         assert_eq!(resolved.source, LarkChannelConfigSource::Feishu);
@@ -14561,7 +14605,7 @@ default_model = "legacy-model"
         assert!(parsed.allowed_users.is_empty());
         assert_eq!(parsed.receive_mode, LarkReceiveMode::Websocket);
         assert!(parsed.port.is_none());
-        assert_eq!(parsed.progress_mode, ProgressMode::Compact);
+        assert_eq!(parsed.progress_mode, ProgressMode::Off);
         assert_eq!(
             parsed.effective_group_reply_mode(),
             GroupReplyMode::AllMessages
@@ -14612,7 +14656,7 @@ default_model = "legacy-model"
                 "secret_abc",
                 Some("verify_token"),
                 None,
-                ProgressMode::Compact,
+                ProgressMode::Off,
             )
         );
     }

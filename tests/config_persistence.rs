@@ -222,6 +222,27 @@ compact_context = true
     assert_eq!(parsed.agent.max_history_messages, 50);
 }
 
+#[tokio::test]
+async fn config_save_maps_workspace_datasheets_to_peripherals_datasheet_dir() {
+    let tmp = tempfile::TempDir::new().expect("tempdir creation should succeed");
+    let workspace_dir = tmp.path().join("workspace");
+    let config_path = tmp.path().join("config.toml");
+
+    let mut config = Config::default();
+    config.workspace_dir = workspace_dir;
+    config.config_path = config_path.clone();
+    config.hardware.workspace_datasheets = true;
+    config.peripherals.datasheet_dir = None;
+
+    config.save().await.expect("config save should succeed");
+
+    let saved = fs::read_to_string(&config_path).expect("config file read should succeed");
+    assert!(
+        saved.contains("datasheet_dir = \"datasheets\""),
+        "legacy hardware datasheet toggle should persist peripherals.datasheet_dir"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Workspace directory creation
 // ─────────────────────────────────────────────────────────────────────────────

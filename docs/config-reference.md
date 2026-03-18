@@ -13,6 +13,7 @@ Config path resolution at startup:
 ZeroClaw logs the resolved config on startup at `INFO` level:
 
 - `Config loaded` with fields: `path`, `workspace`, `source`, `initialized`
+- `source` is one of `ZEROCLAW_CONFIG_DIR`, `ZEROCLAW_WORKSPACE`, `active_workspace.toml`, or `default_config_dir`
 
 CLI commands for config inspection and modification:
 
