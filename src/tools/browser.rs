@@ -8,7 +8,7 @@
 use super::traits::{Tool, ToolResult};
 use super::url_validation::{validate_url as validate_network_url, DomainPolicy, UrlSchemePolicy};
 use crate::config::UrlAccessConfig;
-use crate::security::SecurityPolicy;
+use crate::security::{DomainMatcher, SecurityPolicy};
 use anyhow::Context;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,7 @@ pub struct BrowserTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
     url_access: UrlAccessConfig,
+    otp_domain_matcher: Option<DomainMatcher>,
     session_name: Option<String>,
     backend: String,
     auto_backend_priority: Vec<String>,
@@ -215,6 +216,7 @@ impl BrowserTool {
             security,
             allowed_domains,
             UrlAccessConfig::default(),
+            None,
             session_name,
             "agent_browser".into(),
             Vec::new(),
@@ -247,6 +249,7 @@ impl BrowserTool {
             security,
             allowed_domains,
             UrlAccessConfig::default(),
+            None,
             session_name,
             backend,
             auto_backend_priority,
@@ -265,6 +268,7 @@ impl BrowserTool {
         security: Arc<SecurityPolicy>,
         allowed_domains: Vec<String>,
         url_access: UrlAccessConfig,
+        otp_domain_matcher: Option<DomainMatcher>,
         session_name: Option<String>,
         backend: String,
         auto_backend_priority: Vec<String>,
@@ -280,6 +284,7 @@ impl BrowserTool {
             security,
             allowed_domains: normalize_domains(allowed_domains),
             url_access,
+            otp_domain_matcher,
             session_name,
             backend,
             auto_backend_priority,
@@ -529,6 +534,7 @@ impl BrowserTool {
                 scheme_policy: UrlSchemePolicy::HttpsOnly,
                 ipv6_error_context: "browser",
                 url_access: Some(&self.url_access),
+                otp_domain_matcher: self.otp_domain_matcher.as_ref(),
             },
         )?;
         Ok(())

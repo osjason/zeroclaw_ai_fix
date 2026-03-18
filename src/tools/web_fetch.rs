@@ -3,7 +3,7 @@ use super::url_validation::{
     normalize_allowed_domains, validate_url, DomainPolicy, UrlSchemePolicy,
 };
 use crate::config::UrlAccessConfig;
-use crate::security::SecurityPolicy;
+use crate::security::{DomainMatcher, SecurityPolicy};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -23,6 +23,7 @@ pub struct WebFetchTool {
     allowed_domains: Vec<String>,
     blocked_domains: Vec<String>,
     url_access: UrlAccessConfig,
+    otp_domain_matcher: Option<DomainMatcher>,
     max_response_size: usize,
     timeout_secs: u64,
 }
@@ -37,6 +38,7 @@ impl WebFetchTool {
         allowed_domains: Vec<String>,
         blocked_domains: Vec<String>,
         url_access: UrlAccessConfig,
+        otp_domain_matcher: Option<DomainMatcher>,
         max_response_size: usize,
         timeout_secs: u64,
     ) -> Self {
@@ -53,6 +55,7 @@ impl WebFetchTool {
             allowed_domains: normalize_allowed_domains(allowed_domains),
             blocked_domains: normalize_allowed_domains(blocked_domains),
             url_access,
+            otp_domain_matcher,
             max_response_size,
             timeout_secs,
         }
@@ -70,6 +73,7 @@ impl WebFetchTool {
                 scheme_policy: UrlSchemePolicy::HttpOrHttps,
                 ipv6_error_context: "web_fetch",
                 url_access: Some(&self.url_access),
+                otp_domain_matcher: self.otp_domain_matcher.as_ref(),
             },
         )
     }
@@ -396,6 +400,7 @@ mod tests {
             allowed_domains.into_iter().map(String::from).collect(),
             blocked_domains.into_iter().map(String::from).collect(),
             UrlAccessConfig::default(),
+            None,
             500_000,
             30,
         )
@@ -503,6 +508,7 @@ mod tests {
             vec![],
             vec![],
             UrlAccessConfig::default(),
+            None,
             500_000,
             30,
         );
@@ -570,6 +576,7 @@ mod tests {
             vec!["example.com".into()],
             vec![],
             UrlAccessConfig::default(),
+            None,
             500_000,
             30,
         );
@@ -595,6 +602,7 @@ mod tests {
             vec!["example.com".into()],
             vec![],
             UrlAccessConfig::default(),
+            None,
             500_000,
             30,
         );
@@ -623,6 +631,7 @@ mod tests {
             vec!["example.com".into()],
             vec![],
             UrlAccessConfig::default(),
+            None,
             10,
             30,
         );

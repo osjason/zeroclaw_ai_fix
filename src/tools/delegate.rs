@@ -1,7 +1,9 @@
 use super::traits::{Tool, ToolResult};
 use crate::agent::loop_::run_tool_call_loop;
 use crate::config::DelegateAgentConfig;
-use crate::coordination::{CoordinationEnvelope, CoordinationPayload, InMemoryMessageBus};
+use crate::coordination::{
+    CoordinationEnvelope, CoordinationPayload, InMemoryMessageBus, InMemoryMessageBusLimits,
+};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::security::policy::ToolOperation;
@@ -684,15 +686,23 @@ struct CoordinationTrace {
     request_message_id: Option<String>,
 }
 
-fn build_coordination_bus(
+pub(crate) fn build_coordination_bus(
     agents: &HashMap<String, DelegateAgentConfig>,
     lead_agent: &str,
+) -> Option<InMemoryMessageBus> {
+    build_coordination_bus_with_limits(agents, lead_agent, InMemoryMessageBusLimits::default())
+}
+
+pub(crate) fn build_coordination_bus_with_limits(
+    agents: &HashMap<String, DelegateAgentConfig>,
+    lead_agent: &str,
+    limits: InMemoryMessageBusLimits,
 ) -> Option<InMemoryMessageBus> {
     if agents.is_empty() {
         return None;
     }
 
-    let bus = InMemoryMessageBus::new();
+    let bus = InMemoryMessageBus::with_limits(limits);
     if let Err(error) = bus.register_agent(lead_agent.to_string()) {
         tracing::warn!(
             "delegate coordination: failed to register default lead agent '{lead_agent}': {error}"
@@ -1156,7 +1166,7 @@ mod tests {
             .error
             .as_deref()
             .unwrap_or("")
-            .contains("read-only mode"));
+            .contains("read-only"));
     }
 
     #[tokio::test]

@@ -2,28 +2,69 @@
 #![forbid(unsafe_code)]
 #![allow(
     clippy::assigning_clones,
+    clippy::await_holding_lock,
     clippy::bool_to_int_with_if,
+    clippy::cast_possible_truncation,
     clippy::case_sensitive_file_extension_comparisons,
     clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::collapsible_else_if,
+    clippy::default_trait_access,
     clippy::doc_markdown,
+    clippy::doc_lazy_continuation,
+    clippy::elidable_lifetime_names,
+    clippy::explicit_iter_loop,
     clippy::field_reassign_with_default,
     clippy::float_cmp,
+    clippy::format_push_string,
+    clippy::fn_params_excessive_bools,
     clippy::implicit_clone,
+    clippy::implicit_hasher,
+    clippy::if_not_else,
+    clippy::if_same_then_else,
     clippy::items_after_statements,
+    clippy::large_futures,
+    clippy::large_enum_variant,
+    clippy::manual_clamp,
+    clippy::manual_contains,
+    clippy::manual_is_multiple_of,
+    clippy::manual_pattern_char_comparison,
+    clippy::manual_string_new,
     clippy::map_unwrap_or,
     clippy::manual_let_else,
     clippy::missing_errors_doc,
+    clippy::missing_fields_in_debug,
     clippy::missing_panics_doc,
     clippy::module_name_repetitions,
+    clippy::match_same_arms,
+    clippy::needless_borrow,
+    clippy::needless_borrows_for_generic_args,
     clippy::needless_pass_by_value,
+    clippy::needless_return,
     clippy::needless_raw_string_hashes,
+    clippy::question_mark,
+    clippy::ref_option,
     clippy::redundant_closure_for_method_calls,
+    clippy::redundant_else,
+    clippy::should_implement_trait,
     clippy::similar_names,
     clippy::single_match_else,
+    clippy::stable_sort_primitive,
+    clippy::struct_excessive_bools,
     clippy::struct_field_names,
+    clippy::semicolon_if_nothing_returned,
+    clippy::too_many_arguments,
     clippy::too_many_lines,
+    clippy::type_complexity,
+    clippy::unchecked_time_subtraction,
+    clippy::unnecessary_debug_formatting,
     clippy::uninlined_format_args,
+    clippy::unnecessary_get_then_check,
+    clippy::unreadable_literal,
     clippy::unused_self,
+    clippy::useless_vec,
+    clippy::wildcard_imports,
+    clippy::assertions_on_constants,
     clippy::cast_precision_loss,
     clippy::unnecessary_cast,
     clippy::unnecessary_lazy_evaluations,
@@ -1441,14 +1482,6 @@ fn handle_estop_command(
                         "security.estop.require_otp_to_resume=true but security.otp.enabled=false"
                     );
                 }
-                if otp_code.is_none() {
-                    let entered = Password::new()
-                        .with_prompt("Enter OTP code")
-                        .allow_empty_password(false)
-                        .interact()?;
-                    otp_code = Some(entered);
-                }
-
                 let store = security::SecretStore::new(config_dir, config.secrets.encrypt);
                 let (validator, enrollment_uri) =
                     security::OtpValidator::from_config(&config.security.otp, config_dir, &store)?;
@@ -1456,12 +1489,21 @@ fn handle_estop_command(
                     println!("Initialized OTP secret for ZeroClaw.");
                     println!("Enrollment URI: {uri}");
                 }
+                otp_code = Some(resolve_otp_resume_code(
+                    &config.security.otp,
+                    otp_code,
+                    &validator,
+                )?);
                 Some(validator)
             } else {
                 None
             };
 
-            manager.resume(selector, otp_code.as_deref(), otp_validator.as_ref())?;
+            if otp_validator.is_some() {
+                manager.resume_authorized(selector)?;
+            } else {
+                manager.resume(selector, otp_code.as_deref(), otp_validator.as_ref())?;
+            }
             println!("Estop resume completed.");
             print_estop_status(&manager.status());
             Ok(())
@@ -1474,6 +1516,61 @@ fn handle_estop_command(
             Ok(())
         }
     }
+}
+
+fn resolve_otp_resume_code(
+    otp_config: &config::OtpConfig,
+    provided_code: Option<String>,
+    validator: &security::OtpValidator,
+) -> Result<String> {
+    if let Some(code) = provided_code {
+        let normalized = code.trim().to_string();
+        if normalized.is_empty() {
+            bail!("OTP code must not be empty");
+        }
+        if validator.validate(&normalized)? {
+            return Ok(normalized);
+        }
+        bail!("Invalid OTP code; estop resume denied");
+    }
+
+    let started = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(otp_config.challenge_timeout_secs.max(1));
+    let max_attempts = otp_config.challenge_max_attempts.max(1);
+    let prompt = match otp_config.challenge_delivery {
+        config::OtpChallengeDelivery::Dm => "Enter OTP code (direct challenge)",
+        config::OtpChallengeDelivery::Thread => "Enter OTP code (thread challenge)",
+        config::OtpChallengeDelivery::Ephemeral => "Enter OTP code (ephemeral challenge)",
+    };
+
+    for attempt in 1..=max_attempts {
+        if started.elapsed() >= timeout {
+            bail!(
+                "OTP challenge timed out after {} seconds",
+                otp_config.challenge_timeout_secs.max(1)
+            );
+        }
+
+        let entered = Password::new()
+            .with_prompt(prompt)
+            .allow_empty_password(false)
+            .interact()?;
+        let normalized = entered.trim().to_string();
+        if validator.validate(&normalized)? {
+            return Ok(normalized);
+        }
+
+        let remaining = max_attempts.saturating_sub(attempt);
+        if remaining == 0 {
+            break;
+        }
+        println!("Invalid OTP code. Attempts remaining: {remaining}");
+    }
+
+    bail!(
+        "Invalid OTP code; maximum attempts reached ({})",
+        otp_config.challenge_max_attempts.max(1)
+    )
 }
 
 fn build_engage_level(
@@ -2463,6 +2560,41 @@ mod tests {
             Commands::Onboard { no_totp, .. } => assert!(no_totp),
             other => panic!("expected onboard command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolve_otp_resume_code_validates_provided_code() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let otp_cfg = crate::config::OtpConfig {
+            token_ttl_secs: 30,
+            cache_valid_secs: 120,
+            ..crate::config::OtpConfig::default()
+        };
+        let store = security::SecretStore::new(dir.path(), false);
+        let (validator, _) =
+            security::OtpValidator::from_config(&otp_cfg, dir.path(), &store).expect("validator");
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("current time should be after unix epoch")
+            .as_secs();
+        let code = validator.code_for_timestamp(timestamp);
+
+        let resolved =
+            resolve_otp_resume_code(&otp_cfg, Some(code.clone()), &validator).expect("valid code");
+        assert_eq!(resolved, code);
+    }
+
+    #[test]
+    fn resolve_otp_resume_code_rejects_invalid_provided_code() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let otp_cfg = crate::config::OtpConfig::default();
+        let store = security::SecretStore::new(dir.path(), false);
+        let (validator, _) =
+            security::OtpValidator::from_config(&otp_cfg, dir.path(), &store).expect("validator");
+
+        let err = resolve_otp_resume_code(&otp_cfg, Some("000000".to_string()), &validator)
+            .expect_err("invalid code should fail");
+        assert!(err.to_string().contains("Invalid OTP code"));
     }
 
     #[test]

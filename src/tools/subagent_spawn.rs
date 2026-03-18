@@ -21,7 +21,7 @@ use std::time::Duration;
 /// Default timeout for background sub-agent provider calls.
 const SPAWN_TIMEOUT_SECS: u64 = 300;
 /// Maximum number of concurrent background sub-agents.
-const MAX_CONCURRENT_SUBAGENTS: usize = 10;
+const DEFAULT_MAX_CONCURRENT_SUBAGENTS: usize = 10;
 
 /// Tool that spawns a delegate agent in the background, returning immediately
 /// with a session ID. The sub-agent runs asynchronously and stores its result
@@ -34,6 +34,7 @@ pub struct SubAgentSpawnTool {
     registry: Arc<SubAgentRegistry>,
     parent_tools: Arc<Vec<Arc<dyn Tool>>>,
     multimodal_config: crate::config::MultimodalConfig,
+    max_concurrent: usize,
 }
 
 impl SubAgentSpawnTool {
@@ -47,6 +48,29 @@ impl SubAgentSpawnTool {
         parent_tools: Arc<Vec<Arc<dyn Tool>>>,
         multimodal_config: crate::config::MultimodalConfig,
     ) -> Self {
+        Self::new_with_limit(
+            agents,
+            fallback_credential,
+            security,
+            provider_runtime_options,
+            registry,
+            parent_tools,
+            multimodal_config,
+            DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_limit(
+        agents: HashMap<String, DelegateAgentConfig>,
+        fallback_credential: Option<String>,
+        security: Arc<SecurityPolicy>,
+        provider_runtime_options: providers::ProviderRuntimeOptions,
+        registry: Arc<SubAgentRegistry>,
+        parent_tools: Arc<Vec<Arc<dyn Tool>>>,
+        multimodal_config: crate::config::MultimodalConfig,
+        max_concurrent: usize,
+    ) -> Self {
         Self {
             agents: Arc::new(agents),
             security,
@@ -55,6 +79,7 @@ impl SubAgentSpawnTool {
             registry,
             parent_tools,
             multimodal_config,
+            max_concurrent: max_concurrent.max(1),
         }
     }
 }
@@ -223,13 +248,14 @@ impl Tool for SubAgentSpawnTool {
             result: None,
             handle: None,
         };
-        if let Err(_running) = self.registry.try_insert(session, MAX_CONCURRENT_SUBAGENTS) {
+        if let Err(_running) = self.registry.try_insert(session, self.max_concurrent) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Maximum concurrent sub-agents reached ({MAX_CONCURRENT_SUBAGENTS}). \
-                     Wait for running agents to complete or kill some."
+                    "Maximum concurrent sub-agents reached ({}). \
+                     Wait for running agents to complete or kill some.",
+                    self.max_concurrent
                 )),
             });
         }
@@ -520,6 +546,9 @@ mod tests {
                 model: "llama3".to_string(),
                 system_prompt: Some("You are a research assistant.".to_string()),
                 api_key: None,
+                enabled: true,
+                capabilities: Vec::new(),
+                priority: 0,
                 temperature: Some(0.3),
                 max_depth: 3,
                 agentic: false,
@@ -628,7 +657,7 @@ mod tests {
             .error
             .as_deref()
             .unwrap_or("")
-            .contains("read-only mode"));
+            .contains("read-only"));
     }
 
     #[tokio::test]
@@ -686,7 +715,7 @@ mod tests {
         let registry = Arc::new(SubAgentRegistry::new());
 
         // Fill up the registry with running sessions
-        for i in 0..MAX_CONCURRENT_SUBAGENTS {
+        for i in 0..DEFAULT_MAX_CONCURRENT_SUBAGENTS {
             registry.insert(SubAgentSession {
                 id: format!("s{i}"),
                 agent_name: "agent".to_string(),

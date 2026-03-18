@@ -29,6 +29,7 @@ pub mod cron_run;
 pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
+pub mod delegate_coordination_status;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
@@ -55,10 +56,15 @@ pub mod pdf_read;
 pub mod process;
 pub mod proxy_config;
 pub mod pushover;
+mod resource_limits;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
+pub mod subagent_list;
+pub mod subagent_manage;
+mod subagent_registry;
+pub mod subagent_spawn;
 pub mod task_plan;
 pub mod traits;
 pub mod url_validation;
@@ -77,6 +83,7 @@ pub use cron_run::CronRunTool;
 pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
+pub use delegate_coordination_status::DelegateCoordinationStatusTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
@@ -105,6 +112,9 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use shell::ShellTool;
+pub use subagent_list::SubAgentListTool;
+pub use subagent_manage::SubAgentManageTool;
+pub use subagent_spawn::SubAgentSpawnTool;
 pub use task_plan::TaskPlanTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
@@ -113,12 +123,13 @@ pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
 
 use crate::config::{Config, DelegateAgentConfig};
+use crate::coordination::InMemoryMessageBusLimits;
 use crate::memory::Memory;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::policy::{
     action_command_preflight_with_approval_violation, CommandPolicyViolation,
 };
-use crate::security::SecurityPolicy;
+use crate::security::{DomainMatcher, SecurityPolicy};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -219,7 +230,11 @@ pub fn default_tools_with_runtime(
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(ShellTool::new(security.clone(), runtime)),
+        Box::new(ShellTool::new_with_resource_limits(
+            security.clone(),
+            runtime,
+            crate::config::ResourceLimitsConfig::default(),
+        )),
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security.clone())),
         Box::new(FileEditTool::new(security.clone())),
@@ -278,9 +293,32 @@ pub fn all_tools_with_runtime(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
+    let otp_domain_matcher = if root_config.security.otp.enabled {
+        let matcher = DomainMatcher::new(
+            &root_config.security.otp.gated_domains,
+            &root_config.security.otp.gated_domain_categories,
+        )
+        .expect("config validation should reject invalid security.otp gated domain patterns");
+        if matcher.patterns().is_empty() {
+            None
+        } else {
+            Some(matcher)
+        }
+    } else {
+        None
+    };
+
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new(security.clone(), runtime.clone())),
-        Arc::new(ProcessTool::new(security.clone(), runtime)),
+        Arc::new(ShellTool::new_with_resource_limits(
+            security.clone(),
+            runtime.clone(),
+            root_config.security.resources.clone(),
+        )),
+        Arc::new(ProcessTool::new_with_resource_limits(
+            security.clone(),
+            runtime,
+            root_config.security.resources.clone(),
+        )),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
@@ -318,12 +356,15 @@ pub fn all_tools_with_runtime(
             security.clone(),
             browser_config.allowed_domains.clone(),
             root_config.security.url_access.clone(),
+            otp_domain_matcher.clone(),
             browser_open::BrowserChoice::from_str(&browser_config.browser_open),
         )));
         // Add full browser automation tool (pluggable backend)
-        tool_arcs.push(Arc::new(BrowserTool::new_with_backend(
+        tool_arcs.push(Arc::new(BrowserTool::new_with_backend_and_url_access(
             security.clone(),
             browser_config.allowed_domains.clone(),
+            root_config.security.url_access.clone(),
+            otp_domain_matcher.clone(),
             browser_config.session_name.clone(),
             browser_config.backend.clone(),
             browser_config.auto_backend_priority.clone(),
@@ -350,6 +391,7 @@ pub fn all_tools_with_runtime(
             security.clone(),
             http_config.allowed_domains.clone(),
             root_config.security.url_access.clone(),
+            otp_domain_matcher.clone(),
             http_config.max_response_size,
             http_config.timeout_secs,
             http_config.user_agent.clone(),
@@ -366,6 +408,7 @@ pub fn all_tools_with_runtime(
             web_fetch_config.allowed_domains.clone(),
             web_fetch_config.blocked_domains.clone(),
             root_config.security.url_access.clone(),
+            otp_domain_matcher,
             web_fetch_config.max_response_size,
             web_fetch_config.timeout_secs,
         )));
@@ -422,31 +465,78 @@ pub fn all_tools_with_runtime(
             (!trimmed_value.is_empty()).then(|| trimmed_value.to_owned())
         });
         let parent_tools = Arc::new(tool_arcs.clone());
-        let delegate_tool = DelegateTool::new_with_options(
+        let provider_runtime_options = crate::providers::ProviderRuntimeOptions {
+            auth_profile_override: None,
+            provider_api_url: root_config.api_url.clone(),
+            provider_transport: root_config.effective_provider_transport(),
+            zeroclaw_dir: root_config
+                .config_path
+                .parent()
+                .map(std::path::PathBuf::from),
+            secrets_encrypt: root_config.secrets.encrypt,
+            reasoning_enabled: root_config.runtime.reasoning_enabled,
+            reasoning_level: root_config.effective_provider_reasoning_level(),
+            custom_provider_api_mode: root_config
+                .provider_api
+                .map(|mode| mode.as_compatible_mode()),
+            max_tokens_override: None,
+            model_support_vision: root_config.model_support_vision,
+        };
+        let coordination_bus = if root_config.coordination.enabled {
+            delegate::build_coordination_bus_with_limits(
+                &delegate_agents,
+                &root_config.coordination.lead_agent,
+                InMemoryMessageBusLimits {
+                    max_inbox_messages_per_agent: root_config
+                        .coordination
+                        .max_inbox_messages_per_agent,
+                    max_dead_letters: root_config.coordination.max_dead_letters,
+                    max_context_entries: root_config.coordination.max_context_entries,
+                    max_seen_message_ids: root_config.coordination.max_seen_message_ids,
+                },
+            )
+        } else {
+            None
+        };
+        let mut delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
-            delegate_fallback_credential,
+            delegate_fallback_credential.clone(),
             security.clone(),
-            crate::providers::ProviderRuntimeOptions {
-                auth_profile_override: None,
-                provider_api_url: root_config.api_url.clone(),
-                provider_transport: root_config.effective_provider_transport(),
-                zeroclaw_dir: root_config
-                    .config_path
-                    .parent()
-                    .map(std::path::PathBuf::from),
-                secrets_encrypt: root_config.secrets.encrypt,
-                reasoning_enabled: root_config.runtime.reasoning_enabled,
-                reasoning_level: root_config.effective_provider_reasoning_level(),
-                custom_provider_api_mode: root_config
-                    .provider_api
-                    .map(|mode| mode.as_compatible_mode()),
-                max_tokens_override: None,
-                model_support_vision: root_config.model_support_vision,
-            },
+            provider_runtime_options.clone(),
         )
         .with_parent_tools(parent_tools)
         .with_multimodal_config(root_config.multimodal.clone());
+        if let Some(bus) = coordination_bus.clone() {
+            delegate_tool = delegate_tool
+                .with_coordination_bus(bus.clone(), root_config.coordination.lead_agent.clone());
+            tool_arcs.push(Arc::new(DelegateCoordinationStatusTool::new(
+                bus,
+                security.clone(),
+            )));
+        } else {
+            delegate_tool = delegate_tool.with_coordination_disabled();
+        }
         tool_arcs.push(Arc::new(delegate_tool));
+
+        if root_config.agent.subagents.enabled {
+            let subagent_registry = Arc::new(subagent_registry::SubAgentRegistry::new());
+            let parent_tools = Arc::new(tool_arcs.clone());
+            tool_arcs.push(Arc::new(SubAgentSpawnTool::new_with_limit(
+                agents.clone(),
+                delegate_fallback_credential,
+                security.clone(),
+                provider_runtime_options,
+                subagent_registry.clone(),
+                parent_tools,
+                root_config.multimodal.clone(),
+                root_config.agent.subagents.max_concurrent,
+            )));
+            tool_arcs.push(Arc::new(SubAgentListTool::new(subagent_registry.clone())));
+            tool_arcs.push(Arc::new(SubAgentManageTool::new(
+                subagent_registry,
+                security.clone(),
+            )));
+        }
     }
 
     // Inter-process agent communication (opt-in)
@@ -727,6 +817,10 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
+        assert!(names.contains(&"delegate_coordination_status"));
+        assert!(names.contains(&"subagent_spawn"));
+        assert!(names.contains(&"subagent_list"));
+        assert!(names.contains(&"subagent_manage"));
     }
 
     #[test]

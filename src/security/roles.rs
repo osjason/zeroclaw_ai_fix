@@ -1,4 +1,5 @@
 use crate::config::SecurityRoleConfig;
+use crate::security::DomainMatcher;
 use anyhow::{anyhow, bail, Result};
 use std::collections::HashMap;
 
@@ -13,6 +14,7 @@ struct RoleDefinition {
     allowed_tools: Vec<String>,
     denied_tools: Vec<String>,
     totp_gated: Vec<String>,
+    gated_domains: DomainMatcher,
     inherits: Option<String>,
     use_global_gated_actions: bool,
 }
@@ -33,6 +35,7 @@ impl RoleRegistry {
                 allowed_tools: vec!["*".to_string()],
                 denied_tools: Vec::new(),
                 totp_gated: Vec::new(),
+                gated_domains: DomainMatcher::default(),
                 inherits: None,
                 use_global_gated_actions: true,
             },
@@ -44,6 +47,7 @@ impl RoleRegistry {
                 allowed_tools: vec!["*".to_string()],
                 denied_tools: Vec::new(),
                 totp_gated: Vec::new(),
+                gated_domains: DomainMatcher::default(),
                 inherits: None,
                 use_global_gated_actions: true,
             },
@@ -64,6 +68,7 @@ impl RoleRegistry {
                     "browser_open".to_string(),
                     "browser".to_string(),
                 ],
+                gated_domains: DomainMatcher::default(),
                 inherits: None,
                 use_global_gated_actions: false,
             },
@@ -75,6 +80,7 @@ impl RoleRegistry {
                 allowed_tools: vec!["file_read".to_string(), "memory_search".to_string()],
                 denied_tools: Vec::new(),
                 totp_gated: Vec::new(),
+                gated_domains: DomainMatcher::default(),
                 inherits: None,
                 use_global_gated_actions: false,
             },
@@ -86,6 +92,7 @@ impl RoleRegistry {
                 allowed_tools: Vec::new(),
                 denied_tools: Vec::new(),
                 totp_gated: Vec::new(),
+                gated_domains: DomainMatcher::default(),
                 inherits: None,
                 use_global_gated_actions: false,
             },
@@ -115,6 +122,10 @@ impl RoleRegistry {
                     allowed_tools: role.allowed_tools.clone(),
                     denied_tools: role.denied_tools.clone(),
                     totp_gated: role.totp_gated.clone(),
+                    gated_domains: DomainMatcher::new(
+                        &role.gated_domains,
+                        &role.gated_domain_categories,
+                    )?,
                     inherits,
                     use_global_gated_actions: false,
                 },
@@ -170,6 +181,21 @@ impl RoleRegistry {
             allowed: true,
             requires_totp: role_totp || global_totp,
         }
+    }
+
+    #[must_use]
+    pub fn is_domain_totp_gated(&self, role_name: &str, domain: &str) -> bool {
+        let normalized_role = role_name.trim().to_ascii_lowercase();
+        if normalized_role.is_empty() || domain.trim().is_empty() {
+            return false;
+        }
+
+        let Some(role) = self.roles.get(&normalized_role) else {
+            return false;
+        };
+
+        let mut seen = Vec::new();
+        self.domain_in_totp_list(role, domain, &mut seen)
     }
 
     fn resolve_allow_decision(
@@ -240,6 +266,30 @@ impl RoleRegistry {
             .roles
             .get(parent_name)
             .is_some_and(|parent| self.uses_global_gated_actions(parent, seen_roles));
+        seen_roles.pop();
+        inherited
+    }
+
+    fn domain_in_totp_list(
+        &self,
+        role: &RoleDefinition,
+        domain: &str,
+        seen_roles: &mut Vec<String>,
+    ) -> bool {
+        if role.gated_domains.is_gated(domain) {
+            return true;
+        }
+        let Some(parent_name) = role.inherits.as_deref() else {
+            return false;
+        };
+        if seen_roles.iter().any(|entry| entry == parent_name) {
+            return false;
+        }
+        seen_roles.push(parent_name.to_string());
+        let inherited = self
+            .roles
+            .get(parent_name)
+            .is_some_and(|parent| self.domain_in_totp_list(parent, domain, seen_roles));
         seen_roles.pop();
         inherited
     }
@@ -368,5 +418,37 @@ mod tests {
         ]);
         assert!(result.is_err());
         assert!(result.expect_err("error").to_string().contains("cycle"));
+    }
+
+    #[test]
+    fn custom_role_domain_gating_is_preserved_in_runtime_registry() {
+        let registry = RoleRegistry::from_config(&[SecurityRoleConfig {
+            name: "developer".to_string(),
+            gated_domains: vec!["*.chase.com".to_string()],
+            ..SecurityRoleConfig::default()
+        }])
+        .expect("registry from config");
+
+        assert!(registry.is_domain_totp_gated("developer", "login.chase.com"));
+        assert!(!registry.is_domain_totp_gated("developer", "docs.rs"));
+    }
+
+    #[test]
+    fn child_role_inherits_parent_domain_gating() {
+        let registry = RoleRegistry::from_config(&[
+            SecurityRoleConfig {
+                name: "developer".to_string(),
+                gated_domains: vec!["*.chase.com".to_string()],
+                ..SecurityRoleConfig::default()
+            },
+            SecurityRoleConfig {
+                name: "staff".to_string(),
+                inherits: Some("developer".to_string()),
+                ..SecurityRoleConfig::default()
+            },
+        ])
+        .expect("registry from config");
+
+        assert!(registry.is_domain_totp_gated("staff", "login.chase.com"));
     }
 }

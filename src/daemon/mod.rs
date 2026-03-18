@@ -87,6 +87,22 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     }
 
+    if config.goal_loop.enabled {
+        let goal_loop_cfg = config.clone();
+        handles.push(spawn_component_supervisor(
+            "goal_loop",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let cfg = goal_loop_cfg.clone();
+                async move { Box::pin(run_goal_loop_worker(cfg)).await }
+            },
+        ));
+    } else {
+        crate::health::mark_component_ok("goal_loop");
+        tracing::info!("Goal loop disabled; goal loop supervisor not started");
+    }
+
     if config.cron.enabled && config.scheduler.enabled {
         let scheduler_cfg = config.clone();
         handles.push(spawn_component_supervisor(
@@ -109,7 +125,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
-    println!("   Components: gateway, channels, heartbeat, scheduler");
+    println!("   Components: gateway, channels, heartbeat, scheduler, goal_loop");
     println!("   Ctrl+C to stop");
 
     tokio::signal::ctrl_c().await?;
@@ -239,6 +255,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                                 channel,
                                 target,
                                 &announcement,
+                                crate::channels::OutboundMessageRole::Log,
                             )
                             .await
                             {
@@ -259,6 +276,23 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                     crate::health::mark_component_error("heartbeat", e.to_string());
                     tracing::warn!("Heartbeat task failed: {e}");
                 }
+            }
+        }
+    }
+}
+
+async fn run_goal_loop_worker(config: Config) -> Result<()> {
+    let engine = crate::goals::engine::GoalEngine::new(&config.workspace_dir);
+    let interval_mins = config.goal_loop.interval_minutes.max(1);
+    let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
+
+    loop {
+        interval.tick().await;
+        match engine.run_cycle(&config).await {
+            Ok(_) => crate::health::mark_component_ok("goal_loop"),
+            Err(error) => {
+                crate::health::mark_component_error("goal_loop", error.to_string());
+                tracing::warn!("Goal loop cycle failed: {error}");
             }
         }
     }

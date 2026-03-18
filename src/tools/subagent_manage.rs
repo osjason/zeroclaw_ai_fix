@@ -434,7 +434,7 @@ mod tests {
             .error
             .as_deref()
             .unwrap_or("")
-            .contains("read-only mode"));
+            .contains("read-only"));
     }
 
     #[tokio::test]

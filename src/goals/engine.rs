@@ -1,7 +1,9 @@
 use anyhow::Result;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use tokio::time::Duration;
 
 /// Maximum retry attempts per step before marking the goal as blocked.
 const MAX_STEP_ATTEMPTS: u32 = 3;
@@ -156,6 +158,76 @@ impl GoalEngine {
         tokio::fs::write(&tmp, data).await?;
         tokio::fs::rename(&tmp, &self.state_path).await?;
         Ok(())
+    }
+
+    pub async fn run_cycle(&self, config: &crate::config::Config) -> Result<usize> {
+        let mut state = self.load_state().await?;
+        let mut completed_steps = 0usize;
+        let max_steps = config.goal_loop.max_steps_per_cycle.max(1);
+        let step_timeout_secs = config.goal_loop.step_timeout_secs.max(1);
+        let step_timeout = Duration::from_secs(step_timeout_secs);
+
+        for _ in 0..max_steps {
+            let Some((goal_index, step_index)) = Self::select_next_actionable(&state) else {
+                break;
+            };
+
+            let prompt = {
+                let goal = &state.goals[goal_index];
+                let step = &goal.steps[step_index];
+                Self::build_step_prompt(goal, step)
+            };
+
+            mark_step_running(&mut state, goal_index, step_index);
+            self.save_state(&state).await?;
+
+            let result = tokio::time::timeout(
+                step_timeout,
+                crate::agent::run(
+                    config.clone(),
+                    Some(prompt),
+                    None,
+                    None,
+                    config.default_temperature,
+                    vec![],
+                    false,
+                    None,
+                ),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(output)) => {
+                    if Self::interpret_result(&output) {
+                        complete_step(&mut state, goal_index, step_index, output);
+                        completed_steps += 1;
+                    } else {
+                        fail_step(&mut state, goal_index, step_index, output);
+                    }
+                }
+                Ok(Err(error)) => {
+                    fail_step(
+                        &mut state,
+                        goal_index,
+                        step_index,
+                        format!("Goal loop agent step failed: {error}"),
+                    );
+                }
+                Err(_) => {
+                    fail_step(
+                        &mut state,
+                        goal_index,
+                        step_index,
+                        format!("Goal loop step timed out after {step_timeout_secs} seconds"),
+                    );
+                }
+            }
+
+            refresh_goal_state(&mut state.goals[goal_index]);
+            self.save_state(&state).await?;
+        }
+
+        Ok(completed_steps)
     }
 
     /// Select the next actionable (goal_index, step_index) pair.
@@ -325,6 +397,85 @@ impl GoalEngine {
         );
 
         prompt
+    }
+}
+
+fn now_rfc3339() -> String {
+    Utc::now().to_rfc3339()
+}
+
+fn mark_step_running(state: &mut GoalState, goal_index: usize, step_index: usize) {
+    let goal = &mut state.goals[goal_index];
+    goal.status = GoalStatus::InProgress;
+    goal.updated_at = now_rfc3339();
+    goal.steps[step_index].status = StepStatus::InProgress;
+}
+
+fn complete_step(state: &mut GoalState, goal_index: usize, step_index: usize, output: String) {
+    let goal = &mut state.goals[goal_index];
+    let step = &mut goal.steps[step_index];
+    step.attempts = step.attempts.saturating_add(1);
+    step.status = StepStatus::Completed;
+    step.result = Some(output.clone());
+
+    if !goal.context.is_empty() {
+        goal.context.push_str("\n\n");
+    }
+    let _ = write!(
+        goal.context,
+        "Step {} completed: {}",
+        step.id,
+        output.trim()
+    );
+    goal.last_error = None;
+    goal.updated_at = now_rfc3339();
+}
+
+fn fail_step(state: &mut GoalState, goal_index: usize, step_index: usize, error: String) {
+    let goal = &mut state.goals[goal_index];
+    let step = &mut goal.steps[step_index];
+    step.attempts = step.attempts.saturating_add(1);
+    step.result = Some(error.clone());
+    step.status = if step.attempts >= MAX_STEP_ATTEMPTS {
+        StepStatus::Blocked
+    } else {
+        StepStatus::Pending
+    };
+    goal.last_error = Some(error);
+    goal.updated_at = now_rfc3339();
+}
+
+fn refresh_goal_state(goal: &mut Goal) {
+    if !goal.steps.is_empty()
+        && goal
+            .steps
+            .iter()
+            .all(|step| step.status == StepStatus::Completed)
+    {
+        goal.status = GoalStatus::Completed;
+        goal.updated_at = now_rfc3339();
+        return;
+    }
+
+    if goal
+        .steps
+        .iter()
+        .any(|step| step.status == StepStatus::Pending && step.attempts < MAX_STEP_ATTEMPTS)
+    {
+        goal.status = GoalStatus::InProgress;
+        return;
+    }
+
+    if goal
+        .steps
+        .iter()
+        .any(|step| matches!(step.status, StepStatus::Blocked | StepStatus::Failed))
+        || goal
+            .steps
+            .iter()
+            .any(|step| step.status == StepStatus::Pending && step.attempts >= MAX_STEP_ATTEMPTS)
+    {
+        goal.status = GoalStatus::Blocked;
     }
 }
 

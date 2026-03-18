@@ -4,6 +4,7 @@ use crate::config::AuditConfig;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
+use ring::hmac;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -67,6 +68,8 @@ pub struct AuditEvent {
     pub action: Option<Action>,
     pub result: Option<ExecutionResult>,
     pub security: SecurityContext,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 impl AuditEvent {
@@ -84,6 +87,7 @@ impl AuditEvent {
                 rate_limit_remaining: None,
                 sandbox_backend: None,
             },
+            signature: None,
         }
     }
 
@@ -148,6 +152,7 @@ pub struct AuditLogger {
     log_path: PathBuf,
     config: AuditConfig,
     buffer: Mutex<Vec<AuditEvent>>,
+    signing_key: Option<Vec<u8>>,
 }
 
 /// Structured command execution details for audit logging.
@@ -166,10 +171,17 @@ impl AuditLogger {
     /// Create a new audit logger
     pub fn new(config: AuditConfig, zeroclaw_dir: PathBuf) -> Result<Self> {
         let log_path = zeroclaw_dir.join(&config.log_path);
+        let signing_key = if config.sign_events {
+            let store = crate::security::SecretStore::new(&zeroclaw_dir, true);
+            Some(store.signing_key()?)
+        } else {
+            None
+        };
         Ok(Self {
             log_path,
             config,
             buffer: Mutex::new(Vec::new()),
+            signing_key,
         })
     }
 
@@ -183,7 +195,11 @@ impl AuditLogger {
         self.rotate_if_needed()?;
 
         // Serialize and write
-        let line = serde_json::to_string(event)?;
+        let mut event_to_write = event.clone();
+        if let Some(key) = &self.signing_key {
+            event_to_write.signature = Some(sign_event(&event_to_write, key)?);
+        }
+        let line = serde_json::to_string(&event_to_write)?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -256,6 +272,15 @@ impl AuditLogger {
         std::fs::rename(&self.log_path, &rotated)?;
         Ok(())
     }
+}
+
+fn sign_event(event: &AuditEvent, key: &[u8]) -> Result<String> {
+    let mut unsigned = event.clone();
+    unsigned.signature = None;
+    let payload = serde_json::to_vec(&unsigned)?;
+    let signing_key = hmac::Key::new(hmac::HMAC_SHA256, key);
+    let signature = hmac::sign(&signing_key, &payload);
+    Ok(hex::encode(signature.as_ref()))
 }
 
 #[cfg(test)]
@@ -393,6 +418,29 @@ mod tests {
         let result = parsed.result.unwrap();
         assert!(result.success);
         assert_eq!(result.duration_ms, Some(42));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audit_logger_signs_event_when_enabled() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            sign_events: true,
+            max_size_mb: 10,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+        let event = AuditEvent::new(AuditEventType::CommandExecution)
+            .with_actor("cli".to_string(), None, None)
+            .with_action("pwd".to_string(), "low".to_string(), false, true);
+
+        logger.log(&event)?;
+
+        let log_path = tmp.path().join("audit.log");
+        let content = tokio::fs::read_to_string(&log_path).await?;
+        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+        assert!(parsed.signature.is_some());
         Ok(())
     }
 

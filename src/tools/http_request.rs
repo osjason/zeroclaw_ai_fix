@@ -3,7 +3,7 @@ use super::url_validation::{
     normalize_allowed_domains, validate_url, DomainPolicy, UrlSchemePolicy,
 };
 use crate::config::{HttpRequestCredentialProfile, UrlAccessConfig};
-use crate::security::SecurityPolicy;
+use crate::security::{DomainMatcher, SecurityPolicy};
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
@@ -16,6 +16,7 @@ pub struct HttpRequestTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
     url_access: UrlAccessConfig,
+    otp_domain_matcher: Option<DomainMatcher>,
     max_response_size: usize,
     timeout_secs: u64,
     user_agent: String,
@@ -27,6 +28,7 @@ impl HttpRequestTool {
         security: Arc<SecurityPolicy>,
         allowed_domains: Vec<String>,
         url_access: UrlAccessConfig,
+        otp_domain_matcher: Option<DomainMatcher>,
         max_response_size: usize,
         timeout_secs: u64,
         user_agent: String,
@@ -36,6 +38,7 @@ impl HttpRequestTool {
             security,
             allowed_domains: normalize_allowed_domains(allowed_domains),
             url_access,
+            otp_domain_matcher,
             max_response_size,
             timeout_secs,
             user_agent,
@@ -58,6 +61,7 @@ impl HttpRequestTool {
                 scheme_policy: UrlSchemePolicy::HttpOrHttps,
                 ipv6_error_context: "http_request",
                 url_access: Some(&self.url_access),
+                otp_domain_matcher: self.otp_domain_matcher.as_ref(),
             },
         )
     }
@@ -457,6 +461,7 @@ mod tests {
             security,
             allowed_domains.into_iter().map(String::from).collect(),
             UrlAccessConfig::default(),
+            None,
             1_000_000,
             30,
             "test".to_string(),
@@ -580,6 +585,7 @@ mod tests {
             security,
             vec![],
             UrlAccessConfig::default(),
+            None,
             1_000_000,
             30,
             "test".to_string(),
@@ -704,6 +710,7 @@ mod tests {
             security,
             vec!["example.com".into()],
             UrlAccessConfig::default(),
+            None,
             1_000_000,
             30,
             "test".to_string(),
@@ -727,6 +734,7 @@ mod tests {
             security,
             vec!["example.com".into()],
             UrlAccessConfig::default(),
+            None,
             1_000_000,
             30,
             "test".to_string(),
@@ -753,6 +761,7 @@ mod tests {
             Arc::new(SecurityPolicy::default()),
             vec!["example.com".into()],
             UrlAccessConfig::default(),
+            None,
             10,
             30,
             "test".to_string(),
@@ -835,6 +844,7 @@ mod tests {
             Arc::new(SecurityPolicy::default()),
             vec!["api.github.com".into()],
             UrlAccessConfig::default(),
+            None,
             1_000_000,
             30,
             "test".to_string(),
@@ -870,6 +880,7 @@ mod tests {
             Arc::new(SecurityPolicy::default()),
             vec!["example.com".into()],
             UrlAccessConfig::default(),
+            None,
             1_000_000,
             30,
             "test".to_string(),

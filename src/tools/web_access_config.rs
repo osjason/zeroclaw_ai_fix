@@ -3,7 +3,7 @@ use super::url_validation::{
     normalize_allowed_domains, validate_url, DomainPolicy, UrlSchemePolicy,
 };
 use crate::config::{Config, UrlAccessConfig};
-use crate::security::SecurityPolicy;
+use crate::security::{DomainMatcher, SecurityPolicy};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -151,6 +151,16 @@ impl WebAccessConfigTool {
 
         let cfg = self.load_config_without_env()?;
         let wildcard = vec!["*".to_string()];
+        let otp_domain_matcher = if cfg.security.otp.enabled {
+            DomainMatcher::new(
+                &cfg.security.otp.gated_domains,
+                &cfg.security.otp.gated_domain_categories,
+            )
+            .ok()
+            .filter(|matcher| !matcher.patterns().is_empty())
+        } else {
+            None
+        };
         let policy = DomainPolicy {
             allowed_domains: &wildcard,
             blocked_domains: &[],
@@ -160,6 +170,7 @@ impl WebAccessConfigTool {
             scheme_policy: UrlSchemePolicy::HttpOrHttps,
             ipv6_error_context: "web_access_config.check_url",
             url_access: Some(&cfg.security.url_access),
+            otp_domain_matcher: otp_domain_matcher.as_ref(),
         };
 
         let result = validate_url(url, &policy);
@@ -483,5 +494,34 @@ mod tests {
         assert_eq!(url_access["domain_allowlist"], json!(["*.rust-lang.org"]));
         assert_eq!(url_access["domain_blocklist"], json!([]));
         assert_eq!(url_access["approved_domains"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn check_url_reports_otp_gated_domain_requirement() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.security.otp.enabled = true;
+        config.security.otp.gated_domains = vec!["*.chase.com".into()];
+        config.save().await.unwrap();
+
+        let tool = WebAccessConfigTool::new(Arc::new(config), test_security());
+        let result = tool
+            .execute(json!({
+                "action": "check_url",
+                "url": "https://login.chase.com"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["allowed"], json!(false));
+        assert!(output["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("security.otp.gated_domains")));
     }
 }

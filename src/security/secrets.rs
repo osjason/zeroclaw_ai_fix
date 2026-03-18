@@ -168,6 +168,11 @@ impl SecretStore {
         value.starts_with("enc2:")
     }
 
+    /// Return the raw local secret key for internal signing/integrity uses.
+    pub fn signing_key(&self) -> Result<Vec<u8>> {
+        self.load_or_create_key()
+    }
+
     /// Load the encryption key from disk, or create one if it doesn't exist.
     fn load_or_create_key(&self) -> Result<Vec<u8>> {
         if self.key_path.exists() {

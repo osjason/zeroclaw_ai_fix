@@ -1,4 +1,5 @@
 use crate::config::UrlAccessConfig;
+use crate::security::DomainMatcher;
 use anyhow::{Context, Result};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 
@@ -18,6 +19,7 @@ pub struct DomainPolicy<'a> {
     pub scheme_policy: UrlSchemePolicy,
     pub ipv6_error_context: &'a str,
     pub url_access: Option<&'a UrlAccessConfig>,
+    pub otp_domain_matcher: Option<&'a DomainMatcher>,
 }
 
 pub fn validate_url(raw_url: &str, policy: &DomainPolicy<'_>) -> Result<String> {
@@ -49,8 +51,23 @@ pub fn validate_url(raw_url: &str, policy: &DomainPolicy<'_>) -> Result<String> 
 
     enforce_global_domain_access_policy(&host, policy.url_access)?;
     enforce_private_host_policy(&host, policy.url_access)?;
+    enforce_otp_domain_gate(&host, policy.otp_domain_matcher)?;
 
     Ok(url.to_string())
+}
+
+fn enforce_otp_domain_gate(host: &str, otp_domain_matcher: Option<&DomainMatcher>) -> Result<()> {
+    let Some(matcher) = otp_domain_matcher else {
+        return Ok(());
+    };
+
+    if matcher.is_gated(host) {
+        anyhow::bail!(
+            "Host '{host}' matches security.otp.gated_domains/security.otp.gated_domain_categories and requires OTP-mediated approval before network access"
+        );
+    }
+
+    Ok(())
 }
 
 fn enforce_global_domain_access_policy(
@@ -506,6 +523,7 @@ mod tests {
             scheme_policy: UrlSchemePolicy::HttpOrHttps,
             ipv6_error_context: "web_fetch",
             url_access: None,
+            otp_domain_matcher: None,
         }
     }
 
@@ -568,6 +586,7 @@ mod tests {
         };
         let policy = DomainPolicy {
             url_access: Some(&url_access),
+            otp_domain_matcher: None,
             ..policy(&allowed, &blocked)
         };
         let got = validate_url("https://10.1.2.3", &policy).unwrap();
@@ -584,6 +603,7 @@ mod tests {
         };
         let policy = DomainPolicy {
             url_access: Some(&url_access),
+            otp_domain_matcher: None,
             ..policy(&allowed, &blocked)
         };
         let got = validate_url("https://localhost:8080", &policy).unwrap();
@@ -610,6 +630,7 @@ mod tests {
         };
         let policy = DomainPolicy {
             url_access: Some(&url_access),
+            otp_domain_matcher: None,
             ..policy(&allowed, &blocked)
         };
         let err = validate_url("https://docs.example.com", &policy)
@@ -629,6 +650,7 @@ mod tests {
         };
         let policy = DomainPolicy {
             url_access: Some(&url_access),
+            otp_domain_matcher: None,
             ..policy(&allowed, &blocked)
         };
         let err = validate_url("https://docs.rs", &policy)
@@ -666,8 +688,41 @@ mod tests {
         };
         let policy = DomainPolicy {
             url_access: Some(&url_access),
+            otp_domain_matcher: None,
             ..policy(&allowed, &blocked)
         };
+        let got = validate_url("https://docs.rs", &policy).unwrap();
+        assert_eq!(got, "https://docs.rs");
+    }
+
+    #[test]
+    fn validate_url_rejects_otp_gated_domain() {
+        let allowed = vec!["*".to_string()];
+        let blocked: Vec<String> = Vec::new();
+        let otp_domain_matcher =
+            DomainMatcher::new(&["*.chase.com".to_string()], &[] as &[String]).unwrap();
+        let policy = DomainPolicy {
+            otp_domain_matcher: Some(&otp_domain_matcher),
+            ..policy(&allowed, &blocked)
+        };
+
+        let err = validate_url("https://login.chase.com", &policy)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("security.otp.gated_domains"));
+    }
+
+    #[test]
+    fn validate_url_allows_non_gated_domain_when_otp_matcher_present() {
+        let allowed = vec!["*".to_string()];
+        let blocked: Vec<String> = Vec::new();
+        let otp_domain_matcher =
+            DomainMatcher::new(&["*.chase.com".to_string()], &[] as &[String]).unwrap();
+        let policy = DomainPolicy {
+            otp_domain_matcher: Some(&otp_domain_matcher),
+            ..policy(&allowed, &blocked)
+        };
+
         let got = validate_url("https://docs.rs", &policy).unwrap();
         assert_eq!(got, "https://docs.rs");
     }
